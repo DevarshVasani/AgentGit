@@ -1,0 +1,2 @@
+/target
+# Cargo.lock is committed on purpose (this workspace ships a binary).

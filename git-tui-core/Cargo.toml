@@ -1,0 +1,15 @@
+[package]
+name = "git-tui-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Git operations and async job engine for git-tui (no TUI concerns)"
+
+[dependencies]
+git2 = { version = "0.19", features = ["vendored-libgit2", "vendored-openssl"] }
+crossbeam-channel = "0.5"
+thiserror = "2"
+
+[dev-dependencies]
+tempfile = "3"
