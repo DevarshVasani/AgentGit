@@ -17,4 +17,13 @@ pub enum GitError {
 
     #[error("hunk staging failed: {0}")]
     HunkStaging(String),
+
+    #[error("branch operation failed: {0}")]
+    Branch(String),
+
+    #[error("log failed: {0}")]
+    Log(String),
+
+    #[error("stash failed: {0}")]
+    Stash(String),
 }
