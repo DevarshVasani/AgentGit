@@ -38,4 +38,7 @@ pub enum GitError {
 
     #[error("sync failed: {0}")]
     Sync(String),
+
+    #[error("commit message generation failed: {0}")]
+    Llm(String),
 }

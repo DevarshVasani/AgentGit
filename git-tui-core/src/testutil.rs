@@ -7,6 +7,10 @@ use std::io::Write;
 use std::path::Path;
 use tempfile::TempDir;
 
+/// Env vars are process-global and `cargo test` runs threads in parallel:
+/// every test that reads or writes LLM key vars must hold this first.
+pub static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Init a new repo in a temp dir, default branch `main`, local user config set.
 pub fn init_repo() -> (TempDir, Repository) {
     let dir = TempDir::new().expect("create tempdir");

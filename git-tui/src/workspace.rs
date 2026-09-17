@@ -68,6 +68,7 @@ impl Workspace {
         let queue =
             JobQueue::spawn(root).map_err(|e| anyhow::anyhow!("cannot open {}: {e}", root.display()))?;
         let mut app = App::new_with_config(queue, self.config.clone());
+        app.set_config_path(Config::default_path());
         if let Some(name) = root
             .file_name()
             .and_then(|s| s.to_str())
@@ -97,6 +98,7 @@ impl Workspace {
                 match JobQueue::spawn(&root) {
                     Ok(queue) => {
                         let mut app = App::new_with_config(queue, self.config.clone());
+                        app.set_config_path(Config::default_path());
                         let name = root
                             .file_name()
                             .and_then(|s| s.to_str())
@@ -274,6 +276,7 @@ impl Workspace {
                     match JobQueue::spawn(&root) {
                         Ok(queue) => {
                             let mut app = App::new_with_config(queue, self.config.clone());
+                            app.set_config_path(Config::default_path());
                             let name = root
                                 .file_name()
                                 .and_then(|s| s.to_str())
@@ -366,7 +369,17 @@ impl Workspace {
         }
     }
 
+    /// Test/legacy path with no modifiers (see [`App::on_key`]). The binary
+    /// uses [`Self::on_key_with_modifiers`].
+    #[allow(dead_code)]
     pub fn on_key(&mut self, key: KeyCode) {
+        let shift = matches!(key, KeyCode::Char('A'));
+        self.on_key_with_modifiers(key, shift);
+    }
+
+    /// Modifier-aware dispatch: Shift+A inside the commit box generates a
+    /// commit message; everywhere else behaves like [`Self::on_key`].
+    pub fn on_key_with_modifiers(&mut self, key: KeyCode, shift_held: bool) {
         // The browser owns every key until it closes (Enter opens the
         // highlighted folder, Esc closes). No global bindings leak in.
         if self.current().mode() == Mode::OpenProject {
@@ -416,7 +429,7 @@ impl Workspace {
                 }
             }
         }
-        self.current_mut().on_key(key);
+        self.current_mut().on_key_with_modifiers(key, shift_held);
     }
 
     /// Keys inside the project browser. Typing filters the current

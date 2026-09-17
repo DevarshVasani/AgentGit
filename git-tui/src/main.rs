@@ -168,7 +168,14 @@ fn run(
                 {
                     workspace.request_quit();
                 } else {
-                    workspace.on_key(normalize_key(key.code, key.modifiers));
+                    let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+                    workspace.on_key_with_modifiers(
+                        normalize_key(key.code, key.modifiers),
+                        // `normalize_key` folds Shift+a into `A`; the commit
+                        // box needs the original Shift state so a literal
+                        // `A` (caps lock) still types normally.
+                        shift || matches!(normalize_key(key.code, key.modifiers), KeyCode::Char('A')),
+                    );
                 }
             }
         }

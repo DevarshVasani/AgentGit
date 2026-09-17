@@ -82,6 +82,12 @@ pub enum AsyncJob {
     },
     /// Local upstream tracking state (no network).
     LoadSync,
+    /// Generate a commit message from staged diffs via the LLM provider.
+    /// Carries a snapshot of [`crate::llm::LlmConfig`] so the worker — the
+    /// only thread holding the repo — can build the prompt + call the API.
+    GenerateCommitMessage {
+        llm: crate::llm::LlmConfig,
+    },
 }
 
 /// Work results. All data owned.
@@ -93,6 +99,8 @@ pub enum AsyncResult {
     Log(Vec<CommitInfo>),
     Stash(Vec<StashEntry>),
     SyncStatus(SyncStatus),
+    /// LLM-generated commit message draft (commit box fills `draft`).
+    GeneratedMessage(String),
     MutationDone,
     Error(GitError),
 }
@@ -259,6 +267,12 @@ fn execute(repo: &mut Repo, job: AsyncJob) -> AsyncResult {
             Ok(st) => AsyncResult::SyncStatus(st),
             Err(e) => AsyncResult::Error(e),
         },
+        AsyncJob::GenerateCommitMessage { llm } => {
+            match crate::llm::generate_commit_message(repo.inner(), &llm) {
+                Ok(msg) => AsyncResult::GeneratedMessage(msg),
+                Err(e) => AsyncResult::Error(e),
+            }
+        }
     }
 }
 
@@ -542,6 +556,67 @@ mod tests {
         assert!(matches!(first, AsyncResult::Status(_)), "got {first:?}");
         assert!(matches!(second, AsyncResult::Diff(_)), "got {second:?}");
         assert!(matches!(third, AsyncResult::Status(_)), "got {third:?}");
+    }
+
+    #[test]
+    fn generate_commit_message_with_nothing_staged_errors_without_network() {
+        let (_dir, repo) = testutil::init_repo();
+        testutil::commit_file(&repo, "a.txt", "a\n", "init");
+        let path = repo.workdir().unwrap().to_path_buf();
+        drop(repo);
+        let queue = JobQueue::spawn(path).unwrap();
+        queue
+            .submit(AsyncJob::GenerateCommitMessage {
+                llm: crate::llm::LlmConfig::default(),
+            })
+            .unwrap();
+        match recv_next(&queue) {
+            AsyncResult::Error(crate::error::GitError::Llm(msg)) => {
+                assert!(msg.contains("nothing staged"), "got: {msg}");
+            }
+            other => panic!("expected Llm error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn generate_commit_message_without_key_errors_with_hint() {
+        // Env vars are process-global: hold the shared lock and restore
+        // afterwards so parallel tests never observe our removals.
+        let _guard = testutil::ENV_LOCK.lock().unwrap();
+        let prev_openai = std::env::var("OPENAI_API_KEY").ok();
+        let prev_llm = std::env::var("LLM_API_KEY").ok();
+        std::env::remove_var("OPENAI_API_KEY");
+        std::env::remove_var("LLM_API_KEY");
+        let (_dir, repo) = testutil::init_repo();
+        testutil::commit_file(&repo, "a.txt", "a\n", "init");
+        testutil::dirty_file(&repo, "a.txt", "more\n");
+        crate::stage::stage_file(&repo, "a.txt").unwrap();
+        let path = repo.workdir().unwrap().to_path_buf();
+        drop(repo);
+        let queue = JobQueue::spawn(path).unwrap();
+        queue
+            .submit(AsyncJob::GenerateCommitMessage {
+                llm: crate::llm::LlmConfig::default(),
+            })
+            .unwrap();
+        let result = recv_next(&queue);
+        match prev_openai {
+            Some(v) => std::env::set_var("OPENAI_API_KEY", v),
+            None => std::env::remove_var("OPENAI_API_KEY"),
+        }
+        match prev_llm {
+            Some(v) => std::env::set_var("LLM_API_KEY", v),
+            None => std::env::remove_var("LLM_API_KEY"),
+        }
+        match result {
+            AsyncResult::Error(crate::error::GitError::Llm(msg)) => {
+                assert!(
+                    msg.contains("API key"),
+                    "got: {msg}"
+                );
+            }
+            other => panic!("expected missing-key Llm error, got {other:?}"),
+        }
     }
 
     #[test]

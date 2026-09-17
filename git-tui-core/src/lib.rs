@@ -7,6 +7,7 @@ pub mod commit;
 pub mod diff;
 pub mod error;
 pub mod jobqueue;
+pub mod llm;
 pub mod log;
 pub mod repo;
 pub mod stage;

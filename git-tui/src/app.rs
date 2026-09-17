@@ -8,6 +8,7 @@ use git_tui_core::branch::BranchInfo;
 use git_tui_core::diff::FileDiff;
 use git_tui_core::error::GitError;
 use git_tui_core::jobqueue::{AsyncJob, AsyncResult, JobQueue};
+use git_tui_core::llm::LlmConfig;
 use git_tui_core::log::CommitInfo;
 use git_tui_core::stash::StashEntry;
 use git_tui_core::status::{FileState, RepoStatus, StatusEntry};
@@ -16,6 +17,14 @@ use std::cell::Cell;
 
 use crate::config::{Config, KeyBindings, Theme};
 use crate::fuzzy;
+
+/// Labels for the LLM setup form rows: provider, model, API key, base URL.
+pub const LLM_FIELD_LABELS: [&str; 4] = [
+    "Provider (openai|openrouter|ollama|anthropic|gemini|custom)",
+    "Model",
+    "API key (empty = use env var)",
+    "Base URL (optional, custom only)",
+];
 
 /// Input mode: normal list navigation, a fullscreen diff overlay, or a
 /// text-input modal.
@@ -33,6 +42,9 @@ pub enum Mode {
     SetUpstream,
     /// Publish a repo with no remotes: the draft is the new `origin` URL.
     SetRemote,
+    /// In-TUI LLM provider setup (`A` in the file list): provider, model,
+    /// API key, and optional base URL. Enter saves to the config file.
+    LlmSettings,
 }
 
 /// Which panel receives navigation keys. Everything is vertical: Tab cycles
@@ -51,6 +63,24 @@ pub struct App {
     queue: JobQueue,
     keys: KeyBindings,
     theme: Theme,
+    /// LLM provider config for Shift+A commit generation.
+    llm: LlmConfig,
+    /// A GenerateCommitMessage job is in flight ("generating…" in the
+    /// commit modal). Set on Shift+A, cleared when the message or an
+    /// error arrives via `poll`.
+    generating: bool,
+    /// One-line success confirmation (e.g. "LLM settings saved"), shown
+    /// above the footer until the next keypress. Like `error` but green.
+    notice: Option<String>,
+    /// Where the config file lives (for the LLM setup form to persist).
+    /// `None` in tests: saving still updates the session, minus the file.
+    config_path: Option<std::path::PathBuf>,
+    /// LLM setup form buffers: provider, model, api_key, base_url.
+    llm_form: [String; 4],
+    /// Saved cursor (chars) per form field while switching rows.
+    llm_cursors: [usize; 4],
+    /// Highlighted form row.
+    llm_selected: usize,
     /// Short repo name for the status panel (workdir basename).
     repo_name: String,
     status: Option<RepoStatus>,
@@ -333,6 +363,13 @@ impl App {
             queue,
             keys: config.keys,
             theme: config.theme,
+            llm: config.llm,
+            generating: false,
+            notice: None,
+            config_path: None,
+            llm_form: Default::default(),
+            llm_cursors: [0; 4],
+            llm_selected: 0,
             repo_name: "repo".into(),
             status: None,
             file_list: Vec::new(),
@@ -719,6 +756,169 @@ impl App {
         self.quit
     }
 
+    /// Whether an LLM commit-message job is in flight (commit modal shows
+    /// "generating…").
+    pub fn is_generating(&self) -> bool {
+        self.generating
+    }
+
+    #[allow(dead_code)]
+    pub fn llm_config(&self) -> &LlmConfig {
+        &self.llm
+    }
+
+    /// Config file location for persisting the LLM setup form.
+    pub fn set_config_path(&mut self, path: Option<std::path::PathBuf>) {
+        self.config_path = path;
+    }
+
+    /// Success confirmation line (cleared on the next keypress).
+    pub fn notice(&self) -> Option<&str> {
+        self.notice.as_deref()
+    }
+
+    /// Highlighted row of the LLM setup form.
+    pub fn llm_selected(&self) -> usize {
+        self.llm_selected.min(LLM_FIELD_LABELS.len() - 1)
+    }
+
+    /// Display value of form row `i`: the live draft for the selected row,
+    /// the stashed buffer otherwise.
+    pub fn llm_field_value(&self, i: usize) -> &str {
+        if i == self.llm_selected() {
+            &self.draft
+        } else {
+            self.llm_form.get(i).map(String::as_str).unwrap_or("")
+        }
+    }
+
+    /// `A` in the file list: open the LLM setup form prefilled from the
+    /// current `[llm]` config (or its defaults).
+    pub fn begin_llm_settings(&mut self) {
+        self.mode = Mode::LlmSettings;
+        self.error = None;
+        self.notice = None;
+        self.llm_form = [
+            self.llm.provider.clone(),
+            self.llm.model.clone(),
+            self.llm.api_key.clone(),
+            self.llm.base_url.clone().unwrap_or_default(),
+        ];
+        self.llm_cursors = [0; 4];
+        self.llm_selected = 0;
+        self.draft = self.llm_form[0].clone();
+        self.move_draft_end();
+        self.llm_cursors[0] = self.draft_cursor();
+    }
+
+    /// Stash the live draft/cursor into the selected form row.
+    fn stash_llm_field(&mut self) {
+        let i = self.llm_selected();
+        self.llm_form[i] = self.draft.clone();
+        self.llm_cursors[i] = self.draft_cursor();
+    }
+
+    /// Move the form highlight, stashing/loading the row buffers.
+    fn move_llm_selection(&mut self, delta: isize) {
+        let n = LLM_FIELD_LABELS.len();
+        self.stash_llm_field();
+        let cur = self.llm_selected.min(n - 1) as isize;
+        self.llm_selected = (cur + delta).clamp(0, n as isize - 1) as usize;
+        let i = self.llm_selected;
+        self.draft = self.llm_form[i].clone();
+        self.draft_cursor = self.llm_cursors[i].min(self.draft.chars().count());
+    }
+
+    /// Back out without saving.
+    pub fn cancel_llm_settings(&mut self) {
+        self.mode = Mode::Normal;
+        self.draft.clear();
+        self.draft_cursor = 0;
+    }
+
+    /// Enter in the setup form: validate, apply to the session, and persist
+    /// `[llm]` to the config file. Stays open with an error on bad input.
+    pub fn save_llm_settings(&mut self) {
+        self.stash_llm_field();
+        let provider = self.llm_form[0].trim().to_lowercase();
+        if !git_tui_core::llm::PROVIDERS.contains(&provider.as_str()) {
+            self.error = Some(format!(
+                "unknown provider {provider:?} (expected one of: {})",
+                git_tui_core::llm::PROVIDERS.join(", ")
+            ));
+            return;
+        }
+        let model = self.llm_form[1].trim().to_string();
+        self.llm = LlmConfig {
+            provider,
+            model: if model.is_empty() {
+                LlmConfig::default().model
+            } else {
+                model
+            },
+            api_key: self.llm_form[2].trim().to_string(),
+            base_url: {
+                let u = self.llm_form[3].trim().to_string();
+                if u.is_empty() {
+                    None
+                } else {
+                    Some(u)
+                }
+            },
+        };
+        if let Some(path) = self.config_path.clone() {
+            if let Err(e) = Config::save_llm_to_path(&path, &self.llm) {
+                self.error = Some(e.to_string());
+                return;
+            }
+            self.notice = Some(format!("LLM settings saved to {}", path.display()));
+        } else {
+            self.notice = Some("LLM settings updated for this session".into());
+        }
+        self.mode = Mode::Normal;
+        self.draft.clear();
+        self.draft_cursor = 0;
+        self.error = None;
+    }
+
+    /// Keys inside the LLM setup form. Tab/Up/Down switch rows; the draft
+    /// line edits the selected row; Enter saves; Esc cancels.
+    fn on_key_llm_settings(&mut self, key: KeyCode) {
+        match key {
+            KeyCode::Char(c) => self.insert_draft_char(c),
+            KeyCode::Backspace => self.delete_draft_before(),
+            KeyCode::Delete => self.delete_draft_after(),
+            KeyCode::Left => self.move_draft_left(),
+            KeyCode::Right => self.move_draft_right(),
+            KeyCode::Home => self.move_draft_home(),
+            KeyCode::End => self.move_draft_end(),
+            KeyCode::Up => self.move_llm_selection(-1),
+            KeyCode::Down | KeyCode::Tab => self.move_llm_selection(1),
+            KeyCode::BackTab => self.move_llm_selection(-1),
+            KeyCode::Enter => self.save_llm_settings(),
+            KeyCode::Esc => self.cancel_llm_settings(),
+            _ => {}
+        }
+    }
+
+    /// Shift+A in the commit box: reference every staged file (index vs
+    /// HEAD) and ask the LLM provider for a Conventional-Commits message.
+    /// The result arrives via `poll` as `GeneratedMessage` and replaces
+    /// the draft (cursor jumps to the end for quick editing).
+    pub fn begin_generate_commit_message(&mut self) {
+        if self.mode != Mode::Committing || self.generating {
+            return;
+        }
+        self.generating = true;
+        self.error = None;
+        if let Err(e) = self.queue.submit(AsyncJob::GenerateCommitMessage {
+            llm: self.llm.clone(),
+        }) {
+            self.generating = false;
+            self.error = Some(e.to_string());
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn set_status_for_test(&mut self, st: git_tui_core::status::RepoStatus) {
         self.status = Some(st);
@@ -791,10 +991,42 @@ impl App {
     }
 
     /// Dispatch a keypress (event loop calls this; then [`App::poll`]).
+    /// Test/legacy path with no modifiers: `A` is treated as Shift+A so
+    /// tests can drive generation with a single KeyCode. The binary uses
+    /// [`Self::on_key_with_modifiers`].
+    #[allow(dead_code)]
     pub fn on_key(&mut self, key: KeyCode) {
-        // A new action dismisses the previous error; async failures from
-        // this action arrive later via `poll` and replace it.
+        // Test/legacy path: no modifiers known. `A` is treated as Shift+A
+        // so tests can drive generation with a single KeyCode.
+        let shift = matches!(key, KeyCode::Char('A'));
+        self.on_key_with_modifiers(key, shift);
+    }
+
+    /// Modifier-aware dispatch (the event loop calls this). Only Shift+A
+    /// generates a message in the commit box, so a literal `A` (caps lock
+    /// or otherwise without Shift) still types normally.
+    pub fn on_key_with_modifiers(&mut self, key: KeyCode, shift_held: bool) {
+        // A new action dismisses the previous error/notice; async failures
+        // from this action arrive later via `poll` and replace them.
         self.error = None;
+        self.notice = None;
+        if self.mode == Mode::Committing
+            && matches!(key, KeyCode::Char('a' | 'A'))
+            && shift_held
+        {
+            self.begin_generate_commit_message();
+            return;
+        }
+        self.on_key_inner(key);
+    }
+
+    fn on_key_inner(&mut self, key: KeyCode) {
+        if self.mode == Mode::LlmSettings {
+            // Shift+A must not leak generation in here: the form owns every
+            // key until Enter saves or Esc cancels.
+            self.on_key_llm_settings(key);
+            return;
+        }
         if self.mode == Mode::FullDiff {
             self.on_key_full_diff(key);
             return;
@@ -849,11 +1081,13 @@ impl App {
                     // FullDiff and FindFile return before reaching here.
                     // OpenProject/ConfirmInit submit through `Workspace`
                     // (it owns all projects), so they are no-ops here.
+                    // LlmSettings is routed to `on_key_llm_settings` above.
                     Mode::Normal
                     | Mode::FullDiff
                     | Mode::FindFile
                     | Mode::OpenProject
-                    | Mode::ConfirmInit => {}
+                    | Mode::ConfirmInit
+                    | Mode::LlmSettings => {}
                 },
                 KeyCode::Esc => {
                     self.mode = match self.mode {
@@ -928,6 +1162,8 @@ impl App {
         } else if k.commit.contains(&key) {
             self.mode = Mode::Committing;
             self.draft.clear();
+        } else if k.llm_settings.contains(&key) {
+            self.begin_llm_settings();
         } else if k.find_files.contains(&key) {
             self.open_finder();
         } else if k.refresh.contains(&key) {
@@ -1652,6 +1888,12 @@ impl App {
     /// either incrementally.
     pub fn poll(&mut self) {
         while let Some(result) = self.queue.try_recv() {
+            self.apply(result);
+        }
+        self.maybe_load_diff();
+    }
+
+    fn apply(&mut self, result: AsyncResult) {
             match result {
                 AsyncResult::Status(st) => {
                     self.status = Some(st);
@@ -1695,6 +1937,16 @@ impl App {
                 AsyncResult::SyncStatus(st) => {
                     self.sync = Some(st);
                 }
+                AsyncResult::GeneratedMessage(msg) => {
+                    self.generating = false;
+                    // The user may have Esc'd while the network call was in
+                    // flight: only fill the open commit box.
+                    if self.mode == Mode::Committing {
+                        self.draft = msg;
+                        self.move_draft_end();
+                        self.error = None;
+                    }
+                }
                 AsyncResult::MutationDone => {
                     self.syncing = None;
                     self.refresh();
@@ -1706,6 +1958,7 @@ impl App {
                 }
                 AsyncResult::Error(e) => {
                     self.syncing = None;
+                    self.generating = false;
                     // EmptyCommit on its own doesn't say how to fix it.
                     self.error = Some(match e {
                         GitError::EmptyCommit => {
@@ -1716,8 +1969,6 @@ impl App {
                     });
                 }
             }
-        }
-        self.maybe_load_diff();
     }
 }
 
@@ -3076,7 +3327,7 @@ mod tests {
         };
         let config = Config {
             keys,
-            theme: crate::config::Theme::default_theme(),
+            ..Default::default()
         };
         let mut fx = Fixture {
             _dir: dir,
@@ -3098,5 +3349,147 @@ mod tests {
                 .any(|e| e.path == "a.txt" && e.state == FileState::Staged)
         });
         assert_eq!(st.files[0].state, FileState::Staged);
+    }
+
+    #[test]
+    fn shift_a_in_commit_box_starts_generation_and_no_staged_errors() {
+        let mut fx = harness(&["a.txt"]);
+        fx.app.on_key(KeyCode::Char('c'));
+        assert_eq!(fx.app.mode(), Mode::Committing);
+        // Legacy single-KeyCode path: `A` means Shift+A.
+        fx.app.on_key(KeyCode::Char('A'));
+        assert!(fx.app.is_generating());
+        let err = wait_for_error(&mut fx.app);
+        assert!(
+            err.contains("nothing staged") || err.contains("API key"),
+            "got: {err}"
+        );
+        assert!(!fx.app.is_generating());
+        assert_eq!(fx.app.mode(), Mode::Committing, "stay in the box to edit");
+    }
+
+    #[test]
+    fn shift_a_without_shift_types_literal_a() {
+        let mut fx = harness(&["a.txt"]);
+        fx.app.on_key(KeyCode::Char('c'));
+        // Real modifier path: no Shift means a literal `A` (caps lock).
+        fx.app.on_key_with_modifiers(KeyCode::Char('A'), false);
+        assert!(!fx.app.is_generating());
+        assert_eq!(fx.app.draft(), "A");
+        // Lowercase always types.
+        fx.app.on_key_with_modifiers(KeyCode::Char('a'), false);
+        assert_eq!(fx.app.draft(), "Aa");
+        // Shift+A generates instead of typing.
+        fx.app.on_key_with_modifiers(KeyCode::Char('a'), true);
+        assert!(fx.app.is_generating());
+        assert_eq!(fx.app.draft(), "Aa", "generation must not type into the draft");
+    }
+
+    #[test]
+    fn generated_message_fills_draft_and_moves_cursor_to_end() {
+        let mut fx = harness(&["a.txt"]);
+        fx.app.on_key(KeyCode::Char('c'));
+        assert_eq!(fx.app.mode(), Mode::Committing);
+        fx.app.generating = true;
+        fx.app.apply(git_tui_core::jobqueue::AsyncResult::GeneratedMessage(
+            "feat: add thing".into(),
+        ));
+        assert_eq!(fx.app.draft(), "feat: add thing");
+        assert_eq!(fx.app.draft_cursor(), fx.app.draft().chars().count());
+        assert!(!fx.app.is_generating());
+        assert!(fx.app.error().is_none());
+    }
+
+    #[test]
+    fn generated_message_arriving_after_esc_is_ignored() {
+        let mut fx = harness(&["a.txt"]);
+        fx.app.on_key(KeyCode::Char('c'));
+        fx.app.generating = true;
+        fx.app.on_key(KeyCode::Esc);
+        assert_eq!(fx.app.mode(), Mode::Normal);
+        fx.app.generating = true;
+        fx.app.apply(git_tui_core::jobqueue::AsyncResult::GeneratedMessage(
+            "feat: late".into(),
+        ));
+        assert!(!fx.app.is_generating());
+        assert_eq!(fx.app.draft(), "", "closed box must not be filled");
+    }
+
+    #[test]
+    fn shift_a_in_file_list_opens_llm_settings_prefilled() {
+        let mut fx = harness(&["a.txt"]);
+        assert_eq!(fx.app.mode(), Mode::Normal);
+        fx.app.on_key(KeyCode::Char('A'));
+        assert_eq!(fx.app.mode(), Mode::LlmSettings);
+        assert_eq!(fx.app.llm_selected(), 0);
+        // Prefilled from the session config (defaults here).
+        assert_eq!(fx.app.llm_field_value(0), "openai");
+        assert_eq!(fx.app.llm_field_value(1), "gpt-4o-mini");
+    }
+
+    #[test]
+    fn llm_settings_tab_switches_fields_and_typing_edits() {
+        let mut fx = harness(&["a.txt"]);
+        fx.app.on_key(KeyCode::Char('A'));
+        fx.app.on_key(KeyCode::Tab);
+        assert_eq!(fx.app.llm_selected(), 1);
+        for c in "x-model".chars() {
+            fx.app.on_key(KeyCode::Char(c));
+        }
+        assert!(fx.app.llm_field_value(1).contains("x-model"));
+        fx.app.on_key(KeyCode::Up);
+        assert_eq!(fx.app.llm_selected(), 0);
+        // Row 0 kept its prefilled value (stash/unstash round-trip).
+        assert_eq!(fx.app.llm_field_value(0), "openai");
+    }
+
+    #[test]
+    fn llm_settings_esc_cancels_without_applying() {
+        let mut fx = harness(&["a.txt"]);
+        fx.app.on_key(KeyCode::Char('A'));
+        fx.app.on_key(KeyCode::Tab);
+        fx.app.on_key(KeyCode::Tab);
+        for c in "junk".chars() {
+            fx.app.on_key(KeyCode::Char(c));
+        }
+        fx.app.on_key(KeyCode::Esc);
+        assert_eq!(fx.app.mode(), Mode::Normal);
+        assert_eq!(fx.app.llm.provider, "openai", "cancel must not apply");
+        assert!(fx.app.notice().is_none());
+    }
+
+    #[test]
+    fn llm_settings_enter_with_bad_provider_stays_open() {
+        let mut fx = harness(&["a.txt"]);
+        fx.app.on_key(KeyCode::Char('A'));
+        fx.app.clear_draft();
+        for c in "skynet".chars() {
+            fx.app.on_key(KeyCode::Char(c));
+        }
+        fx.app.on_key(KeyCode::Enter);
+        assert_eq!(fx.app.mode(), Mode::LlmSettings, "bad input stays open");
+        assert!(fx.app.error().unwrap_or("").contains("unknown provider"));
+        assert_eq!(fx.app.llm.provider, "openai", "bad input not applied");
+    }
+
+    #[test]
+    fn llm_settings_enter_saves_and_persists_to_file() {
+        let mut fx = harness(&["a.txt"]);
+        let dir = tempfile::TempDir::new().unwrap();
+        let cfg_path = dir.path().join("config.toml");
+        fx.app.set_config_path(Some(cfg_path.clone()));
+        fx.app.on_key(KeyCode::Char('A'));
+        // Provider row: replace "openai" with "ollama".
+        fx.app.clear_draft();
+        for c in "ollama".chars() {
+            fx.app.on_key(KeyCode::Char(c));
+        }
+        fx.app.on_key(KeyCode::Enter);
+        assert_eq!(fx.app.mode(), Mode::Normal);
+        assert_eq!(fx.app.llm.provider, "ollama");
+        assert!(fx.app.notice().unwrap_or("").contains("saved"));
+        // Round-trips through the real config file.
+        let cfg = Config::load_from_path(&cfg_path).unwrap();
+        assert_eq!(cfg.llm.provider, "ollama");
     }
 }

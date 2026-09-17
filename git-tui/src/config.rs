@@ -6,6 +6,7 @@
 
 use anyhow::{Context, Result};
 use crossterm::event::KeyCode;
+use git_tui_core::llm::LlmConfig;
 use ratatui::style::Color;
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -39,6 +40,7 @@ pub const ACTIONS: &[&str] = &[
     "project_close",
     "sync_pull",
     "sync_push",
+    "llm_settings",
 ];
 
 /// Key names accepted in `[keys]` besides single characters.
@@ -93,6 +95,8 @@ pub struct KeyBindings {
     pub project_close: Vec<KeyCode>,
     pub sync_pull: Vec<KeyCode>,
     pub sync_push: Vec<KeyCode>,
+    /// Opens the in-TUI LLM setup form (`A` by default in the file list).
+    pub llm_settings: Vec<KeyCode>,
 }
 
 impl Default for KeyBindings {
@@ -125,6 +129,8 @@ impl Default for KeyBindings {
             project_close: vec![Char('q')],
             sync_pull: vec![Char('p')],
             sync_push: vec![Char('P')],
+            // Shift+A in the file list (Shift+a normalizes to `A`).
+            llm_settings: vec![Char('A')],
         }
     }
 }
@@ -256,6 +262,11 @@ impl Theme {
 pub struct Config {
     pub keys: KeyBindings,
     pub theme: Theme,
+    /// LLM provider for Shift+A commit generation in the commit box.
+    /// `~/.config/git-tui/config.toml` `[llm]` section; empty key falls
+    /// back to `$OPENAI_API_KEY` / `$ANTHROPIC_API_KEY` / `$GEMINI_API_KEY`
+    /// / `$OPENROUTER_API_KEY` / `$LLM_API_KEY` at generation time.
+    pub llm: LlmConfig,
 }
 
 impl Default for Config {
@@ -263,6 +274,7 @@ impl Default for Config {
         Self {
             keys: KeyBindings::default(),
             theme: Theme::default_theme(),
+            llm: LlmConfig::default(),
         }
     }
 }
@@ -301,6 +313,48 @@ impl Config {
         })
     }
 
+    /// Persist just the `[llm]` section to `path`, preserving every other
+    /// section already in the file (keys, theme). Creates parent dirs.
+    /// Used by the in-TUI setup form (`A` in the file list).
+    pub fn save_llm_to_path(path: &Path, llm: &LlmConfig) -> Result<()> {
+        let mut doc: toml::Table = if path.exists() {
+            let text = std::fs::read_to_string(path)
+                .with_context(|| format!("cannot read config {}", path.display()))?;
+            toml::from_str(&text).with_context(|| format!("bad config {}", path.display()))?
+        } else {
+            toml::Table::new()
+        };
+        let mut table = toml::Table::new();
+        table.insert(
+            "provider".to_string(),
+            toml::Value::String(llm.provider.clone()),
+        );
+        table.insert(
+            "model".to_string(),
+            toml::Value::String(llm.model.clone()),
+        );
+        table.insert(
+            "api_key".to_string(),
+            toml::Value::String(llm.api_key.clone()),
+        );
+        if let Some(url) = llm.base_url.as_deref().filter(|u| !u.trim().is_empty()) {
+            table.insert(
+                "base_url".to_string(),
+                toml::Value::String(url.to_string()),
+            );
+        }
+        doc.insert("llm".to_string(), toml::Value::Table(table));
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("cannot create {}", parent.display()))?;
+        }
+        let text =
+            toml::to_string_pretty(&doc).context("cannot serialize config")?;
+        std::fs::write(path, text)
+            .with_context(|| format!("cannot write config {}", path.display()))?;
+        Ok(())
+    }
+
     fn from_toml(text: &str) -> Result<Self> {
         #[derive(Default, Deserialize)]
         #[serde(deny_unknown_fields)]
@@ -309,6 +363,8 @@ impl Config {
             keys: HashMap<String, OneOrMany>,
             #[serde(default)]
             theme: ThemeSection,
+            #[serde(default)]
+            llm: LlmSection,
         }
 
         #[derive(Deserialize)]
@@ -323,6 +379,19 @@ impl Config {
         struct ThemeSection {
             #[serde(default)]
             name: Option<String>,
+        }
+
+        #[derive(Default, Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct LlmSection {
+            #[serde(default)]
+            provider: Option<String>,
+            #[serde(default)]
+            model: Option<String>,
+            #[serde(default)]
+            api_key: Option<String>,
+            #[serde(default)]
+            base_url: Option<String>,
         }
 
         let file: FileConfig = toml::from_str(text).context("cannot parse TOML")?;
@@ -367,6 +436,7 @@ impl Config {
                 "project_close" => k.project_close = keys,
                 "sync_pull" => k.sync_pull = keys,
                 "sync_push" => k.sync_push = keys,
+                "llm_settings" => k.llm_settings = keys,
                 _ => anyhow::bail!(
                     "unknown action [{action}] (expected one of: {})",
                     ACTIONS.join(", ")
@@ -375,6 +445,32 @@ impl Config {
         }
         if let Some(name) = file.theme.name {
             cfg.theme = Theme::by_name(&name)?;
+        }
+        if let Some(provider) = file.llm.provider {
+            let p = provider.trim().to_lowercase();
+            if git_tui_core::llm::PROVIDERS.contains(&p.as_str()) {
+                cfg.llm.provider = p;
+            } else {
+                anyhow::bail!(
+                    "unknown llm provider {provider:?} (expected one of: {})",
+                    git_tui_core::llm::PROVIDERS.join(", ")
+                );
+            }
+        }
+        if let Some(model) = file.llm.model {
+            if model.trim().is_empty() {
+                anyhow::bail!("llm model must not be empty");
+            }
+            cfg.llm.model = model.trim().to_string();
+        }
+        if let Some(key) = file.llm.api_key {
+            cfg.llm.api_key = key.trim().to_string();
+        }
+        if let Some(url) = file.llm.base_url {
+            if url.trim().is_empty() {
+                anyhow::bail!("llm base_url must not be empty");
+            }
+            cfg.llm.base_url = Some(url.trim().to_string());
         }
         Ok(cfg)
     }
@@ -541,5 +637,88 @@ mod tests {
         let field = dir.path().join("d.toml");
         std::fs::write(&field, "[theme]\nstyle = \"tokyo-night\"\n").unwrap();
         assert!(Config::load_from_path(&field).is_err());
+    }
+
+    #[test]
+    fn llm_defaults_to_openai_without_key() {
+        let cfg = Config::default();
+        assert_eq!(cfg.llm.provider, "openai");
+        assert_eq!(cfg.llm.model, "gpt-4o-mini");
+        assert!(cfg.llm.api_key.is_empty());
+    }
+
+    #[test]
+    fn llm_section_overrides_provider_model_and_key() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("llm.toml");
+        std::fs::write(
+            &path,
+            "[llm]\nprovider = \"anthropic\"\nmodel = \"claude-3-5-haiku-latest\"\napi_key = \"sk-test\"\n",
+        )
+        .unwrap();
+        let cfg = Config::load_from_path(&path).unwrap();
+        assert_eq!(cfg.llm.provider, "anthropic");
+        assert_eq!(cfg.llm.model, "claude-3-5-haiku-latest");
+        assert_eq!(cfg.llm.api_key, "sk-test");
+        // Keys/theme untouched.
+        assert!(cfg.keys.commit.contains(&KeyCode::Char('c')));
+    }
+
+    #[test]
+    fn llm_settings_key_defaults_to_shift_a() {
+        assert!(KeyBindings::default()
+            .llm_settings
+            .contains(&KeyCode::Char('A')));
+    }
+
+    #[test]
+    fn llm_custom_base_url_and_unknown_provider() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let ok = dir.path().join("ok.toml");
+        std::fs::write(
+            &ok,
+            "[llm]\nprovider = \"custom\"\nbase_url = \"http://localhost:8080/v1\"\n",
+        )
+        .unwrap();
+        let cfg = Config::load_from_path(&ok).unwrap();
+        assert_eq!(cfg.llm.provider, "custom");
+        assert_eq!(
+            cfg.llm.base_url.as_deref(),
+            Some("http://localhost:8080/v1")
+        );
+        let bad = dir.path().join("bad.toml");
+        std::fs::write(&bad, "[llm]\nprovider = \"skynet\"\n").unwrap();
+        assert!(Config::load_from_path(&bad).is_err());
+        let bad_field = dir.path().join("bad2.toml");
+        std::fs::write(&bad_field, "[llm]\napi_keys = \"x\"\n").unwrap();
+        assert!(Config::load_from_path(&bad_field).is_err());
+    }
+
+    #[test]
+    fn save_llm_preserves_other_sections_and_roundtrips() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("git-tui").join("config.toml");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            "[keys]\nquit = \"Q\"\n\n[theme]\nname = \"tokyo-night\"\n",
+        )
+        .unwrap();
+        let llm = LlmConfig {
+            provider: "ollama".into(),
+            model: "llama3.1".into(),
+            api_key: String::new(),
+            base_url: None,
+        };
+        Config::save_llm_to_path(&path, &llm).unwrap();
+        let cfg = Config::load_from_path(&path).unwrap();
+        assert_eq!(cfg.llm.provider, "ollama");
+        assert_eq!(cfg.llm.model, "llama3.1");
+        // Untouched sections survive the merge.
+        assert!(cfg.keys.quit.contains(&KeyCode::Char('Q')));
+        assert_eq!(
+            cfg.theme.border_focused,
+            ratatui::style::Color::Rgb(122, 162, 247)
+        );
     }
 }

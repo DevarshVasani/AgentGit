@@ -1,6 +1,6 @@
 //! Phase 4: status + diff panels (ratatui).
 
-use crate::app::{App, Focus, Mode};
+use crate::app::{App, Focus, Mode, LLM_FIELD_LABELS};
 use crate::config::Theme;
 use crate::syntax::{highlight_line, HiToken};
 use crate::words::{word_diff, WordSeg};
@@ -78,7 +78,11 @@ pub fn render(frame: &mut Frame, app: &App) {
         Block::default().style(Style::default().bg(app.theme().bg)),
         area,
     );
-    let footer_len = if app.error().is_some() { 2 } else { 1 };
+    let footer_len = if app.error().is_some() || app.notice().is_some() {
+        2
+    } else {
+        1
+    };
     let layout = compute_layout(area, footer_len);
 
     render_status_panel(frame, layout.status, app);
@@ -90,7 +94,12 @@ pub fn render(frame: &mut Frame, app: &App) {
     render_footer(frame, layout.footer, app, false);
 
     match app.mode() {
-        Mode::Committing => render_input_modal(frame, area, app, " Commit message "),
+        Mode::Committing => render_input_modal(
+            frame,
+            area,
+            app,
+            commit_title(app),
+        ),
         Mode::NewBranch => render_input_modal(frame, area, app, " New branch name "),
         Mode::StashPush => render_input_modal(frame, area, app, " Stash message "),
         Mode::SetUpstream => render_input_modal(frame, area, app, " Push - set upstream (remote) "),
@@ -99,6 +108,7 @@ pub fn render(frame: &mut Frame, app: &App) {
         }
         Mode::OpenProject => render_open_browser_modal(frame, area, app, &[]),
         Mode::ConfirmInit => render_confirm_init_modal(frame, area, app),
+        Mode::LlmSettings => render_llm_modal(frame, area, app),
         Mode::FindFile => {
             // Opened fullscreen: keep the diff behind the modal.
             if app.finder_return() == Mode::FullDiff {
@@ -137,7 +147,11 @@ pub fn render_workspace(frame: &mut Frame, ws: &Workspace) {
     };
     render_project_bar(frame, bar, ws);
     let app = ws.current();
-    let footer_len = if app.error().is_some() { 2 } else { 1 };
+    let footer_len = if app.error().is_some() || app.notice().is_some() {
+        2
+    } else {
+        1
+    };
     let layout = compute_layout(body, footer_len);
 
     render_status_panel(frame, layout.status, app);
@@ -149,7 +163,12 @@ pub fn render_workspace(frame: &mut Frame, ws: &Workspace) {
     render_footer(frame, layout.footer, app, true);
 
     match app.mode() {
-        Mode::Committing => render_input_modal(frame, area, app, " Commit message "),
+        Mode::Committing => render_input_modal(
+            frame,
+            area,
+            app,
+            commit_title(app),
+        ),
         Mode::NewBranch => render_input_modal(frame, area, app, " New branch name "),
         Mode::StashPush => render_input_modal(frame, area, app, " Stash message "),
         Mode::SetUpstream => render_input_modal(frame, area, app, " Push - set upstream (remote) "),
@@ -158,6 +177,7 @@ pub fn render_workspace(frame: &mut Frame, ws: &Workspace) {
         }
         Mode::OpenProject => render_open_browser_modal(frame, area, app, ws.project_roots()),
         Mode::ConfirmInit => render_confirm_init_modal(frame, area, app),
+        Mode::LlmSettings => render_llm_modal(frame, area, app),
         Mode::FindFile => {
             if app.finder_return() == Mode::FullDiff {
                 render_fullscreen_diff(frame, body, app);
@@ -1125,6 +1145,21 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App, multi: bool) {
             chunks[0],
         );
         frame.render_widget(footer_hints(app, theme, multi), chunks[1]);
+    } else if let Some(note) = app.notice() {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(1), Constraint::Length(1)])
+            .split(area);
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![Span::styled(
+                note.to_string(),
+                Style::default()
+                    .fg(theme.branch_current)
+                    .add_modifier(Modifier::BOLD),
+            )])),
+            chunks[0],
+        );
+        frame.render_widget(footer_hints(app, theme, multi), chunks[1]);
     } else {
         frame.render_widget(footer_hints(app, theme, multi), area);
     }
@@ -1132,7 +1167,12 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App, multi: bool) {
 
 fn footer_hints(app: &App, theme: Theme, multi: bool) -> Paragraph<'static> {
     let base = match app.mode() {
-        Mode::Committing => "←/→ move · Home/End jump · Del deletes · Enter commit · Esc cancel",
+        Mode::Committing if app.is_generating() => {
+            "generating from staged diff… · Esc cancel"
+        }
+        Mode::Committing => {
+            "←/→ move · Home/End jump · Del deletes · Shift+A generate from staged · Enter commit · Esc cancel"
+        }
         Mode::NewBranch => "←/→ move · Home/End jump · Del deletes · Enter create branch · Esc cancel",
         Mode::StashPush => "←/→ move · Home/End jump · Del deletes · Enter stash · Esc cancel",
         Mode::SetUpstream => "←/→ move · Home/End jump · Del deletes · Enter push -u · Esc cancel",
@@ -1148,12 +1188,13 @@ fn footer_hints(app: &App, theme: Theme, multi: bool) -> Paragraph<'static> {
             "enter pop · a stash · D drop · tab files · q close · Q quit"
         }
         Mode::FindFile => "type to filter · ↑/↓ move · ←/→ edit · enter open · esc cancel",
+        Mode::LlmSettings => "tab/↑↓ switch field · ←/→ edit · enter save · esc cancel",
         Mode::OpenProject => {
             "type to filter · ↑/↓ move · enter open · → descend · ← up · tab jump to path · esc clear/close"
         }
         Mode::ConfirmInit => "enter git init here · esc back · any other key picks another folder",
         Mode::Normal => {
-            "space stage/unstage · on ▶ dir stages all · c commit · p pull · P push · / find · enter full diff · o open project · r refresh · q close · Q quit"
+            "space stage/unstage · on ▶ dir stages all · c commit · A llm · p pull · P push · / find · enter full diff · o open project · r refresh · q close · Q quit"
         }
     };
     let switch = if multi && app.mode() == Mode::Normal {
@@ -1291,11 +1332,85 @@ fn render_finder_modal(frame: &mut Frame, area: Rect, app: &App) {
     }
 }
 
-fn render_input_modal(frame: &mut Frame, area: Rect, app: &App, title: &'static str) {
+/// Commit modal title: shows the generating state while the LLM call is
+/// in flight so Shift+A has visible feedback.
+fn commit_title(app: &App) -> &'static str {
+    if app.is_generating() {
+        " Commit message (generating…) "
+    } else {
+        " Commit message (Shift+A generates) "
+    }
+}
+
+/// LLM setup form (`A` in the file list): four labeled rows (provider,
+/// model, API key, base URL). The selected row highlights and scrolls
+/// horizontally with the cursor; Enter saves to the config file.
+fn render_llm_modal(frame: &mut Frame, area: Rect, app: &App) {
+    let theme = app.theme();
+    let popup = centered_rect(area, 76, 8);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Block::default().style(Style::default().bg(theme.bg)),
+        popup,
+    );
+    let block = panel_block(
+        true,
+        theme,
+        " LLM setup — Shift+A uses this in the commit box ".to_string(),
+    );
+    let inner_w = popup.width.saturating_sub(2) as usize;
+    let inner_h = popup.height.saturating_sub(2) as usize;
+    let sel = app.llm_selected();
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(inner_h);
+    let mut cursor_col = 0;
+    let mut cursor_row = 0;
+    for (i, label) in LLM_FIELD_LABELS.iter().enumerate() {
+        let selected = i == sel;
+        let value = app.llm_field_value(i).to_string();
+        let width = inner_w.saturating_sub(label.len() + 4);
+        let (visible, col) = input_window(&value, app.draft_cursor(), width.max(1));
+        if selected {
+            cursor_col = col;
+            cursor_row = lines.len();
+        }
+        let marker = if selected { "> " } else { "  " };
+        let prefix = format!("{marker}{label}: ");
+        let style = if selected {
+            selection_style(theme)
+        } else {
+            Style::default().fg(theme.fg).bg(theme.bg)
+        };
+        let used = prefix.width() + visible.width();
+        let pad = inner_w.saturating_sub(used);
+        lines.push(Line::from(vec![
+            Span::styled(marker.to_string(), style),
+            Span::styled(label.to_string(), style),
+            Span::styled(": ".to_string(), style),
+            Span::styled(visible, style),
+            Span::styled(" ".repeat(pad), style),
+        ]));
+    }
+    frame.render_widget(Paragraph::new(lines).block(block), popup);
+    let prefix_len = 2 + LLM_FIELD_LABELS[sel].len() + 2;
+    let cursor_x = popup.x + 1 + prefix_len as u16 + cursor_col as u16;
+    let cursor_y = popup.y + 1 + cursor_row as u16;
+    if cursor_x < popup.x + popup.width.saturating_sub(1) {
+        frame.set_cursor_position((cursor_x, cursor_y));
+    }
+}
+
+fn render_input_modal(frame: &mut Frame, area: Rect, app: &App, title: &str) {
     let popup = centered_rect(area, 60, 3);
     frame.render_widget(Clear, popup);
     let inner_w = popup.width.saturating_sub(2) as usize;
-    let (visible, cursor_col) = input_window(app.draft(), app.draft_cursor(), inner_w);
+    // While the LLM call is in flight and the draft is still empty, show a
+    // placeholder so the modal doesn't look stuck on a blank line.
+    let text = if app.is_generating() && app.draft().is_empty() {
+        "generating…"
+    } else {
+        app.draft()
+    };
+    let (visible, cursor_col) = input_window(text, app.draft_cursor(), inner_w);
     let input = Paragraph::new(visible).block(
         Block::default()
             .borders(Borders::ALL)
@@ -1741,7 +1856,6 @@ mod tests {
         }
         out
     }
-
     #[test]
     fn renders_file_list_with_branch_and_selection() {
         let (_dir, app) =
@@ -1759,6 +1873,20 @@ mod tests {
         let s = screen(&app, 80, 28);
         assert!(s.contains("clean"), "empty message missing:\n{s}");
         assert!(s.contains("✓"), "clean marker missing:\n{s}");
+    }
+
+    #[test]
+    fn llm_setup_modal_shows_all_fields_and_save_hint() {
+        use crossterm::event::KeyCode;
+        let (_dir, mut app) = test_app();
+        app.on_key(KeyCode::Char('A'));
+        let s = screen(&app, 100, 32);
+        assert!(s.contains("LLM setup"), "modal title missing:\n{s}");
+        for label in ["Provider", "Model", "API key", "Base URL"] {
+            assert!(s.contains(label), "field {label} missing:\n{s}");
+        }
+        assert!(s.contains("openai"), "prefilled provider missing:\n{s}");
+        assert!(s.contains("enter save"), "save hint missing:\n{s}");
     }
 
     #[test]
@@ -2370,6 +2498,7 @@ mod tests {
         let config = Config {
             keys: KeyBindings::default(),
             theme: Theme::by_name("tokyo-night").unwrap(),
+            ..Default::default()
         };
         let mut app = App::new_with_config(JobQueue::spawn(dir.path()).unwrap(), config);
         app.set_status_for_test(RepoStatus {
