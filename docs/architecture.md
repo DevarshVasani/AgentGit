@@ -44,6 +44,8 @@ pub struct FileDiff {
 
 pub struct Hunk {
     pub header: String,          // "@@ -10,4 +10,6 @@ fn foo"
+    pub old_start: u32,          // 1-based first old-file line (0 = empty side)
+    pub new_start: u32,          // 1-based first new-file line
     pub lines: Vec<DiffLine>,
 }
 

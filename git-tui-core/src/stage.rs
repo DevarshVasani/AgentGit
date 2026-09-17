@@ -1,0 +1,232 @@
+//! Staging operations.
+
+use crate::diff::LineKind;
+use crate::error::GitError;
+use std::path::Path;
+
+/// Stage a whole file (workdir -> index).
+pub fn stage_file(repo: &git2::Repository, path: &str) -> Result<(), GitError> {
+    let mut index = repo.index()?;
+    index
+        .add_path(Path::new(path))
+        .map_err(|e| GitError::HunkStaging(format!("cannot stage file {path}: {e}")))?;
+    index.write()?;
+    Ok(())
+}
+
+/// Unstage a whole file (index -> HEAD). New files are removed from the index.
+pub fn unstage_file(repo: &git2::Repository, path: &str) -> Result<(), GitError> {
+    // If HEAD exists, reset this path in the index to HEAD.
+    if let Ok(head) = repo.head() {
+        if let Ok(target) = head.peel_to_commit() {
+            let obj = target.as_object().clone();
+            repo.reset_default(Some(&obj), [path])?;
+            // reset_default updates the index on disk; ensure it is written.
+            return Ok(());
+        }
+    }
+    // No HEAD (or unborn): drop the path from the index if present.
+    let mut index = repo.index()?;
+    // remove_path errors if absent; treat as success (already unstaged).
+    let _ = index.remove_path(Path::new(path));
+    index.write()?;
+    Ok(())
+}
+
+/// Stage a single hunk (by index into the unstaged diff) via partial-index
+/// application: only that hunk's changes are written to the index.
+pub fn stage_hunk(repo: &git2::Repository, path: &str, hunk_index: usize) -> Result<(), GitError> {
+    let diff = crate::diff::unstaged_diff(repo, path)?;
+    if hunk_index >= diff.hunks.len() {
+        return Err(GitError::HunkStaging(format!(
+            "hunk index {hunk_index} out of range ({} hunks in {path})",
+            diff.hunks.len()
+        )));
+    }
+    if diff.hunks.is_empty() {
+        return Err(GitError::HunkStaging(format!(
+            "no hunks to stage in {path}"
+        )));
+    }
+    let hunk = &diff.hunks[hunk_index];
+    let (old_start, old_lines) = parse_hunk_header(&hunk.header).ok_or_else(|| {
+        GitError::HunkStaging(format!("cannot parse hunk header: {}", hunk.header))
+    })?;
+
+    let base = index_blob_content(repo, path)?;
+    let base_ends_newline = base.ends_with('\n') || base.is_empty();
+    let mut base_lines: Vec<String> = if base.is_empty() {
+        Vec::new()
+    } else {
+        base.lines().map(|l| l.to_string()).collect()
+    };
+
+    // New lines contributed by this hunk (context + additions).
+    let new_segment: Vec<String> = hunk
+        .lines
+        .iter()
+        .filter(|l| l.kind == LineKind::Context || l.kind == LineKind::Add)
+        .map(|l| l.text.clone())
+        .collect();
+
+    let start = if old_lines == 0 {
+        old_start
+    } else if old_start == 0 {
+        0
+    } else {
+        old_start.saturating_sub(1)
+    };
+    let start = start.min(base_lines.len());
+    let end = (start + old_lines).min(base_lines.len());
+    base_lines.splice(start..end, new_segment);
+
+    let mut new_content = base_lines.join("\n");
+    if !base_lines.is_empty() && base_ends_newline {
+        new_content.push('\n');
+    } else if !new_content.is_empty() {
+        // Preserve workdir trailing-newline convention when base lacked one.
+        if let Ok(wd) = workdir_content(repo, path) {
+            if wd.ends_with('\n') {
+                new_content.push('\n');
+            }
+        }
+    }
+
+    write_index_content(repo, path, new_content.as_bytes())?;
+    Ok(())
+}
+
+fn index_blob_content(repo: &git2::Repository, path: &str) -> Result<String, GitError> {
+    let index = repo.index()?;
+    match index.get_path(Path::new(path), 0) {
+        Some(entry) => {
+            let blob = repo.find_blob(entry.id)?;
+            Ok(String::from_utf8_lossy(blob.content()).into_owned())
+        }
+        None => Ok(String::new()),
+    }
+}
+
+fn workdir_content(repo: &git2::Repository, path: &str) -> Result<String, GitError> {
+    let full = repo
+        .workdir()
+        .ok_or_else(|| GitError::HunkStaging("bare repo".into()))?
+        .join(Path::new(path));
+    std::fs::read_to_string(&full)
+        .map_err(|e| GitError::HunkStaging(format!("cannot read {path}: {e}")))
+}
+
+fn write_index_content(repo: &git2::Repository, path: &str, data: &[u8]) -> Result<(), GitError> {
+    let mut index = repo.index()?;
+    let entry = match index.get_path(Path::new(path), 0) {
+        Some(e) => e,
+        None => git2::IndexEntry {
+            ctime: git2::IndexTime::new(0, 0),
+            mtime: git2::IndexTime::new(0, 0),
+            dev: 0,
+            ino: 0,
+            mode: 0o100644,
+            uid: 0,
+            gid: 0,
+            file_size: data.len() as u32,
+            id: git2::Oid::zero(),
+            flags: 0,
+            flags_extended: 0,
+            path: path.as_bytes().to_vec(),
+        },
+    };
+    index
+        .add_frombuffer(&entry, data)
+        .map_err(|e| GitError::HunkStaging(format!("cannot write partial hunk to index: {e}")))?;
+    index.write()?;
+    Ok(())
+}
+
+/// Parse `"@@ -old_start[,old_lines] +new_start[,new_lines] @@ ..."`
+/// into `(old_start, old_lines)`.
+fn parse_hunk_header(header: &str) -> Option<(usize, usize)> {
+    let header = header.trim();
+    let inner = header.strip_prefix("@@")?.split("@@").next()?.trim();
+    let mut parts = inner.split_whitespace();
+    let old = parts.next()?.strip_prefix('-')?;
+    let (start_s, lines_s) = match old.split_once(',') {
+        Some((s, l)) => (s, Some(l)),
+        None => (old, None),
+    };
+    let start: usize = start_s.parse().ok()?;
+    let lines: usize = match lines_s {
+        Some(l) => l.parse().ok()?,
+        None => 1,
+    };
+    Some((start, lines))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testutil;
+    use std::fs;
+
+    fn two_hunk_repo() -> (tempfile::TempDir, git2::Repository) {
+        let (dir, repo) = testutil::init_repo();
+        let base = (1..=40).map(|i| format!("line {i}\n")).collect::<String>();
+        testutil::commit_file(&repo, "a.txt", &base, "init");
+        let dirty = base.replacen("line 5\n", "line 5 CHANGED\n", 1).replacen(
+            "line 35\n",
+            "line 35 CHANGED\n",
+            1,
+        );
+        fs::write(repo.workdir().unwrap().join("a.txt"), &dirty).unwrap();
+        (dir, repo)
+    }
+
+    #[test]
+    fn stage_single_hunk_leaves_other_hunks_unstaged() {
+        let (_dir, repo) = two_hunk_repo();
+        let before = crate::diff::unstaged_diff(&repo, "a.txt").unwrap();
+        assert!(before.hunks.len() >= 2);
+
+        stage_hunk(&repo, "a.txt", 0).unwrap();
+
+        // Staged diff now has exactly one hunk; unstaged has the remainder.
+        let staged = crate::diff::staged_diff(&repo, "a.txt").unwrap();
+        let unstaged = crate::diff::unstaged_diff(&repo, "a.txt").unwrap();
+        assert_eq!(staged.hunks.len(), 1, "staged: {staged:?}");
+        assert_eq!(unstaged.hunks.len(), before.hunks.len() - 1);
+
+        let status = crate::status::repo_status(&repo).unwrap();
+        let entry = status.files.iter().find(|e| e.path == "a.txt").unwrap();
+        assert_eq!(entry.state, crate::status::FileState::BothStagedAndUnstaged);
+    }
+
+    #[test]
+    fn unstage_file_restores_index_to_head() {
+        let (_dir, repo) = testutil::init_repo();
+        testutil::commit_file(&repo, "a.txt", "a\n", "init");
+        testutil::dirty_file(&repo, "a.txt", "more\n");
+        stage_file(&repo, "a.txt").unwrap();
+        assert!(!crate::diff::staged_diff(&repo, "a.txt")
+            .unwrap()
+            .hunks
+            .is_empty());
+        unstage_file(&repo, "a.txt").unwrap();
+        assert!(crate::diff::staged_diff(&repo, "a.txt")
+            .unwrap()
+            .hunks
+            .is_empty());
+        assert!(!crate::diff::unstaged_diff(&repo, "a.txt")
+            .unwrap()
+            .hunks
+            .is_empty());
+    }
+
+    #[test]
+    fn stage_out_of_range_hunk_index_errors() {
+        let (_dir, repo) = two_hunk_repo();
+        let err = stage_hunk(&repo, "a.txt", 99).unwrap_err();
+        match err {
+            GitError::HunkStaging(_) => {}
+            other => panic!("wrong error: {other:?}"),
+        }
+    }
+}
