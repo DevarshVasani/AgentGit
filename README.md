@@ -43,7 +43,21 @@ quit = "Q"
 project_close = "q"
 sync_pull = "p"
 sync_push = "P"
+
+[llm]
+provider = "openai"  # openai | openrouter | ollama | anthropic | gemini | custom
+model = "gpt-4o-mini"
+api_key = "sk-..."  # or leave empty and export $OPENAI_API_KEY ($ANTHROPIC_API_KEY,
+                    # $GEMINI_API_KEY, $OPENROUTER_API_KEY, or generic $LLM_API_KEY)
+# base_url = "http://localhost:11434/v1"  # only for provider = "custom" (or to override)
 ```
+
+AI commit messages: stage with `space`, press `c` for the commit box,
+then `Shift+A` generates a Conventional-Commits message from the staged
+(index vs HEAD) diffs — every staged file is referenced in the prompt.
+Connect the LLM either through the TUI (press `A` in the file list for
+the setup form: provider, model, API key) or via the file below;
+`ollama` needs no key.
 
 The theme can also be forced for one run (overrides the file):
 
@@ -59,13 +73,15 @@ Key names: single characters, plus `space`, `tab`, `enter`, `esc`,
 `focus_log`, `focus_stash`, `scroll_up`, `scroll_down`, `branch_new`,
 `branch_delete`, `checkout`, `stash_pop`, `stash_push`, `stash_drop`,
  `find_files`, `project_next`, `project_prev`, `project_open`, `project_close`,
- `sync_pull`, `sync_push`.
+ `sync_pull`, `sync_push`, `llm_settings`.
 
 Keyboard flow: `j`/`k` move in the file tree (the selected file's unified
 diff previews inline), `/` fuzzy-finds a file (`enter` jumps to it),
 `enter` opens it fullscreen side-by-side (`esc` closes) — files with no
 changes show the whole file automatically, changed files show the diff —
-`space` stages, `c` commits, `p` pulls, `P` pushes,
+`space` stages, `c` commits (`Shift+A` inside the commit box generates the
+message from staged files, `A` in the file list opens the LLM setup),
+`p` pulls, `P` pushes,
 `1`–`4`/`tab` switch panels. Text boxes
 (commit message, new branch, stash message, jump-to-path, file finder)
 are fully editable: `←`/`→` move the cursor, `Home`/`End` jump,
