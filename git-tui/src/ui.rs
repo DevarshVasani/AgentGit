@@ -213,8 +213,11 @@ fn render_status_panel(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 /// A row of the files tree: a directory header or a file (indexed into
-/// `RepoStatus::files`). Headers are always expanded; selection stays
-/// file-based, so staging keys behave exactly as in the flat list.
+/// `RepoStatus::files`). Collapsed headers render folded (`▶`) and hide
+/// their children; selection stays file-based, so staging keys behave
+/// exactly as in the flat list. When the selected file is hidden inside
+/// a collapsed dir, its shallowest collapsed ancestor header takes the
+/// highlight so the cursor never disappears.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum FileRow<'a> {
     Dir { path: &'a str, depth: usize },
@@ -281,10 +284,40 @@ fn render_files_panel(frame: &mut Frame, area: Rect, app: &App) {
         return;
     }
     let rows = file_rows(&st.files);
+    // Fold collapsed subtrees: drop every row hiding under a collapsed
+    // dir, but keep the collapsed header itself (rendered as `▶`).
+    let rows: Vec<&FileRow> = rows
+        .iter()
+        .filter(|row| {
+            let r: &FileRow = row;
+            let path: &str = match r {
+                FileRow::Dir { path, .. } => path,
+                FileRow::File { index, .. } => st.files[*index].path.as_str(),
+            };
+            !ancestors(path).iter().any(|a| app.is_collapsed(a))
+        })
+        .collect();
     let sel = app.selected().min(st.files.len() - 1);
+    // The selected file's own row, or — when it is hidden inside a
+    // collapsed dir — its shallowest collapsed ancestor header, which
+    // is always visible (its own ancestors are all expanded).
     let sel_row = rows
         .iter()
-        .position(|r| matches!(r, FileRow::File { index, .. } if *index == sel))
+        .position(|row| {
+            let r: &FileRow = row;
+            matches!(r, FileRow::File { index, .. } if *index == sel)
+        })
+        .or_else(|| {
+            ancestors(st.files[sel].path.as_str())
+                .into_iter()
+                .find(|a| app.is_collapsed(a))
+                .and_then(|header| {
+                    rows.iter().position(|row| {
+                        let r: &FileRow = row;
+                        matches!(r, FileRow::Dir { path, .. } if *path == header)
+                    })
+                })
+        })
         .unwrap_or(0);
     let visible = area.height.saturating_sub(2) as usize;
     let off = follow_selection(sel_row, visible, app.files_scroll());
@@ -981,7 +1014,7 @@ fn footer_hints(app: &App, theme: Theme) -> Paragraph<'static> {
         }
         Mode::FindFile => "type to filter · ↑/↓ move · enter open · esc cancel",
         Mode::Normal => {
-            "space stage/unstage · c commit · / find · enter full diff · r refresh · q quit"
+            "space stage/unstage · on ▶ dir stages all · c commit · / find · enter full diff · r refresh · q quit"
         }
     };
     Paragraph::new(Line::styled(hints, Style::default().fg(theme.hint)))
@@ -1386,6 +1419,37 @@ mod tests {
         assert_eq!(rows[4], FileRow::File { index: 1, depth: 3 });
         assert_eq!(rows[6], FileRow::File { index: 2, depth: 1 });
         assert_eq!(rows.len(), 7);
+    }
+
+    #[test]
+    fn collapsed_dir_hides_its_children_and_shows_folded_marker() {
+        let (_dir, mut app) = with_files(&[
+            ("src/a.rs", FileState::Unstaged),
+            ("src/nested/b.rs", FileState::Unstaged),
+            ("z.txt", FileState::Unstaged),
+        ]);
+        app.set_collapsed("src", true);
+        let s = screen(&app, 100, 32);
+        assert!(s.contains("▶ src/"), "collapsed header missing:\n{s}");
+        assert!(!s.contains("a.rs"), "hidden child leaked:\n{s}");
+        assert!(!s.contains("b.rs"), "hidden nested child leaked:\n{s}");
+        assert!(s.contains("z.txt"), "visible file missing:\n{s}");
+    }
+
+    #[test]
+    fn collapsing_nested_dir_keeps_sibling_visible() {
+        let (_dir, mut app) = with_files(&[
+            ("src/a.rs", FileState::Unstaged),
+            ("src/nested/b.rs", FileState::Unstaged),
+            ("z.txt", FileState::Unstaged),
+        ]);
+        app.set_collapsed("src/nested", true);
+        let s = screen(&app, 100, 32);
+        assert!(s.contains("▼ src/"), "expanded parent missing:\n{s}");
+        assert!(s.contains("▶ nested/"), "collapsed header missing:\n{s}");
+        assert!(s.contains("a.rs"), "visible sibling missing:\n{s}");
+        assert!(!s.contains("b.rs"), "hidden nested child leaked:\n{s}");
+        assert!(s.contains("z.txt"), "visible file missing:\n{s}");
     }
 
     #[test]

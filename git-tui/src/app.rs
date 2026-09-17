@@ -653,7 +653,8 @@ impl App {
     }
 
     /// Toggle collapse on the deepest collapsed-capable ancestor of the
-    /// selected file (or expand when that ancestor is collapsed).
+    /// selected file (or expand when that ancestor is collapsed). Only
+    /// the deepest directory flips so sibling subtrees stay visible.
     fn toggle_folder(&mut self) {
         let Some(file) = self.selected_file() else {
             return;
@@ -664,9 +665,7 @@ impl App {
             return;
         };
         let collapsed = !self.collapsed.contains(&deepest);
-        for dir in dirs {
-            self.set_collapsed(&dir, collapsed);
-        }
+        self.set_collapsed(&deepest, collapsed);
         // Stay put when collapsing under the cursor: the cursor may now
         // sit on a hidden file, and Down skips out while Up re-enters,
         // so collapsing never yanks the selection elsewhere.
@@ -706,11 +705,32 @@ impl App {
             .unwrap_or(0)
     }
 
-    /// Space: stage unless already fully staged (then unstage).
+    /// Space: stage unless already fully staged (then unstage). When the
+    /// highlight sits on a collapsed directory header (the selected file
+    /// is hidden inside it), the whole directory is staged/unstaged so
+    /// its files are ready to commit together.
     fn toggle_stage(&mut self) {
         let Some(file) = self.selected_file().cloned() else {
             return;
         };
+        if let Some(dir) = self.collapsed_dir_for(&file.path) {
+            self.toggle_stage_dir(&dir);
+        } else {
+            self.toggle_stage_file(&file);
+        }
+    }
+
+    /// Shallowest collapsed ancestor of `path` (the header the UI
+    /// highlights when this file is hidden), or `None` when visible.
+    /// Mirrors the highlight fallback in `ui.rs`.
+    fn collapsed_dir_for(&self, path: &str) -> Option<String> {
+        ancestors_of(path)
+            .into_iter()
+            .find(|dir| self.collapsed.contains(dir.as_str()))
+    }
+
+    /// Space on one visible file: stage unless already fully staged.
+    fn toggle_stage_file(&mut self, file: &StatusEntry) {
         if file.state == FileState::Conflicted {
             self.error = Some(format!(
                 "conflicted: resolve markers in {} first",
@@ -723,13 +743,64 @@ impl App {
             return;
         }
         let job = if file.state == FileState::Staged {
-            AsyncJob::UnstageFile { path: file.path }
+            AsyncJob::UnstageFile {
+                path: file.path.clone(),
+            }
         } else {
-            AsyncJob::StageFile { path: file.path }
+            AsyncJob::StageFile {
+                path: file.path.clone(),
+            }
         };
         if let Err(e) = self.queue.submit(job) {
             self.error = Some(e.to_string());
         }
+    }
+
+    /// Space on a collapsed directory header: stage every stageable file
+    /// beneath it, or unstage them all when every one is already staged.
+    /// Conflicted files abort the whole directory like the single-file
+    /// case; clean files are skipped silently.
+    fn toggle_stage_dir(&mut self, dir: &str) {
+        let prefix = format!("{dir}/");
+        let under: Vec<(String, FileState)> = self
+            .file_list
+            .iter()
+            .filter(|e| e.path.starts_with(&prefix))
+            .map(|e| (e.path.clone(), e.state))
+            .collect();
+        if let Some((path, _)) = under.iter().find(|(_, s)| *s == FileState::Conflicted) {
+            self.error = Some(format!("conflicted: resolve markers in {path} first"));
+            return;
+        }
+        let to_stage: Vec<String> = under
+            .iter()
+            .filter(|(_, s)| !matches!(s, FileState::Clean | FileState::Staged))
+            .map(|(p, _)| p.clone())
+            .collect();
+        if !to_stage.is_empty() {
+            for path in to_stage {
+                if let Err(e) = self.queue.submit(AsyncJob::StageFile { path }) {
+                    self.error = Some(e.to_string());
+                    return;
+                }
+            }
+            return;
+        }
+        let staged: Vec<String> = under
+            .iter()
+            .filter(|(_, s)| *s == FileState::Staged)
+            .map(|(p, _)| p.clone())
+            .collect();
+        if !staged.is_empty() {
+            for path in staged {
+                if let Err(e) = self.queue.submit(AsyncJob::UnstageFile { path }) {
+                    self.error = Some(e.to_string());
+                    return;
+                }
+            }
+            return;
+        }
+        self.error = Some(format!("nothing to stage under {dir}/"));
     }
 
     fn submit_commit(&mut self) {
@@ -1208,6 +1279,22 @@ mod tests {
     }
 
     #[test]
+    fn left_collapses_only_deepest_parent() {
+        let mut fx = harness(&["src/a.rs", "src/nested/b.rs", "z.txt"]);
+        fx.app.on_key(KeyCode::Char('j'));
+        assert_eq!(fx.app.selected_file().unwrap().path, "src/nested/b.rs");
+        fx.app.on_key(KeyCode::Left);
+        assert!(
+            fx.app.is_collapsed("src/nested"),
+            "deepest parent should collapse"
+        );
+        assert!(
+            !fx.app.is_collapsed("src"),
+            "sibling subtree must stay expanded"
+        );
+    }
+
+    #[test]
     fn folders_collapse_expand_and_skip_hidden_files() {
         let mut fx = harness(&["src/a.rs", "src/nested/b.rs", "z.txt"]);
         fx.app.on_key(KeyCode::Left);
@@ -1303,6 +1390,92 @@ mod tests {
         });
         let entry = st.files.iter().find(|e| e.path == "a.txt").unwrap();
         assert_eq!(entry.state, FileState::Unstaged);
+    }
+
+    #[test]
+    fn space_on_collapsed_dir_stages_everything_under_it() {
+        let mut fx = harness(&["src/a.rs", "src/nested/b.rs", "z.txt"]);
+        // Collapse src/; the cursor stays on hidden src/a.rs, so the
+        // header takes the highlight and Space acts on the whole dir.
+        fx.app.on_key(KeyCode::Left);
+        assert_eq!(fx.app.selected_file().unwrap().path, "src/a.rs");
+        fx.app.on_key(KeyCode::Char(' '));
+        let st = wait_for(&mut fx.app, |st| {
+            let under: Vec<_> = st
+                .files
+                .iter()
+                .filter(|e| e.path.starts_with("src/"))
+                .collect();
+            under.len() == 2 && under.iter().all(|e| e.state == FileState::Staged)
+        });
+        let outside = st.files.iter().find(|e| e.path == "z.txt").unwrap();
+        assert_eq!(
+            outside.state,
+            FileState::Unstaged,
+            "files outside the dir must be left alone"
+        );
+    }
+
+    #[test]
+    fn space_on_collapsed_dir_unstages_when_everything_staged() {
+        let mut fx = harness(&["src/a.rs", "src/nested/b.rs"]);
+        fx.app.on_key(KeyCode::Left);
+        fx.app.on_key(KeyCode::Char(' '));
+        wait_for(&mut fx.app, |st| {
+            st.files.len() == 2 && st.files.iter().all(|e| e.state == FileState::Staged)
+        });
+        // Everything under src/ is staged, so Space unstages the whole dir.
+        fx.app.on_key(KeyCode::Char(' '));
+        let st = wait_for(&mut fx.app, |st| {
+            st.files.len() == 2 && st.files.iter().all(|e| e.state == FileState::Unstaged)
+        });
+        assert!(
+            st.files.iter().all(|e| e.state == FileState::Unstaged),
+            "got: {:?}",
+            st.files
+        );
+    }
+
+    #[test]
+    fn space_on_collapsed_dir_with_conflict_reports_error() {
+        let mut fx = harness(&[]);
+        fx.app.status = Some(RepoStatus {
+            branch: "main".into(),
+            head_summary: "x".into(),
+            files: vec![
+                StatusEntry {
+                    path: "src/a.rs".into(),
+                    state: FileState::Unstaged,
+                },
+                StatusEntry {
+                    path: "src/b.rs".into(),
+                    state: FileState::Conflicted,
+                },
+            ],
+            tracked_files: vec!["src/a.rs".into(), "src/b.rs".into()],
+        });
+        fx.app.rebuild_file_list();
+        fx.app.set_collapsed("src", true);
+        fx.app.on_key(KeyCode::Char(' '));
+        let err = fx.app.error().expect("expected conflict error");
+        assert!(err.contains("conflicted"), "got: {err}");
+        assert!(err.contains("src/b.rs"), "got: {err}");
+    }
+
+    #[test]
+    fn space_on_collapsed_dir_with_nothing_to_stage_reports_error() {
+        let mut fx = harness(&[]);
+        fx.app.status = Some(RepoStatus {
+            branch: "main".into(),
+            head_summary: "x".into(),
+            files: vec![],
+            tracked_files: vec!["src/a.rs".into()],
+        });
+        fx.app.rebuild_file_list();
+        fx.app.set_collapsed("src", true);
+        fx.app.on_key(KeyCode::Char(' '));
+        let err = fx.app.error().expect("expected nothing-to-stage error");
+        assert!(err.contains("under src/"), "got: {err}");
     }
 
     #[test]
