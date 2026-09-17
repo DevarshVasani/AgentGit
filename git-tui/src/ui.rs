@@ -93,6 +93,10 @@ pub fn render(frame: &mut Frame, app: &App) {
         Mode::Committing => render_input_modal(frame, area, app, " Commit message "),
         Mode::NewBranch => render_input_modal(frame, area, app, " New branch name "),
         Mode::StashPush => render_input_modal(frame, area, app, " Stash message "),
+        Mode::SetUpstream => render_input_modal(frame, area, app, " Push - set upstream (remote) "),
+        Mode::SetRemote => {
+            render_input_modal(frame, area, app, " Remote URL for origin (publish) ")
+        }
         Mode::OpenProject => render_open_browser_modal(frame, area, app, &[]),
         Mode::ConfirmInit => render_confirm_init_modal(frame, area, app),
         Mode::FindFile => {
@@ -148,6 +152,10 @@ pub fn render_workspace(frame: &mut Frame, ws: &Workspace) {
         Mode::Committing => render_input_modal(frame, area, app, " Commit message "),
         Mode::NewBranch => render_input_modal(frame, area, app, " New branch name "),
         Mode::StashPush => render_input_modal(frame, area, app, " Stash message "),
+        Mode::SetUpstream => render_input_modal(frame, area, app, " Push - set upstream (remote) "),
+        Mode::SetRemote => {
+            render_input_modal(frame, area, app, " Remote URL for origin (publish) ")
+        }
         Mode::OpenProject => render_open_browser_modal(frame, area, app, ws.project_roots()),
         Mode::ConfirmInit => render_confirm_init_modal(frame, area, app),
         Mode::FindFile => {
@@ -275,6 +283,7 @@ fn render_status_panel(frame: &mut Frame, area: Rect, app: &App) {
     // Info strip only: the files panel below owns the Status-focus glow
     // (that is where the cursor lives), so this border stays dim.
     let block = panel_block(false, theme, "[1]-Status".to_string());
+    let sync = sync_suffix(app);
     let line = match app.status() {
         None => Line::raw("loading…"),
         Some(st) if st.files.is_empty() => Line::from(vec![
@@ -284,7 +293,7 @@ fn render_status_panel(frame: &mut Frame, area: Rect, app: &App) {
                     .fg(theme.branch_current)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::raw(format!("{} → {}", app.repo_name(), st.branch)),
+            Span::raw(format!("{} → {}{}", app.repo_name(), st.branch, sync)),
         ]),
         // Count first: the rail is narrow and the tail can clip.
         Some(st) => Line::from(vec![
@@ -295,14 +304,41 @@ fn render_status_panel(frame: &mut Frame, area: Rect, app: &App) {
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw(format!(
-                "{} → {} ({})",
+                "{} → {} ({}){}",
                 app.repo_name(),
                 st.branch,
-                st.files.len()
+                st.files.len(),
+                sync
             )),
         ]),
     };
     frame.render_widget(Paragraph::new(line).block(block), area);
+}
+
+/// Upstream tracking suffix for the status line (` → origin/main ↑2`,
+/// ` · pushing…`, ` · no upstream (P pushes)`). Empty while sync state
+/// is still loading so the line never flickers.
+fn sync_suffix(app: &App) -> String {
+    if let Some(msg) = app.syncing() {
+        return format!(" · {msg}");
+    }
+    let Some(st) = app.sync() else {
+        return String::new();
+    };
+    match &st.upstream {
+        Some(up) => {
+            let mut div = String::new();
+            if st.ahead > 0 {
+                div += &format!(" ↑{}", st.ahead);
+            }
+            if st.behind > 0 {
+                div += &format!(" ↓{}", st.behind);
+            }
+            format!(" → {up}{div}")
+        }
+        None if st.remotes.is_empty() => " · no remote (P publishes)".into(),
+        None => " · no upstream (P pushes)".into(),
+    }
 }
 
 /// A row of the files tree: a directory header or a file (indexed into
@@ -1096,26 +1132,28 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App, multi: bool) {
 
 fn footer_hints(app: &App, theme: Theme, multi: bool) -> Paragraph<'static> {
     let base = match app.mode() {
-        Mode::Committing => "Enter commit · Esc cancel",
-        Mode::NewBranch => "Enter create branch · Esc cancel",
-        Mode::StashPush => "Enter stash · Esc cancel",
+        Mode::Committing => "←/→ move · Home/End jump · Del deletes · Enter commit · Esc cancel",
+        Mode::NewBranch => "←/→ move · Home/End jump · Del deletes · Enter create branch · Esc cancel",
+        Mode::StashPush => "←/→ move · Home/End jump · Del deletes · Enter stash · Esc cancel",
+        Mode::SetUpstream => "←/→ move · Home/End jump · Del deletes · Enter push -u · Esc cancel",
+        Mode::SetRemote => "←/→ move · Home/End jump · Del deletes · Enter add origin + push · Esc cancel",
         Mode::FullDiff => {
-            "j/k hunk · ↑/↓ scroll · space stage hunk · PgUp/PgDn page · / find · esc close · q quit"
+            "j/k hunk · ↑/↓ scroll · space stage hunk · PgUp/PgDn page · / find · p pull · P push · esc close · q close · Q quit"
         }
         Mode::Normal if app.focus() == Focus::Branches => {
-            "enter checkout · a new branch · D delete · tab commits · q quit"
+            "enter checkout · a new branch · D delete · tab commits · q close · Q quit"
         }
-        Mode::Normal if app.focus() == Focus::Log => "j/k scroll · tab stash · r refresh · q quit",
+        Mode::Normal if app.focus() == Focus::Log => "j/k scroll · tab stash · r refresh · q close · Q quit",
         Mode::Normal if app.focus() == Focus::Stash => {
-            "enter pop · a stash · D drop · tab files · q quit"
+            "enter pop · a stash · D drop · tab files · q close · Q quit"
         }
-        Mode::FindFile => "type to filter · ↑/↓ move · enter open · esc cancel",
+        Mode::FindFile => "type to filter · ↑/↓ move · ←/→ edit · enter open · esc cancel",
         Mode::OpenProject => {
             "type to filter · ↑/↓ move · enter open · → descend · ← up · tab jump to path · esc clear/close"
         }
         Mode::ConfirmInit => "enter git init here · esc back · any other key picks another folder",
         Mode::Normal => {
-            "space stage/unstage · on ▶ dir stages all · c commit · / find · enter full diff · o open project · r refresh · q quit"
+            "space stage/unstage · on ▶ dir stages all · c commit · p pull · P push · / find · enter full diff · o open project · r refresh · q close · Q quit"
         }
     };
     let switch = if multi && app.mode() == Mode::Normal {
@@ -1135,6 +1173,40 @@ fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
     let x = area.x + (area.width.saturating_sub(width)) / 2;
     let y = area.y + (area.height.saturating_sub(height)) / 2;
     Rect::new(x, y, width, height)
+}
+
+/// Visible slice of a single-line text input plus the cursor's column
+/// inside it. Scrolls horizontally so a long line (e.g. a commit message
+/// wider than the modal) stays editable: the cursor is always on screen.
+fn input_window(text: &str, cursor: usize, width: usize) -> (String, usize) {
+    use unicode_width::UnicodeWidthChar;
+    let chars: Vec<char> = text.chars().collect();
+    let widths: Vec<usize> = chars.iter().map(|c| c.width().unwrap_or(0)).collect();
+    let cursor = cursor.min(chars.len());
+    let cursor_col: usize = widths[..cursor].iter().sum();
+    let width = width.max(1);
+    let start_col = if cursor_col >= width {
+        cursor_col - width + 1
+    } else {
+        0
+    };
+    let mut out = String::new();
+    let mut col = 0;
+    for (i, c) in chars.iter().enumerate() {
+        let w = widths[i];
+        if col + w <= start_col {
+            col += w;
+            continue;
+        }
+        if col >= start_col + width {
+            break;
+        }
+        // A wide char straddling the left edge would overflow the box:
+        // show a space so columns stay aligned.
+        out.push(if col < start_col { ' ' } else { *c });
+        col += w;
+    }
+    (out, cursor_col - start_col)
 }
 
 /// Telescope-style fuzzy file finder (`/`): query line on top, ranked
@@ -1159,7 +1231,8 @@ fn render_finder_modal(frame: &mut Frame, area: Rect, app: &App) {
     let inner_w = popup.width.saturating_sub(2) as usize;
     let inner_h = popup.height.saturating_sub(2) as usize;
     let mut lines: Vec<Line<'static>> = Vec::with_capacity(inner_h);
-    // Query line.
+    // Query line (scrolls when longer than the box).
+    let (query, query_cursor) = input_window(app.draft(), app.draft_cursor(), inner_w.saturating_sub(2));
     lines.push(Line::from(vec![
         Span::styled(
             "> ",
@@ -1167,7 +1240,7 @@ fn render_finder_modal(frame: &mut Frame, area: Rect, app: &App) {
                 .fg(theme.border_focused)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(app.draft().to_string(), Style::default().fg(theme.fg)),
+        Span::styled(query, Style::default().fg(theme.fg)),
     ]));
     // Match window follows the cursor (stateless: cursor only moves ±1 and
     // resets to 0 on every keystroke).
@@ -1210,8 +1283,8 @@ fn render_finder_modal(frame: &mut Frame, area: Rect, app: &App) {
         ]));
     }
     frame.render_widget(Paragraph::new(lines).block(block), popup);
-    // Cursor just after the query text.
-    let cursor_x = popup.x + 1 + 2 + app.draft().width() as u16;
+    // Cursor inside the (possibly scrolled) query text.
+    let cursor_x = popup.x + 1 + 2 + query_cursor as u16;
     let cursor_y = popup.y + 1;
     if cursor_x < popup.x + popup.width.saturating_sub(1) {
         frame.set_cursor_position((cursor_x, cursor_y));
@@ -1221,15 +1294,17 @@ fn render_finder_modal(frame: &mut Frame, area: Rect, app: &App) {
 fn render_input_modal(frame: &mut Frame, area: Rect, app: &App, title: &'static str) {
     let popup = centered_rect(area, 60, 3);
     frame.render_widget(Clear, popup);
-    let input = Paragraph::new(app.draft()).block(
+    let inner_w = popup.width.saturating_sub(2) as usize;
+    let (visible, cursor_col) = input_window(app.draft(), app.draft_cursor(), inner_w);
+    let input = Paragraph::new(visible).block(
         Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
             .title(title),
     );
     frame.render_widget(input, popup);
-    // Cursor just after the draft text (single-line input).
-    let cursor_x = popup.x + 1 + app.draft().len() as u16;
+    // Cursor tracks the true edit position, even when the text is scrolled.
+    let cursor_x = popup.x + 1 + cursor_col as u16;
     let cursor_y = popup.y + 1;
     if cursor_x < popup.x + popup.width.saturating_sub(1) {
         frame.set_cursor_position((cursor_x, cursor_y));
@@ -1282,9 +1357,14 @@ fn render_open_browser_modal(
         ),
     ]));
     if browser.editing_path {
+        let (visible, _) = input_window(
+            app.draft(),
+            app.draft_cursor(),
+            inner_w.saturating_sub("path: ".len()),
+        );
         lines.push(Line::from(vec![
             Span::styled("path: ", Style::default().fg(theme.hint)),
-            Span::styled(app.draft().to_string(), Style::default().fg(theme.fg)),
+            Span::styled(visible, Style::default().fg(theme.fg)),
         ]));
     }
     if !browser.filter.is_empty() {
@@ -1371,7 +1451,12 @@ fn render_open_browser_modal(
     }
     frame.render_widget(Paragraph::new(lines).block(block), popup);
     if browser.editing_path {
-        let cursor_x = popup.x + 1 + "path: ".len() as u16 + app.draft().len() as u16;
+        let (_, col) = input_window(
+            app.draft(),
+            app.draft_cursor(),
+            inner_w.saturating_sub("path: ".len()),
+        );
+        let cursor_x = popup.x + 1 + "path: ".len() as u16 + col as u16;
         let cursor_y = popup.y + 2;
         if cursor_x < popup.x + popup.width.saturating_sub(1) {
             frame.set_cursor_position((cursor_x, cursor_y));
@@ -1905,6 +1990,51 @@ mod tests {
         let s = screen(&app, 40, 10);
         assert!(s.contains("Commit"), "modal title missing:\n{s}");
         assert!(s.contains("hi"), "draft missing:\n{s}");
+    }
+
+    #[test]
+    fn input_window_keeps_short_text_whole() {
+        let (visible, col) = input_window("hi", 2, 20);
+        assert_eq!(visible, "hi");
+        assert_eq!(col, 2);
+    }
+
+    #[test]
+    fn input_window_scrolls_long_text_to_cursor() {
+        let text: String = "x".repeat(100);
+        // Cursor at the end: the tail is visible, cursor in the last cell
+        // (9 chars + the cursor itself fill the 10-cell window).
+        let (visible, col) = input_window(&text, 100, 10);
+        assert_eq!(visible, "x".repeat(9));
+        assert_eq!(col, 9);
+        // Cursor at the start: the head is visible.
+        let (visible, col) = input_window(&text, 0, 10);
+        assert_eq!(visible, "x".repeat(10));
+        assert_eq!(col, 0);
+        // Cursor in the middle stays on screen.
+        let (visible, col) = input_window(&text, 50, 10);
+        assert_eq!(visible, "x".repeat(10));
+        assert_eq!(col, 9);
+        assert!(visible.len() <= 10);
+    }
+
+    #[test]
+    fn renders_scrolled_commit_modal_without_panic() {
+        use crossterm::event::KeyCode;
+        let (_dir, mut app) = with_files(&[("a.txt", FileState::Unstaged)]);
+        app.on_key(KeyCode::Char('c'));
+        // Far wider than the 60-cell modal: only the tail around the
+        // cursor can show, but the tail of the message must be visible.
+        for c in "commit-message-".chars().cycle().take(120) {
+            app.on_key(KeyCode::Char(c));
+        }
+        let s = screen(&app, 80, 24);
+        assert!(s.contains("Commit"), "modal title missing:\n{s}");
+        assert!(s.contains("message-"), "tail of long draft missing:\n{s}");
+        // Move to the front: the head scrolls back into view.
+        app.on_key(KeyCode::Home);
+        let s = screen(&app, 80, 24);
+        assert!(s.contains("commit-m"), "head of long draft missing:\n{s}");
     }
 
     #[test]

@@ -35,4 +35,7 @@ pub enum GitError {
 
     #[error("stash failed: {0}")]
     Stash(String),
+
+    #[error("sync failed: {0}")]
+    Sync(String),
 }

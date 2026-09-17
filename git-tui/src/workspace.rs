@@ -351,6 +351,21 @@ impl Workspace {
         }
     }
 
+    /// Close the current project tab (`q`). With several tabs open the tab
+    /// is removed and selection moves to the next tab (previous one when the
+    /// last tab closed). With a single tab, closing exits the application.
+    pub fn close_current_project(&mut self) {
+        if self.apps.len() <= 1 {
+            self.request_quit();
+            return;
+        }
+        self.apps.remove(self.current);
+        self.roots.remove(self.current);
+        if self.current >= self.apps.len() {
+            self.current = self.apps.len() - 1;
+        }
+    }
+
     pub fn on_key(&mut self, key: KeyCode) {
         // The browser owns every key until it closes (Enter opens the
         // highlighted folder, Esc closes). No global bindings leak in.
@@ -369,6 +384,19 @@ impl Workspace {
                 KeyCode::Esc => self.current_mut().back_to_open_project(),
                 _ => {}
             }
+            return;
+        }
+        // `q` closes the current project, `Q` (Shift+q) quits the whole app.
+        // Only in Normal/FullDiff: text modals and the finder treat `q` as
+        // literal input. `quit` wins when both actions share a key so a
+        // `quit = ["q", "Q"]` override still quits everything.
+        if matches!(
+            self.current().mode(),
+            Mode::Normal | Mode::FullDiff
+        ) && !self.keys.quit.contains(&key)
+            && self.keys.project_close.contains(&key)
+        {
+            self.close_current_project();
             return;
         }
         if self.current().mode() == Mode::Normal {
@@ -403,6 +431,11 @@ impl Workspace {
             match key {
                 KeyCode::Char(c) => self.current_mut().push_draft_char(c),
                 KeyCode::Backspace => self.current_mut().pop_draft_char(),
+                KeyCode::Delete => self.current_mut().delete_draft_after(),
+                KeyCode::Left => self.current_mut().move_draft_left(),
+                KeyCode::Right => self.current_mut().move_draft_right(),
+                KeyCode::Home => self.current_mut().move_draft_home(),
+                KeyCode::End => self.current_mut().move_draft_end(),
                 KeyCode::Enter => self.submit_jump_path(),
                 KeyCode::Esc => {
                     if let Some(b) = self.current_mut().open_browser_mut() {
@@ -807,6 +840,27 @@ mod tests {
     }
 
     #[test]
+    fn jump_editor_edits_mid_text_with_cursor() {
+        let a = init_repo_with_file("a", "a.txt", "a\n");
+        let mut ws = Workspace::open(vec![a.path().to_path_buf()], Config::default()).unwrap();
+        ws.on_key(KeyCode::Char('o'));
+        ws.on_key(KeyCode::Tab);
+        type_text(&mut ws, "ab");
+        ws.on_key(KeyCode::Left);
+        ws.on_key(KeyCode::Backspace);
+        assert_eq!(ws.current().draft(), "b");
+        ws.on_key(KeyCode::Home);
+        type_text(&mut ws, "x");
+        assert_eq!(ws.current().draft(), "xb");
+        ws.on_key(KeyCode::Esc);
+        assert!(!ws
+            .current()
+            .open_browser()
+            .unwrap()
+            .editing_path);
+    }
+
+    #[test]
     fn jump_to_file_is_an_error() {
         let a = init_repo_with_file("a", "a.txt", "a\n");
         let mut ws = Workspace::open(vec![a.path().to_path_buf()], Config::default()).unwrap();
@@ -920,5 +974,94 @@ mod tests {
         ws.on_key(KeyCode::Esc);
         assert_eq!(ws.current().mode(), Mode::Normal);
         assert_eq!(ws.len(), 2);
+    }
+
+    #[test]
+    fn q_closes_current_project_and_keeps_selection() {
+        let a = init_repo_with_file("a", "a.txt", "a\n");
+        let b = init_repo_with_file("b", "b.txt", "b\n");
+        let mut ws = Workspace::open(
+            vec![a.path().to_path_buf(), b.path().to_path_buf()],
+            Config::default(),
+        )
+        .unwrap();
+        assert_eq!(ws.len(), 2);
+        assert_eq!(ws.index(), 0);
+        ws.on_key(KeyCode::Char('q'));
+        assert!(!ws.should_quit(), "closing one of two tabs must not quit");
+        assert_eq!(ws.len(), 1);
+        assert_eq!(ws.index(), 0);
+    }
+
+    #[test]
+    fn q_on_last_tab_quits_and_shift_q_quits_everything() {
+        let a = init_repo_with_file("a", "a.txt", "a\n");
+        let b = init_repo_with_file("b", "b.txt", "b\n");
+        let mut ws = Workspace::open(
+            vec![a.path().to_path_buf(), b.path().to_path_buf()],
+            Config::default(),
+        )
+        .unwrap();
+        ws.on_key(KeyCode::Char('Q'));
+        assert!(ws.should_quit(), "Shift+Q must quit the whole app");
+
+        let mut ws = Workspace::open(vec![a.path().to_path_buf()], Config::default()).unwrap();
+        ws.on_key(KeyCode::Char('q'));
+        assert!(
+            ws.should_quit(),
+            "closing the last tab must quit the application"
+        );
+    }
+
+    #[test]
+    fn q_in_fullscreen_closes_project_and_Q_quits() {
+        let a = init_repo_with_file("a", "a.txt", "a\n");
+        let b = init_repo_with_file("b", "b.txt", "b\n");
+        let mut ws = Workspace::open(
+            vec![a.path().to_path_buf(), b.path().to_path_buf()],
+            Config::default(),
+        )
+        .unwrap();
+        // Wait for the file tree so Enter can open fullscreen.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            ws.poll();
+            if ws.current().has_files() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for files"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        ws.on_key(KeyCode::Enter);
+        assert_eq!(ws.current().mode(), Mode::FullDiff);
+        ws.on_key(KeyCode::Char('q'));
+        assert_eq!(ws.len(), 1, "q fullscreen must close the project");
+        assert!(!ws.should_quit());
+
+        // Reopen to two tabs and verify Q quits from fullscreen.
+        let mut ws = Workspace::open(
+            vec![a.path().to_path_buf(), b.path().to_path_buf()],
+            Config::default(),
+        )
+        .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            ws.poll();
+            if ws.current().has_files() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for files"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        ws.on_key(KeyCode::Enter);
+        assert_eq!(ws.current().mode(), Mode::FullDiff);
+        ws.on_key(KeyCode::Char('Q'));
+        assert!(ws.should_quit(), "Q fullscreen must quit the app");
     }
 }

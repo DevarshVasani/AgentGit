@@ -47,6 +47,22 @@ pub fn dirty_file(repo: &Repository, path: &str, append_contents: &str) {
         .expect("append to file");
 }
 
+/// Clone a local repo (file path) into a fresh temp dir. The clone keeps
+/// the `origin` remote pointing at `src`, so push/pull tests run offline.
+pub fn clone_local(src: &Path) -> (TempDir, Repository) {
+    let dir = TempDir::new().expect("create tempdir");
+    let repo = Repository::clone(src.to_str().expect("src is utf-8"), dir.path())
+        .expect("clone local repo");
+    {
+        let mut cfg = repo.config().expect("open config");
+        cfg.set_str("user.name", "Test User")
+            .expect("set user.name");
+        cfg.set_str("user.email", "test@example.com")
+            .expect("set user.email");
+        cfg.set_str("commit.gpgsign", "false").ok();
+    }
+    (dir, repo)
+}
 /// Create branch `name` at HEAD and check it out.
 pub fn new_branch(repo: &Repository, name: &str) {
     let head = repo.head().expect("HEAD exists for new_branch");

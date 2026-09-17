@@ -11,6 +11,7 @@ use git_tui_core::jobqueue::{AsyncJob, AsyncResult, JobQueue};
 use git_tui_core::log::CommitInfo;
 use git_tui_core::stash::StashEntry;
 use git_tui_core::status::{FileState, RepoStatus, StatusEntry};
+use git_tui_core::sync::SyncStatus;
 use std::cell::Cell;
 
 use crate::config::{Config, KeyBindings, Theme};
@@ -28,6 +29,10 @@ pub enum Mode {
     FindFile,
     OpenProject,
     ConfirmInit,
+    /// Push with no upstream yet: the draft names the remote to push `-u` to.
+    SetUpstream,
+    /// Publish a repo with no remotes: the draft is the new `origin` URL.
+    SetRemote,
 }
 
 /// Which panel receives navigation keys. Everything is vertical: Tab cycles
@@ -56,11 +61,19 @@ pub struct App {
     mode: Mode,
     focus: Focus,
     draft: String,
+    /// Cursor inside `draft` as a char index (commit/branch/stash modals,
+    /// the finder query, the jump-to-path line). Byte math is derived on
+    /// demand so direct `draft` writes elsewhere can't break it: readers
+    /// clamp to the current char count.
+    draft_cursor: usize,
     /// Cursor inside the fuzzy file finder (`Mode::FindFile`).
     finder_selected: usize,
     /// Where the finder returns on Enter/Esc: the mode it was opened
     /// from (`Normal` or `FullDiff`), so `/` works fullscreen too.
     finder_return: Mode,
+    /// Where the push/publish modals return on Enter/Esc (`Normal` or
+    /// `FullDiff`), so `P` works fullscreen too.
+    sync_return: Mode,
     error: Option<String>,
     quit: bool,
     diff: Option<FileDiff>,
@@ -80,6 +93,12 @@ pub struct App {
     log_scroll: u16,
     stash: Option<Vec<StashEntry>>,
     stash_selected: usize,
+    /// Upstream tracking state (upstream ref, ahead/behind, remotes).
+    /// Loaded at startup and after every mutation; drives `P` behavior.
+    sync: Option<SyncStatus>,
+    /// A push/pull/publish job is in flight ("pushing…", …). Shown in the
+    /// status panel until it succeeds or fails.
+    syncing: Option<String>,
     // List scroll offsets for the left-rail panels. `Cell` so the renderer
     // (which only gets `&App`) can follow the selection without a `&mut`.
     files_scroll: Cell<usize>,
@@ -282,6 +301,16 @@ fn read_subdirs(dir: &std::path::Path) -> Result<Vec<DirEntry>, String> {
     Ok(out)
 }
 
+/// Split an upstream shorthand (`origin/main`, `origin/feature/x`) into
+/// its remote and branch. Remote names cannot contain `/`, so the first
+/// slash is the boundary; a bare name with no slash pushes to `origin`.
+fn split_upstream(upstream: &str) -> (&str, &str) {
+    match upstream.find('/') {
+        Some(i) => (&upstream[..i], &upstream[i + 1..]),
+        None => ("origin", upstream),
+    }
+}
+
 /// Cumulative ancestor prefixes: "a/b/c/f" -> ["a", "a/b", "a/b/c"].
 fn ancestors_of(path: &str) -> Vec<String> {
     let mut out = Vec::new();
@@ -311,8 +340,10 @@ impl App {
             mode: Mode::Normal,
             focus: Focus::Status,
             draft: String::new(),
+            draft_cursor: 0,
             finder_selected: 0,
             finder_return: Mode::Normal,
+            sync_return: Mode::Normal,
             error: None,
             quit: false,
             diff: None,
@@ -327,6 +358,8 @@ impl App {
             log_scroll: 0,
             stash: None,
             stash_selected: 0,
+            sync: None,
+            syncing: None,
             files_scroll: Cell::new(0),
             branch_scroll: Cell::new(0),
             stash_scroll: Cell::new(0),
@@ -375,15 +408,76 @@ impl App {
     }
 
     pub fn push_draft_char(&mut self, c: char) {
-        self.draft.push(c);
+        self.insert_draft_char(c);
     }
 
     pub fn pop_draft_char(&mut self) {
-        self.draft.pop();
+        self.delete_draft_before();
     }
 
     pub fn clear_draft(&mut self) {
         self.draft.clear();
+        self.draft_cursor = 0;
+    }
+
+    /// Cursor position in `draft` (chars from the start), clamped so stale
+    /// values after direct `draft` writes stay valid.
+    pub fn draft_cursor(&self) -> usize {
+        self.draft_cursor.min(self.draft.chars().count())
+    }
+
+    fn draft_byte_index(&self) -> usize {
+        self.draft
+            .char_indices()
+            .nth(self.draft_cursor())
+            .map(|(i, _)| i)
+            .unwrap_or(self.draft.len())
+    }
+
+    /// Insert one char at the cursor (commit box, finder, jump line).
+    pub fn insert_draft_char(&mut self, c: char) {
+        let byte = self.draft_byte_index();
+        self.draft.insert(byte, c);
+        self.draft_cursor = self.draft_cursor() + 1;
+    }
+
+    /// Backspace: delete the char before the cursor.
+    pub fn delete_draft_before(&mut self) {
+        let cursor = self.draft_cursor();
+        if cursor == 0 {
+            return;
+        }
+        let byte = self.draft_byte_index();
+        let prev = self.draft[..byte].chars().next_back().map(|c| c.len_utf8()).unwrap_or(0);
+        self.draft.drain(byte - prev..byte);
+        self.draft_cursor = cursor - 1;
+    }
+
+    /// Delete key: delete the char under the cursor.
+    pub fn delete_draft_after(&mut self) {
+        let byte = self.draft_byte_index();
+        if byte >= self.draft.len() {
+            return;
+        }
+        let len = self.draft[byte..].chars().next().map(|c| c.len_utf8()).unwrap_or(0);
+        self.draft.drain(byte..byte + len);
+        self.draft_cursor = self.draft_cursor();
+    }
+
+    pub fn move_draft_left(&mut self) {
+        self.draft_cursor = self.draft_cursor().saturating_sub(1);
+    }
+
+    pub fn move_draft_right(&mut self) {
+        self.draft_cursor = (self.draft_cursor() + 1).min(self.draft.chars().count());
+    }
+
+    pub fn move_draft_home(&mut self) {
+        self.draft_cursor = 0;
+    }
+
+    pub fn move_draft_end(&mut self) {
+        self.draft_cursor = self.draft.chars().count();
     }
 
     /// Cancel the open-project flow entirely (Esc in the browser).
@@ -607,6 +701,16 @@ impl App {
         self.finder_return
     }
 
+    /// Upstream tracking state, if loaded yet.
+    pub fn sync(&self) -> Option<&SyncStatus> {
+        self.sync.as_ref()
+    }
+
+    /// In-flight push/pull/publish label ("pushing…"), if any.
+    pub fn syncing(&self) -> Option<&str> {
+        self.syncing.as_deref()
+    }
+
     pub fn error(&self) -> Option<&str> {
         self.error.as_deref()
     }
@@ -676,6 +780,7 @@ impl App {
                 limit: Self::LOG_LIMIT,
             },
             AsyncJob::ListStash,
+            AsyncJob::LoadSync,
         ];
         for job in jobs {
             if let Err(e) = self.queue.submit(job) {
@@ -698,14 +803,22 @@ impl App {
             match key {
                 KeyCode::Up => self.finder_move(-1),
                 KeyCode::Down => self.finder_move(1),
+                KeyCode::Left => self.move_draft_left(),
+                KeyCode::Right => self.move_draft_right(),
                 KeyCode::Char(c) => {
-                    self.draft.push(c);
+                    self.insert_draft_char(c);
                     self.finder_selected = 0;
                 }
                 KeyCode::Backspace => {
-                    self.draft.pop();
+                    self.delete_draft_before();
                     self.finder_selected = 0;
                 }
+                KeyCode::Delete => {
+                    self.delete_draft_after();
+                    self.finder_selected = 0;
+                }
+                KeyCode::Home => self.move_draft_home(),
+                KeyCode::End => self.move_draft_end(),
                 KeyCode::Enter => {
                     self.expand_selected();
                     self.submit_finder();
@@ -720,21 +833,33 @@ impl App {
         }
         if self.mode != Mode::Normal {
             match key {
-                KeyCode::Char(c) => self.draft.push(c),
-                KeyCode::Backspace => {
-                    self.draft.pop();
-                }
+                KeyCode::Char(c) => self.insert_draft_char(c),
+                KeyCode::Backspace => self.delete_draft_before(),
+                KeyCode::Delete => self.delete_draft_after(),
+                KeyCode::Left => self.move_draft_left(),
+                KeyCode::Right => self.move_draft_right(),
+                KeyCode::Home => self.move_draft_home(),
+                KeyCode::End => self.move_draft_end(),
                 KeyCode::Enter => match self.mode {
                     Mode::Committing => self.submit_commit(),
                     Mode::NewBranch => self.submit_new_branch(),
                     Mode::StashPush => self.submit_stash_push(),
+                    Mode::SetUpstream => self.submit_push_upstream(),
+                    Mode::SetRemote => self.submit_publish(),
                     // FullDiff and FindFile return before reaching here.
                     // OpenProject/ConfirmInit submit through `Workspace`
                     // (it owns all projects), so they are no-ops here.
-                    Mode::Normal | Mode::FullDiff | Mode::FindFile | Mode::OpenProject | Mode::ConfirmInit => {}
+                    Mode::Normal
+                    | Mode::FullDiff
+                    | Mode::FindFile
+                    | Mode::OpenProject
+                    | Mode::ConfirmInit => {}
                 },
                 KeyCode::Esc => {
-                    self.mode = Mode::Normal;
+                    self.mode = match self.mode {
+                        Mode::SetUpstream | Mode::SetRemote => self.sync_return,
+                        _ => Mode::Normal,
+                    };
                     self.draft.clear();
                 }
                 _ => {}
@@ -807,6 +932,10 @@ impl App {
             self.open_finder();
         } else if k.refresh.contains(&key) {
             self.refresh();
+        } else if k.sync_pull.contains(&key) {
+            self.start_pull();
+        } else if k.sync_push.contains(&key) {
+            self.start_push();
         } else if k.quit.contains(&key) {
             self.quit = true;
         }
@@ -837,6 +966,10 @@ impl App {
             self.diff_scroll = self.diff_scroll.saturating_sub(10);
         } else if k.scroll_down.contains(&key) {
             self.diff_scroll = self.diff_scroll.saturating_add(10);
+        } else if k.sync_pull.contains(&key) {
+            self.start_pull();
+        } else if k.sync_push.contains(&key) {
+            self.start_push();
         } else if k.quit.contains(&key) {
             self.quit = true;
         }
@@ -1407,6 +1540,112 @@ impl App {
         }
     }
 
+    /// `p`, lazygit-style: pull the current branch (`git pull`, honoring
+    /// the user's pull.rebase/pull.ff config). Runs on the worker thread;
+    /// the status panel shows "pulling…" until it lands or fails.
+    fn start_pull(&mut self) {
+        self.syncing = Some("pulling…".into());
+        if let Err(e) = self.queue.submit(AsyncJob::Pull) {
+            self.syncing = None;
+            self.error = Some(e.to_string());
+        }
+    }
+
+    /// `P`, lazygit-style: push the current branch. With an upstream it
+    /// pushes straight away; without one it asks for the remote (`-u`);
+    /// with no remotes at all it asks for the `origin` URL (publish).
+    fn start_push(&mut self) {
+        let Some(branch) = self.status.as_ref().map(|st| st.branch.clone()) else {
+            self.error = Some("still loading — try again in a moment".into());
+            return;
+        };
+        let Some(sync) = self.sync.clone() else {
+            self.reload_sync();
+            self.error = Some("loading remotes — press P again in a moment".into());
+            return;
+        };
+        self.sync_return = self.mode;
+        if sync.remotes.is_empty() {
+            self.mode = Mode::SetRemote;
+            self.draft.clear();
+            self.draft_cursor = 0;
+        } else if let Some(upstream) = sync.upstream {
+            let (remote, _) = split_upstream(&upstream);
+            self.syncing = Some("pushing…".into());
+            if let Err(e) = self.queue.submit(AsyncJob::Push {
+                remote: remote.to_string(),
+                branch,
+                set_upstream: false,
+            }) {
+                self.syncing = None;
+                self.error = Some(e.to_string());
+            }
+        } else {
+            self.mode = Mode::SetUpstream;
+            self.draft = "origin".to_string();
+            self.move_draft_end();
+        }
+    }
+
+    /// Enter in `SetUpstream`: push `-u <remote> <branch>`.
+    fn submit_push_upstream(&mut self) {
+        let remote = self.draft.trim().to_string();
+        if remote.is_empty() {
+            return;
+        }
+        let Some(branch) = self.status.as_ref().map(|st| st.branch.clone()) else {
+            self.error = Some("still loading — try again in a moment".into());
+            return;
+        };
+        match self.queue.submit(AsyncJob::Push {
+            remote,
+            branch,
+            set_upstream: true,
+        }) {
+            Ok(()) => {
+                self.mode = self.sync_return;
+                self.draft.clear();
+                self.draft_cursor = 0;
+                self.syncing = Some("pushing…".into());
+            }
+            Err(e) => self.error = Some(e.to_string()),
+        }
+    }
+
+    /// Enter in `SetRemote`: point `origin` at the typed URL and push `-u`.
+    /// The "not yet on GitHub" flow: create the empty repo on the host,
+    /// paste its URL here, and the branch is published.
+    fn submit_publish(&mut self) {
+        let url = self.draft.trim().to_string();
+        if url.is_empty() {
+            return;
+        }
+        let Some(branch) = self.status.as_ref().map(|st| st.branch.clone()) else {
+            self.error = Some("still loading — try again in a moment".into());
+            return;
+        };
+        match self.queue.submit(AsyncJob::Publish {
+            remote: "origin".to_string(),
+            url,
+            branch,
+        }) {
+            Ok(()) => {
+                self.mode = self.sync_return;
+                self.draft.clear();
+                self.draft_cursor = 0;
+                self.syncing = Some("publishing…".into());
+            }
+            Err(e) => self.error = Some(e.to_string()),
+        }
+    }
+
+    /// Refresh upstream tracking state (cheap local reads, no network).
+    fn reload_sync(&mut self) {
+        if let Err(e) = self.queue.submit(AsyncJob::LoadSync) {
+            self.error = Some(e.to_string());
+        }
+    }
+
     /// Drain finished jobs without blocking (event loop calls this every
     /// frame). A [`AsyncResult::MutationDone`] invalidates the snapshot, so
     /// it refreshes status and reloads the focused diff rather than patching
@@ -1453,14 +1692,20 @@ impl App {
                     self.stash_selected = self.stash_selected.min(entries.len().saturating_sub(1));
                     self.stash = Some(entries);
                 }
+                AsyncResult::SyncStatus(st) => {
+                    self.sync = Some(st);
+                }
                 AsyncResult::MutationDone => {
+                    self.syncing = None;
                     self.refresh();
                     self.reload_diff();
                     self.reload_branches();
                     self.reload_log();
                     self.reload_stash();
+                    self.reload_sync();
                 }
                 AsyncResult::Error(e) => {
+                    self.syncing = None;
                     // EmptyCommit on its own doesn't say how to fix it.
                     self.error = Some(match e {
                         GitError::EmptyCommit => {
@@ -1844,6 +2089,55 @@ mod tests {
     }
 
     #[test]
+    fn commit_message_edits_mid_text_with_cursor() {
+        let mut fx = harness(&["a.txt"]);
+        fx.app.on_key(KeyCode::Char('c'));
+        for c in "hello".chars() {
+            fx.app.on_key(KeyCode::Char(c));
+        }
+        assert_eq!(fx.app.draft_cursor(), 5);
+        fx.app.on_key(KeyCode::Left);
+        fx.app.on_key(KeyCode::Left);
+        assert_eq!(fx.app.draft_cursor(), 3);
+        // Backspace deletes before the cursor: "hello" -> "helo".
+        fx.app.on_key(KeyCode::Backspace);
+        assert_eq!(fx.app.draft(), "helo");
+        assert_eq!(fx.app.draft_cursor(), 2);
+        // Typing inserts at the cursor: "helo" -> "heXlo".
+        fx.app.on_key(KeyCode::Char('X'));
+        assert_eq!(fx.app.draft(), "heXlo");
+        assert_eq!(fx.app.draft_cursor(), 3);
+        // Delete removes under the cursor: "heXlo" -> "heXo".
+        fx.app.on_key(KeyCode::Delete);
+        assert_eq!(fx.app.draft(), "heXo");
+        // Home/End jump; typing at the front and back works.
+        fx.app.on_key(KeyCode::Home);
+        fx.app.on_key(KeyCode::Char('!'));
+        assert_eq!(fx.app.draft(), "!heXo");
+        fx.app.on_key(KeyCode::End);
+        fx.app.on_key(KeyCode::Char('?'));
+        assert_eq!(fx.app.draft(), "!heXo?");
+        assert_eq!(fx.app.draft_cursor(), 6);
+    }
+
+    #[test]
+    fn commit_cursor_clamps_at_both_ends() {
+        let mut fx = harness(&["a.txt"]);
+        fx.app.on_key(KeyCode::Char('c'));
+        fx.app.on_key(KeyCode::Char('a'));
+        fx.app.on_key(KeyCode::Left);
+        fx.app.on_key(KeyCode::Left);
+        assert_eq!(fx.app.draft_cursor(), 0, "clamps at start");
+        fx.app.on_key(KeyCode::Backspace);
+        assert_eq!(fx.app.draft(), "a", "nothing to delete at start");
+        fx.app.on_key(KeyCode::Right);
+        fx.app.on_key(KeyCode::Right);
+        assert_eq!(fx.app.draft_cursor(), 1, "clamps at end");
+        fx.app.on_key(KeyCode::Delete);
+        assert_eq!(fx.app.draft(), "a", "nothing to delete at end");
+    }
+
+    #[test]
     fn failing_job_surfaces_error_display() {
         let mut fx = harness(&["a.txt"]);
         // Commit with nothing staged -> EmptyCommit error via worker.
@@ -2104,9 +2398,161 @@ mod tests {
         fx.app.on_key(KeyCode::Char('q'));
         assert!(!fx.app.should_quit());
         assert_eq!(fx.app.draft(), "q");
+        fx.app.on_key(KeyCode::Char('Q'));
+        assert!(!fx.app.should_quit(), "Q in modal must type, not quit");
+        assert_eq!(fx.app.draft(), "qQ");
         fx.app.on_key(KeyCode::Esc);
+        // Lowercase `q` no longer quits the app (workspace closes the
+        // project instead); uppercase `Q` quits everything.
         fx.app.on_key(KeyCode::Char('q'));
+        assert!(!fx.app.should_quit());
+        fx.app.on_key(KeyCode::Char('Q'));
         assert!(fx.app.should_quit());
+    }
+
+    /// Repo with an `origin` remote (bare, on disk) that nothing has been
+    /// pushed to yet: pressing `P` must offer to set the upstream.
+    fn sync_harness() -> (tempfile::TempDir, tempfile::TempDir, App) {
+        let (dir, repo) = init_repo();
+        commit_file(&repo, "a.txt", "a\n", "init");
+        let origin_dir = tempfile::TempDir::new().unwrap();
+        let bare = origin_dir.path().join("origin.git");
+        git2::Repository::init_bare(&bare).unwrap();
+        repo.remote("origin", bare.to_str().unwrap()).unwrap();
+        let path = repo.workdir().unwrap().to_path_buf();
+        drop(repo);
+        let app = App::new(JobQueue::spawn(path).unwrap());
+        (dir, origin_dir, app)
+    }
+
+    /// Settle until upstream tracking state arrives (preloaded at startup).
+    fn wait_for_sync(app: &mut App) -> git_tui_core::sync::SyncStatus {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            app.poll();
+            if let Some(st) = app.sync() {
+                return st.clone();
+            }
+            assert!(Instant::now() < deadline, "timed out waiting for sync");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn p_pull_failure_surfaces_error_and_clears_syncing() {
+        // Harness repos have no remote (and dirty files, so `git pull`
+        // fails one way or another depending on the user's pull config).
+        // What matters: the failure lands in the error line and the
+        // "pulling…" indicator clears instead of sticking forever.
+        let mut fx = harness(&["a.txt"]);
+        fx.app.on_key(KeyCode::Char('p'));
+        assert_eq!(fx.app.syncing(), Some("pulling…"));
+        let err = wait_for_error(&mut fx.app);
+        assert!(!err.is_empty(), "expected a pull failure message");
+        assert!(fx.app.syncing().is_none());
+    }
+
+    #[test]
+    fn push_without_remotes_opens_publish_modal_and_enter_publishes() {
+        let (dir, repo) = init_repo();
+        commit_file(&repo, "a.txt", "a\n", "init");
+        let origin_dir = tempfile::TempDir::new().unwrap();
+        let bare = origin_dir.path().join("origin.git");
+        git2::Repository::init_bare(&bare).unwrap();
+        let path = repo.workdir().unwrap().to_path_buf();
+        drop(repo);
+        let mut app = App::new(JobQueue::spawn(path).unwrap());
+        let st = wait_for_sync(&mut app);
+        assert!(st.remotes.is_empty());
+        app.on_key(KeyCode::Char('P'));
+        assert_eq!(app.mode(), Mode::SetRemote);
+        for c in bare.to_str().unwrap().chars() {
+            app.on_key(KeyCode::Char(c));
+        }
+        app.on_key(KeyCode::Enter);
+        assert_eq!(app.mode(), Mode::Normal);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            app.poll();
+            if app.sync().is_some_and(|s| s.upstream.is_some()) {
+                break;
+            }
+            assert!(Instant::now() < deadline, "publish never recorded upstream");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(app.sync().unwrap().upstream.as_deref(), Some("origin/main"));
+        let remote = git2::Repository::open_bare(&bare).unwrap();
+        assert!(remote.find_reference("refs/heads/main").is_ok());
+        drop(dir);
+    }
+
+    #[test]
+    fn push_without_upstream_opens_set_upstream_modal() {
+        let (_dir, _origin, mut app) = sync_harness();
+        wait_for_sync(&mut app);
+        app.on_key(KeyCode::Char('P'));
+        assert_eq!(app.mode(), Mode::SetUpstream);
+        assert_eq!(app.draft(), "origin");
+        app.on_key(KeyCode::Enter);
+        assert_eq!(app.mode(), Mode::Normal);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            app.poll();
+            if app.sync().is_some_and(|s| s.upstream.is_some()) {
+                break;
+            }
+            assert!(Instant::now() < deadline, "push -u never recorded upstream");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(app.sync().unwrap().upstream.as_deref(), Some("origin/main"));
+    }
+
+    #[test]
+    fn push_with_upstream_pushes_directly_without_modal() {
+        let (_dir, _origin, mut app) = sync_harness();
+        wait_for_sync(&mut app);
+        // Establish the upstream first.
+        app.on_key(KeyCode::Char('P'));
+        assert_eq!(app.mode(), Mode::SetUpstream);
+        app.on_key(KeyCode::Enter);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            app.poll();
+            if app.sync().is_some_and(|s| s.upstream.is_some()) {
+                break;
+            }
+            assert!(Instant::now() < deadline, "push -u never recorded upstream");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(app.syncing().is_none());
+        // A fresh `P` now pushes straight away, no modal.
+        app.on_key(KeyCode::Char('P'));
+        assert_eq!(app.mode(), Mode::Normal);
+        assert_eq!(app.syncing(), Some("pushing…"));
+    }
+
+    #[test]
+    fn esc_in_sync_modal_returns_without_syncing() {
+        let (_dir, _origin, mut app) = sync_harness();
+        wait_for_sync(&mut app);
+        app.on_key(KeyCode::Char('P'));
+        assert_eq!(app.mode(), Mode::SetUpstream);
+        app.on_key(KeyCode::Esc);
+        assert_eq!(app.mode(), Mode::Normal);
+        assert!(app.syncing().is_none());
+        assert!(app.sync().unwrap().upstream.is_none());
+    }
+
+    #[test]
+    fn sync_modal_from_fullscreen_returns_to_fullscreen() {
+        let mut fx = harness(&["a.txt"]);
+        fx.app.on_key(KeyCode::Enter);
+        assert_eq!(fx.app.mode(), Mode::FullDiff);
+        // Harness repos have no remotes: `P` opens the publish modal.
+        fx.app.on_key(KeyCode::Char('P'));
+        assert_eq!(fx.app.mode(), Mode::SetRemote);
+        fx.app.on_key(KeyCode::Esc);
+        assert_eq!(fx.app.mode(), Mode::FullDiff);
     }
 
     /// Two-hunk fixture: 40 lines, changes at line 5 and line 35.

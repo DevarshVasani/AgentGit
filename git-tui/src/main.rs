@@ -77,6 +77,21 @@ fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) 
     let _ = terminal.show_cursor();
 }
 
+/// Some terminals report Shift+letter as lowercase + SHIFT instead of the
+/// uppercase char, which would misclassify Shift+q (`Q`, quit-all) as `q`
+/// (close-project). Normalize `a`-`z` + SHIFT to `A`-`Z` so `KeyCode`-only
+/// bindings stay reliable regardless of the terminal.
+fn normalize_key(code: KeyCode, modifiers: KeyModifiers) -> KeyCode {
+    if modifiers.contains(KeyModifiers::SHIFT) {
+        if let KeyCode::Char(c) = code {
+            if c.is_ascii_lowercase() {
+                return KeyCode::Char(c.to_ascii_uppercase());
+            }
+        }
+    }
+    code
+}
+
 struct Cli {
     theme: Option<String>,
     paths: Vec<PathBuf>,
@@ -153,7 +168,7 @@ fn run(
                 {
                     workspace.request_quit();
                 } else {
-                    workspace.on_key(key.code);
+                    workspace.on_key(normalize_key(key.code, key.modifiers));
                 }
             }
         }
@@ -266,6 +281,23 @@ mod tests {
         assert_eq!(
             config.theme.border_focused,
             ratatui::style::Color::Rgb(122, 162, 247)
+        );
+    }
+
+    #[test]
+    fn shift_lowercase_normalizes_to_uppercase() {
+        use crossterm::event::KeyModifiers;
+        assert_eq!(
+            normalize_key(KeyCode::Char('q'), KeyModifiers::SHIFT),
+            KeyCode::Char('Q')
+        );
+        assert_eq!(
+            normalize_key(KeyCode::Char('q'), KeyModifiers::empty()),
+            KeyCode::Char('q')
+        );
+        assert_eq!(
+            normalize_key(KeyCode::Char('Q'), KeyModifiers::SHIFT),
+            KeyCode::Char('Q')
         );
     }
 }

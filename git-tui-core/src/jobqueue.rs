@@ -11,6 +11,7 @@ use crate::log::CommitInfo;
 use crate::repo::Repo;
 use crate::stash::StashEntry;
 use crate::status::RepoStatus;
+use crate::sync::SyncStatus;
 use crossbeam_channel::{Receiver, Sender};
 use std::path::Path;
 use std::time::Duration;
@@ -63,6 +64,24 @@ pub enum AsyncJob {
     StashDrop {
         index: usize,
     },
+    /// Push the branch to a remote (`git push [-u]`, shells out so auth
+    /// works like the user's shell).
+    Push {
+        remote: String,
+        branch: String,
+        set_upstream: bool,
+    },
+    /// Pull the current branch (`git pull`, honoring pull.rebase/pull.ff).
+    Pull,
+    /// Point `remote` at `url` (unless already set) and push with `-u`.
+    /// The "not yet on GitHub" flow: create the empty remote, then publish.
+    Publish {
+        remote: String,
+        url: String,
+        branch: String,
+    },
+    /// Local upstream tracking state (no network).
+    LoadSync,
 }
 
 /// Work results. All data owned.
@@ -73,6 +92,7 @@ pub enum AsyncResult {
     Branches(Vec<BranchInfo>),
     Log(Vec<CommitInfo>),
     Stash(Vec<StashEntry>),
+    SyncStatus(SyncStatus),
     MutationDone,
     Error(GitError),
 }
@@ -207,6 +227,36 @@ fn execute(repo: &mut Repo, job: AsyncJob) -> AsyncResult {
         },
         AsyncJob::StashDrop { index } => match repo.stash_drop(index) {
             Ok(()) => AsyncResult::MutationDone,
+            Err(e) => AsyncResult::Error(e),
+        },
+        AsyncJob::Push {
+            remote,
+            branch,
+            set_upstream,
+        } => match repo.workdir() {
+            Some(wd) => match crate::sync::push(&wd, &remote, &branch, set_upstream) {
+                Ok(_) => AsyncResult::MutationDone,
+                Err(e) => AsyncResult::Error(e),
+            },
+            None => AsyncResult::Error(GitError::Sync("bare repositories cannot push".into())),
+        },
+        AsyncJob::Pull => match repo.workdir() {
+            Some(wd) => match crate::sync::pull(&wd) {
+                Ok(_) => AsyncResult::MutationDone,
+                Err(e) => AsyncResult::Error(e),
+            },
+            None => AsyncResult::Error(GitError::Sync("bare repositories cannot pull".into())),
+        },
+        AsyncJob::Publish {
+            remote,
+            url,
+            branch,
+        } => match crate::sync::publish(repo.inner(), &remote, &url, &branch) {
+            Ok(_) => AsyncResult::MutationDone,
+            Err(e) => AsyncResult::Error(e),
+        },
+        AsyncJob::LoadSync => match crate::sync::sync_status(repo.inner()) {
+            Ok(st) => AsyncResult::SyncStatus(st),
             Err(e) => AsyncResult::Error(e),
         },
     }
@@ -628,5 +678,95 @@ mod tests {
         // Nothing left to drop.
         queue.submit(AsyncJob::StashDrop { index: 0 }).unwrap();
         assert!(matches!(recv_next(&queue), AsyncResult::Error(_)));
+    }
+
+    fn expect_sync(result: AsyncResult) -> crate::sync::SyncStatus {
+        match result {
+            AsyncResult::SyncStatus(st) => st,
+            other => panic!("expected SyncStatus, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn push_pull_and_sync_status_via_queue() {
+        let (_dir, repo) = testutil::init_repo();
+        testutil::commit_file(&repo, "a.txt", "a\n", "init");
+        let origin_dir = tempfile::TempDir::new().unwrap();
+        let origin_path = origin_dir.path().join("origin.git");
+        git2::Repository::init_bare(&origin_path).unwrap();
+        crate::sync::add_remote(&repo, "origin", origin_path.to_str().unwrap()).unwrap();
+        let path = repo.workdir().unwrap().to_path_buf();
+        drop(repo);
+        let queue = JobQueue::spawn(path).unwrap();
+
+        queue
+            .submit(AsyncJob::Push {
+                remote: "origin".into(),
+                branch: "main".into(),
+                set_upstream: true,
+            })
+            .unwrap();
+        expect_mutation_done(recv_next(&queue));
+
+        queue.submit(AsyncJob::LoadSync).unwrap();
+        let st = expect_sync(recv_next(&queue));
+        assert_eq!(st.upstream.as_deref(), Some("origin/main"));
+        assert_eq!((st.ahead, st.behind), (0, 0));
+
+        // Advance the remote from a second clone, then pull it back.
+        // The bare repo's HEAD still points at unborn master (init_bare
+        // default), so aim it at main before cloning — like a real host.
+        git2::Repository::open_bare(&origin_path)
+            .unwrap()
+            .set_head("refs/heads/main")
+            .unwrap();
+        let (dir2, other) = testutil::clone_local(&origin_path);
+        testutil::commit_file(&other, "b.txt", "b\n", "from other");
+        let other_path = other.workdir().unwrap().to_path_buf();
+        drop(other);
+        let push_queue = JobQueue::spawn(other_path).unwrap();
+        push_queue
+            .submit(AsyncJob::Push {
+                remote: "origin".into(),
+                branch: "main".into(),
+                set_upstream: false,
+            })
+            .unwrap();
+        expect_mutation_done(recv_next(&push_queue));
+        drop(dir2);
+
+        queue.submit(AsyncJob::Pull).unwrap();
+        expect_mutation_done(recv_next(&queue));
+
+        queue.submit(AsyncJob::LoadSync).unwrap();
+        let st = expect_sync(recv_next(&queue));
+        assert_eq!((st.ahead, st.behind), (0, 0));
+    }
+
+    #[test]
+    fn publish_new_repo_via_queue() {
+        let (_dir, repo) = testutil::init_repo();
+        testutil::commit_file(&repo, "a.txt", "a\n", "init");
+        let origin_dir = tempfile::TempDir::new().unwrap();
+        let origin_path = origin_dir.path().join("origin.git");
+        git2::Repository::init_bare(&origin_path).unwrap();
+        let path = repo.workdir().unwrap().to_path_buf();
+        drop(repo);
+        let queue = JobQueue::spawn(path).unwrap();
+
+        queue
+            .submit(AsyncJob::Publish {
+                remote: "origin".into(),
+                url: origin_path.to_str().unwrap().into(),
+                branch: "main".into(),
+            })
+            .unwrap();
+        expect_mutation_done(recv_next(&queue));
+
+        queue.submit(AsyncJob::LoadSync).unwrap();
+        let st = expect_sync(recv_next(&queue));
+        assert_eq!(st.upstream.as_deref(), Some("origin/main"));
+        let remote = git2::Repository::open_bare(&origin_path).unwrap();
+        assert!(remote.find_reference("refs/heads/main").is_ok());
     }
 }

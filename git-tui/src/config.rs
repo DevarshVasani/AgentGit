@@ -36,6 +36,9 @@ pub const ACTIONS: &[&str] = &[
     "project_next",
     "project_prev",
     "project_open",
+    "project_close",
+    "sync_pull",
+    "sync_push",
 ];
 
 /// Key names accepted in `[keys]` besides single characters.
@@ -87,6 +90,9 @@ pub struct KeyBindings {
     pub project_next: Vec<KeyCode>,
     pub project_prev: Vec<KeyCode>,
     pub project_open: Vec<KeyCode>,
+    pub project_close: Vec<KeyCode>,
+    pub sync_pull: Vec<KeyCode>,
+    pub sync_push: Vec<KeyCode>,
 }
 
 impl Default for KeyBindings {
@@ -98,7 +104,7 @@ impl Default for KeyBindings {
             stage: vec![Char(' '), Char('s')],
             commit: vec![Char('c')],
             refresh: vec![Char('r')],
-            quit: vec![Char('q')],
+            quit: vec![Char('Q')],
             focus_next: vec![KeyCode::Tab],
             focus_status: vec![Char('1'), KeyCode::Left],
             focus_branches: vec![Char('2')],
@@ -116,6 +122,9 @@ impl Default for KeyBindings {
             project_next: vec![Char(']')],
             project_prev: vec![Char('[')],
             project_open: vec![Char('o')],
+            project_close: vec![Char('q')],
+            sync_pull: vec![Char('p')],
+            sync_push: vec![Char('P')],
         }
     }
 }
@@ -355,6 +364,9 @@ impl Config {
                 "project_next" => k.project_next = keys,
                 "project_prev" => k.project_prev = keys,
                 "project_open" => k.project_open = keys,
+                "project_close" => k.project_close = keys,
+                "sync_pull" => k.sync_pull = keys,
+                "sync_push" => k.sync_push = keys,
                 _ => anyhow::bail!(
                     "unknown action [{action}] (expected one of: {})",
                     ACTIONS.join(", ")
@@ -379,11 +391,20 @@ mod tests {
         assert!(keys.nav_down.contains(&KeyCode::Down));
         assert!(keys.stage.contains(&KeyCode::Char(' ')));
         assert!(keys.stage.contains(&KeyCode::Char('s')));
-        assert!(keys.quit.contains(&KeyCode::Char('q')));
+        // `q` closes the current project, `Q` (Shift+q) quits the app.
+        assert!(keys.project_close.contains(&KeyCode::Char('q')));
+        assert!(keys.quit.contains(&KeyCode::Char('Q')));
         assert!(keys.focus_next.contains(&KeyCode::Tab));
         assert!(keys.checkout.contains(&KeyCode::Enter));
         assert!(keys.branch_delete.contains(&KeyCode::Char('D')));
         assert!(keys.find_files.contains(&KeyCode::Char('/')));
+    }
+
+    #[test]
+    fn sync_keys_default_to_lazygit_pull_push() {
+        let keys = KeyBindings::default();
+        assert!(keys.sync_pull.contains(&KeyCode::Char('p')));
+        assert!(keys.sync_push.contains(&KeyCode::Char('P')));
     }
 
     #[test]
@@ -475,7 +496,8 @@ mod tests {
     #[test]
     fn missing_file_means_defaults() {
         let cfg = Config::load_from_path(Path::new("/nonexistent/config.toml")).unwrap();
-        assert!(cfg.keys.quit.contains(&KeyCode::Char('q')));
+        assert!(cfg.keys.quit.contains(&KeyCode::Char('Q')));
+        assert!(cfg.keys.project_close.contains(&KeyCode::Char('q')));
     }
 
     // RED: file loading not implemented yet.
