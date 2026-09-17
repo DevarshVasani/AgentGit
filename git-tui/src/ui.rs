@@ -92,7 +92,13 @@ pub fn render(frame: &mut Frame, app: &App) {
         Mode::Committing => render_input_modal(frame, area, app, " Commit message "),
         Mode::NewBranch => render_input_modal(frame, area, app, " New branch name "),
         Mode::StashPush => render_input_modal(frame, area, app, " Stash message "),
-        Mode::FindFile => render_finder_modal(frame, area, app),
+        Mode::FindFile => {
+            // Opened fullscreen: keep the diff behind the modal.
+            if app.finder_return() == Mode::FullDiff {
+                render_fullscreen_diff(frame, area, app);
+            }
+            render_finder_modal(frame, area, app);
+        }
         Mode::FullDiff => render_fullscreen_diff(frame, area, app),
         Mode::Normal => {}
     }
@@ -265,14 +271,18 @@ fn render_files_panel(frame: &mut Frame, area: Rect, app: &App) {
     }
     let theme = app.theme();
     let focused = app.focus() == Focus::Status;
-    let Some(st) = app.status() else {
+    let Some(_st) = app.status() else {
         frame.render_widget(
             Paragraph::new("loading…").block(panel_block(focused, theme, "[2]-Files".to_string())),
             area,
         );
         return;
     };
-    if st.files.is_empty() {
+    // The browsable tree (changed files, then clean tracked ones): the
+    // same list the cursor indexes into, so every file can be reached
+    // and the highlight never gets stuck behind.
+    let files = app.file_list();
+    if files.is_empty() {
         frame.render_widget(
             Paragraph::new("(clean working tree)").block(panel_block(
                 focused,
@@ -283,7 +293,7 @@ fn render_files_panel(frame: &mut Frame, area: Rect, app: &App) {
         );
         return;
     }
-    let rows = file_rows(&st.files);
+    let rows = file_rows(files);
     // Fold collapsed subtrees: drop every row hiding under a collapsed
     // dir, but keep the collapsed header itself (rendered as `▶`).
     let rows: Vec<&FileRow> = rows
@@ -292,12 +302,12 @@ fn render_files_panel(frame: &mut Frame, area: Rect, app: &App) {
             let r: &FileRow = row;
             let path: &str = match r {
                 FileRow::Dir { path, .. } => path,
-                FileRow::File { index, .. } => st.files[*index].path.as_str(),
+                FileRow::File { index, .. } => files[*index].path.as_str(),
             };
             !ancestors(path).iter().any(|a| app.is_collapsed(a))
         })
         .collect();
-    let sel = app.selected().min(st.files.len() - 1);
+    let sel = app.selected().min(files.len() - 1);
     // The selected file's own row, or — when it is hidden inside a
     // collapsed dir — its shallowest collapsed ancestor header, which
     // is always visible (its own ancestors are all expanded).
@@ -308,7 +318,7 @@ fn render_files_panel(frame: &mut Frame, area: Rect, app: &App) {
             matches!(r, FileRow::File { index, .. } if *index == sel)
         })
         .or_else(|| {
-            ancestors(st.files[sel].path.as_str())
+            ancestors(files[sel].path.as_str())
                 .into_iter()
                 .find(|a| app.is_collapsed(a))
                 .and_then(|header| {
@@ -336,7 +346,7 @@ fn render_files_panel(frame: &mut Frame, area: Rect, app: &App) {
                 )]))
             }
             FileRow::File { index, depth } => {
-                let f = &st.files[*index];
+                let f = &files[*index];
                 let (glyph, color) = state_glyph(f.state, theme);
                 let indent = "  ".repeat(*depth);
                 ListItem::new(Line::from(vec![
@@ -353,7 +363,7 @@ fn render_files_panel(frame: &mut Frame, area: Rect, app: &App) {
         .block(panel_block(
             focused,
             theme,
-            format!("[2]-Files ({} of {})", sel + 1, st.files.len()),
+            format!("[2]-Files ({} of {})", sel + 1, files.len()),
         ))
         .highlight_style(selection_style(theme))
         .highlight_symbol("> ");
@@ -1003,7 +1013,7 @@ fn footer_hints(app: &App, theme: Theme) -> Paragraph<'static> {
         Mode::NewBranch => "Enter create branch · Esc cancel",
         Mode::StashPush => "Enter stash · Esc cancel",
         Mode::FullDiff => {
-            "j/k hunk · ↑/↓ scroll · space stage hunk · PgUp/PgDn page · esc close · q quit"
+            "j/k hunk · ↑/↓ scroll · space stage hunk · PgUp/PgDn page · / find · esc close · q quit"
         }
         Mode::Normal if app.focus() == Focus::Branches => {
             "enter checkout · a new branch · D delete · tab commits · q quit"
@@ -1386,6 +1396,40 @@ mod tests {
         let s = screen(&app, 80, 28);
         assert!(s.contains("clean"), "empty message missing:\n{s}");
         assert!(s.contains("✓"), "clean marker missing:\n{s}");
+    }
+
+    #[test]
+    fn highlight_follows_selection_into_clean_tracked_files() {
+        use crossterm::event::KeyCode;
+        // a.txt changed, b.txt clean-but-tracked: both are browsable, so
+        // moving down must move the `>` highlight onto b.txt.
+        let (_dir, mut app) = test_app();
+        app.set_status_for_test(RepoStatus {
+            branch: "main".into(),
+            head_summary: "init".into(),
+            files: vec![StatusEntry {
+                path: "a.txt".into(),
+                state: FileState::Unstaged,
+            }],
+            tracked_files: vec!["a.txt".into(), "b.txt".into()],
+        });
+        app.on_key(KeyCode::Char('j'));
+        assert_eq!(app.selected_file().unwrap().path, "b.txt");
+        let s = screen(&app, 80, 28);
+        let row_with = |name: &str| {
+            s.lines()
+                .find(|l| l.contains(name))
+                .unwrap_or_else(|| panic!("{name} row missing:\n{s}"))
+                .to_string()
+        };
+        assert!(
+            row_with("b.txt").contains('>'),
+            "highlight never reached b.txt:\n{s}"
+        );
+        assert!(
+            !row_with("a.txt").contains('>'),
+            "highlight stuck on a.txt:\n{s}"
+        );
     }
 
     #[test]
@@ -2109,6 +2153,25 @@ mod tests {
         assert!(s.contains("Find files"), "finder title missing:\n{s}");
         assert!(s.contains("main.rs"), "match missing:\n{s}");
         assert!(s.contains("1 match"), "match count missing:\n{s}");
+    }
+
+    #[test]
+    fn renders_finder_modal_over_fullscreen_diff() {
+        use crossterm::event::KeyCode;
+        let (_dir, mut app) = with_files(&[
+            ("a.txt", FileState::Unstaged),
+            ("b.txt", FileState::Unstaged),
+        ]);
+        app.on_key(KeyCode::Enter);
+        assert_eq!(app.mode(), Mode::FullDiff);
+        app.on_key(KeyCode::Char('/'));
+        assert_eq!(app.mode(), Mode::FindFile);
+        let s = screen(&app, 100, 32);
+        assert!(s.contains("Find files"), "finder title missing:\n{s}");
+        assert!(
+            s.contains("Full diff"),
+            "fullscreen backdrop missing behind finder:\n{s}"
+        );
     }
 
     #[test]

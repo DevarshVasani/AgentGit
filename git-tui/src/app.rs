@@ -56,6 +56,9 @@ pub struct App {
     draft: String,
     /// Cursor inside the fuzzy file finder (`Mode::FindFile`).
     finder_selected: usize,
+    /// Where the finder returns on Enter/Esc: the mode it was opened
+    /// from (`Normal` or `FullDiff`), so `/` works fullscreen too.
+    finder_return: Mode,
     error: Option<String>,
     quit: bool,
     diff: Option<FileDiff>,
@@ -114,6 +117,7 @@ impl App {
             focus: Focus::Status,
             draft: String::new(),
             finder_selected: 0,
+            finder_return: Mode::Normal,
             error: None,
             quit: false,
             diff: None,
@@ -201,7 +205,8 @@ impl App {
     }
 
     /// Every browsable file: changed first, then clean tracked files.
-    #[cfg(test)]
+    /// The files panel renders this same list so the highlight always
+    /// tracks the cursor (see `render_files_panel`).
     pub fn file_list(&self) -> &[StatusEntry] {
         &self.file_list
     }
@@ -323,6 +328,11 @@ impl App {
             .min(self.finder_matches().len().saturating_sub(1))
     }
 
+    /// Mode the open finder returns to on Enter/Esc.
+    pub fn finder_return(&self) -> Mode {
+        self.finder_return
+    }
+
     pub fn error(&self) -> Option<&str> {
         self.error.as_deref()
     }
@@ -427,7 +437,7 @@ impl App {
                     self.submit_finder();
                 }
                 KeyCode::Esc => {
-                    self.mode = Mode::Normal;
+                    self.mode = self.finder_return;
                     self.draft.clear();
                 }
                 _ => {}
@@ -527,11 +537,14 @@ impl App {
     }
 
     /// Keys inside the fullscreen diff overlay. hunk navigation and staging
-    /// mirror the old diff-pane keys; Esc closes back to the file list.
+    /// mirror the old diff-pane keys; `/` finds another file without
+    /// leaving fullscreen; Esc closes back to the file list.
     fn on_key_full_diff(&mut self, key: KeyCode) {
         let k = self.keys.clone();
         if key == KeyCode::Esc {
             self.mode = Mode::Normal;
+        } else if k.find_files.contains(&key) {
+            self.open_finder();
         } else if key == KeyCode::Up {
             // Arrows scroll line-by-line so long single-hunk diffs stay
             // viewable; j/k below jump by hunk.
@@ -1046,8 +1059,10 @@ impl App {
         }
     }
 
-    /// `/`: open the fuzzy file finder on the browsable tree.
+    /// `/`: open the fuzzy file finder on the browsable tree. Works
+    /// from `Normal` and from `FullDiff`; Enter/Esc return there.
     fn open_finder(&mut self) {
+        self.finder_return = self.mode;
         self.mode = Mode::FindFile;
         self.draft.clear();
         self.finder_selected = self.selected.min(self.file_count().saturating_sub(1));
@@ -1063,7 +1078,9 @@ impl App {
         self.finder_selected = (cur + delta).clamp(0, n as isize - 1) as usize;
     }
 
-    /// Enter in the finder: jump the file cursor to the chosen match.
+    /// Enter in the finder: jump the file cursor to the chosen match
+    /// and return where the finder was opened from (staying fullscreen
+    /// when opened fullscreen, with the new file's diff loading).
     fn submit_finder(&mut self) {
         let matches = self.finder_matches();
         let Some(&index) = matches.get(self.finder_cursor()) else {
@@ -1071,7 +1088,7 @@ impl App {
         };
         self.selected = index;
         self.focus = Focus::Status;
-        self.mode = Mode::Normal;
+        self.mode = self.finder_return;
         self.draft.clear();
         self.finder_selected = 0;
         self.maybe_load_diff();
@@ -1856,6 +1873,34 @@ mod tests {
     }
 
     #[test]
+    fn enter_esc_then_walk_files_in_both_directions() {
+        let mut fx = harness(&["a.txt", "b.txt", "c.txt"]);
+        fx.app.on_key(KeyCode::Enter);
+        assert_eq!(fx.app.mode(), Mode::FullDiff);
+        fx.app.on_key(KeyCode::Esc);
+        assert_eq!(fx.app.mode(), Mode::Normal);
+        for expected in ["b.txt", "c.txt"] {
+            fx.app.on_key(KeyCode::Char('j'));
+            assert_eq!(
+                fx.app.selected_file().unwrap().path,
+                expected,
+                "down-walk broke after Esc"
+            );
+        }
+        for expected in ["b.txt", "a.txt"] {
+            fx.app.on_key(KeyCode::Char('k'));
+            assert_eq!(
+                fx.app.selected_file().unwrap().path,
+                expected,
+                "up-walk broke after Esc"
+            );
+        }
+        // The preview must follow the cursor again too.
+        let d = wait_for_diff(&mut fx.app, "a.txt");
+        assert_eq!(d.path, "a.txt");
+    }
+
+    #[test]
     fn slash_opens_finder_and_esc_cancels() {
         let mut fx = harness(&["a.txt"]);
         fx.app.on_key(KeyCode::Char('/'));
@@ -1904,6 +1949,34 @@ mod tests {
         assert!(fx.app.finder_matches().is_empty());
         fx.app.on_key(KeyCode::Enter);
         assert_eq!(fx.app.mode(), Mode::FindFile);
+    }
+
+    #[test]
+    fn slash_in_fullscreen_opens_finder_and_esc_returns_to_fullscreen() {
+        let mut fx = harness(&["a.txt", "b.txt"]);
+        fx.app.on_key(KeyCode::Enter);
+        assert_eq!(fx.app.mode(), Mode::FullDiff);
+        fx.app.on_key(KeyCode::Char('/'));
+        assert_eq!(fx.app.mode(), Mode::FindFile);
+        fx.app.on_key(KeyCode::Esc);
+        assert_eq!(fx.app.mode(), Mode::FullDiff);
+    }
+
+    #[test]
+    fn finder_enter_in_fullscreen_jumps_to_match_and_stays_fullscreen() {
+        let mut fx = harness(&["a.txt", "b.txt"]);
+        fx.app.on_key(KeyCode::Enter);
+        assert_eq!(fx.app.mode(), Mode::FullDiff);
+        fx.app.on_key(KeyCode::Char('/'));
+        for c in "b".chars() {
+            fx.app.on_key(KeyCode::Char(c));
+        }
+        assert_eq!(fx.app.finder_matches(), vec![1]);
+        fx.app.on_key(KeyCode::Enter);
+        assert_eq!(fx.app.mode(), Mode::FullDiff);
+        assert_eq!(fx.app.selected_file().unwrap().path, "b.txt");
+        let d = wait_for_diff(&mut fx.app, "b.txt");
+        assert_eq!(d.path, "b.txt");
     }
 
     #[test]
