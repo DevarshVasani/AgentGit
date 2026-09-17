@@ -6,6 +6,15 @@ pub enum GitError {
     #[error("not inside a git repository (searched upward from {0})")]
     NotARepo(String),
 
+    #[error("path is empty: type a directory or repo path")]
+    EmptyPath,
+
+    #[error("no such path: {0}")]
+    NotFound(String),
+
+    #[error("bare repositories are not supported: {0}")]
+    BareRepo(String),
+
     #[error(transparent)]
     Git(#[from] git2::Error),
 

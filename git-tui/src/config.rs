@@ -33,6 +33,9 @@ pub const ACTIONS: &[&str] = &[
     "stash_push",
     "stash_drop",
     "find_files",
+    "project_next",
+    "project_prev",
+    "project_open",
 ];
 
 /// Key names accepted in `[keys]` besides single characters.
@@ -81,6 +84,9 @@ pub struct KeyBindings {
     pub stash_push: Vec<KeyCode>,
     pub stash_drop: Vec<KeyCode>,
     pub find_files: Vec<KeyCode>,
+    pub project_next: Vec<KeyCode>,
+    pub project_prev: Vec<KeyCode>,
+    pub project_open: Vec<KeyCode>,
 }
 
 impl Default for KeyBindings {
@@ -107,6 +113,9 @@ impl Default for KeyBindings {
             stash_push: vec![Char('a')],
             stash_drop: vec![Char('D')],
             find_files: vec![Char('/')],
+            project_next: vec![Char(']')],
+            project_prev: vec![Char('[')],
+            project_open: vec![Char('o')],
         }
     }
 }
@@ -343,6 +352,9 @@ impl Config {
                 "stash_push" => k.stash_push = keys,
                 "stash_drop" => k.stash_drop = keys,
                 "find_files" => k.find_files = keys,
+                "project_next" => k.project_next = keys,
+                "project_prev" => k.project_prev = keys,
+                "project_open" => k.project_open = keys,
                 _ => anyhow::bail!(
                     "unknown action [{action}] (expected one of: {})",
                     ACTIONS.join(", ")

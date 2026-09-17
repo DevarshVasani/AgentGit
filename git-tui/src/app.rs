@@ -26,6 +26,8 @@ pub enum Mode {
     NewBranch,
     StashPush,
     FindFile,
+    OpenProject,
+    ConfirmInit,
 }
 
 /// Which panel receives navigation keys. Everything is vertical: Tab cycles
@@ -85,6 +87,199 @@ pub struct App {
     stash_scroll: Cell<usize>,
     /// Collapsed directory prefixes in the files tree (no trailing slash).
     collapsed: std::collections::HashSet<String>,
+    /// Directory picker for opening projects (`Mode::OpenProject`).
+    open_browser: Option<OpenBrowser>,
+}
+
+/// One subdirectory row in the project browser.
+#[derive(Debug, Clone)]
+pub struct DirEntry {
+    pub name: String,
+    /// The directory itself contains `.git` (repo root): badged `[repo]`.
+    pub is_repo_root: bool,
+}
+
+/// Which row of the browser list is highlighted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BrowserRow {
+    /// `.`: open the browsed folder itself.
+    Current,
+    /// `..`: go up to the parent.
+    Parent,
+    /// A subdirectory: open it, or descend into it.
+    Dir(usize),
+}
+
+/// Directory picker behind `Mode::OpenProject`. Row 0 is always `.`
+/// (open this folder), row 1 is `..` (parent), then the visible
+/// subdirectories (all of them, or the type-to-filter matches).
+#[derive(Debug, Clone)]
+pub struct OpenBrowser {
+    pub cwd: std::path::PathBuf,
+    pub entries: Vec<DirEntry>,
+    /// Subset of `entries` shown: everything without a filter, the
+    /// case-insensitive substring matches with one.
+    pub view: Vec<DirEntry>,
+    pub selected: usize,
+    pub error: Option<String>,
+    /// Jump-to-path line (`tab`): typing a path instead of browsing.
+    pub editing_path: bool,
+    /// Type-to-filter query: any typed char narrows this folder's list,
+    /// so there is no separate "start searching" step.
+    pub filter: String,
+}
+
+impl OpenBrowser {
+    /// Rows in the list: `.` + `..` + one per visible subdirectory.
+    pub fn row_count(&self) -> usize {
+        self.view.len() + 2
+    }
+
+    pub fn row(&self, index: usize) -> BrowserRow {
+        if index == 0 {
+            BrowserRow::Current
+        } else if index == 1 {
+            BrowserRow::Parent
+        } else {
+            BrowserRow::Dir(index - 2)
+        }
+    }
+
+    pub fn selected_row(&self) -> BrowserRow {
+        self.row(self.selected.min(self.row_count().saturating_sub(1)))
+    }
+
+    /// Absolute path the highlighted row points at (`.` and `..`
+    /// included; `..` of `/` resolves to `/` itself).
+    pub fn selected_path(&self) -> std::path::PathBuf {
+        match self.selected_row() {
+            BrowserRow::Current => self.cwd.clone(),
+            BrowserRow::Parent => self
+                .cwd
+                .parent()
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(|| self.cwd.clone()),
+            BrowserRow::Dir(i) => self
+                .view
+                .get(i)
+                .map(|e| self.cwd.join(&e.name))
+                .unwrap_or_else(|| self.cwd.clone()),
+        }
+    }
+
+    /// Start substring-filtering the folder list (any typed char lands
+    /// here; there is no separate search mode to enter).
+    pub fn push_filter_char(&mut self, c: char) {
+        self.filter.push(c);
+        self.apply_filter();
+    }
+
+    pub fn pop_filter_char(&mut self) {
+        self.filter.pop();
+        self.apply_filter();
+    }
+
+    /// Drop the query and show the full list again.
+    pub fn clear_filter(&mut self) {
+        self.filter.clear();
+        self.apply_filter();
+    }
+
+    /// Rebuild the visible rows from `entries` + `filter`. `.`/`..` always
+    /// stay; a fresh filter jumps the highlight to the first match.
+    fn apply_filter(&mut self) {
+        if self.filter.is_empty() {
+            self.view = self.entries.clone();
+            return;
+        }
+        let q = self.filter.to_lowercase();
+        self.view = self
+            .entries
+            .iter()
+            .filter(|e| e.name.to_lowercase().contains(&q))
+            .cloned()
+            .collect();
+        if !self.view.is_empty() {
+            // First match sits at row 2 (after `.` and `..`).
+            self.selected = 2;
+        }
+        self.selected = self.selected.min(self.row_count().saturating_sub(1));
+    }
+
+    pub fn move_cursor(&mut self, delta: isize) {
+        let n = self.row_count();
+        if n == 0 {
+            return;
+        }
+        let cur = self.selected.min(n - 1) as isize;
+        self.selected = (cur + delta).clamp(0, n as isize - 1) as usize;
+    }
+
+    /// Re-read `cwd` from disk (subdirectories only, sorted). Keeps the
+    /// old listing when the directory cannot be read. Moving folders
+    /// resets the cursor and drops any active filter.
+    pub fn rescan(&mut self) {
+        match read_subdirs(&self.cwd) {
+            Ok(entries) => {
+                self.entries = entries;
+                self.error = None;
+            }
+            Err(e) => {
+                self.entries = Vec::new();
+                self.error = Some(e);
+            }
+        }
+        self.filter.clear();
+        self.view = self.entries.clone();
+        self.selected = self.selected.min(self.row_count().saturating_sub(1));
+    }
+
+    /// Move the browser to `dir`, rescanning only when it reads cleanly.
+    /// Returns false (and keeps the old folder) on unreadable targets.
+    pub fn goto(&mut self, dir: std::path::PathBuf) -> bool {
+        match read_subdirs(&dir) {
+            Ok(entries) => {
+                self.cwd = dir;
+                self.entries = entries;
+                self.view = self.entries.clone();
+                self.selected = 0;
+                self.error = None;
+                self.filter.clear();
+                true
+            }
+            Err(e) => {
+                self.error = Some(e);
+                false
+            }
+        }
+    }
+}
+
+/// Subdirectories of `dir`, sorted by name. Files are hidden: only
+/// folders can become projects.
+fn read_subdirs(dir: &std::path::Path) -> Result<Vec<DirEntry>, String> {
+    let rd = std::fs::read_dir(dir)
+        .map_err(|e| format!("cannot list {}: {e}", dir.display()))?;
+    let mut out = Vec::new();
+    for entry in rd {
+        let entry = entry.map_err(|e| format!("cannot list {}: {e}", dir.display()))?;
+        let ft = entry
+            .file_type()
+            .map_err(|e| format!("cannot list {}: {e}", dir.display()))?;
+        // Follow symlinked dirs so linked projects stay browsable.
+        let is_dir = ft.is_dir()
+            || (ft.is_symlink()
+                && entry.path().is_dir());
+        if !is_dir {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let path = entry.path();
+        let is_repo_root = path.join(".git").exists();
+        out.push(DirEntry { name, is_repo_root });
+    }
+    out.sort_by_key(|e| e.name.to_lowercase());
+    Ok(out)
 }
 
 /// Cumulative ancestor prefixes: "a/b/c/f" -> ["a", "a/b", "a/b/c"].
@@ -136,6 +331,7 @@ impl App {
             branch_scroll: Cell::new(0),
             stash_scroll: Cell::new(0),
             collapsed: Default::default(),
+            open_browser: None,
         };
         app.refresh();
         app.preload_panels();
@@ -148,6 +344,84 @@ impl App {
 
     pub fn set_repo_name(&mut self, name: String) {
         self.repo_name = name;
+    }
+
+    /// Open the project browser (`o`): pick a directory, Enter opens it.
+    /// Starts at the current project's root so siblings are one step away.
+    pub fn begin_open_project(&mut self, start: std::path::PathBuf) {
+        self.mode = Mode::OpenProject;
+        self.draft.clear();
+        self.error = None;
+        let mut browser = OpenBrowser {
+            cwd: start,
+            entries: Vec::new(),
+            view: Vec::new(),
+            // Row 0 is `.` (the folder itself); row 1 is `..`, then dirs.
+            selected: 0,
+            error: None,
+            editing_path: false,
+            filter: String::new(),
+        };
+        browser.rescan();
+        self.open_browser = Some(browser);
+    }
+
+    pub fn open_browser(&self) -> Option<&OpenBrowser> {
+        self.open_browser.as_ref()
+    }
+
+    pub fn open_browser_mut(&mut self) -> Option<&mut OpenBrowser> {
+        self.open_browser.as_mut()
+    }
+
+    pub fn push_draft_char(&mut self, c: char) {
+        self.draft.push(c);
+    }
+
+    pub fn pop_draft_char(&mut self) {
+        self.draft.pop();
+    }
+
+    pub fn clear_draft(&mut self) {
+        self.draft.clear();
+    }
+
+    /// Cancel the open-project flow entirely (Esc in the browser).
+    pub fn cancel_open_project(&mut self) {
+        self.mode = Mode::Normal;
+        self.draft.clear();
+        self.open_browser = None;
+    }
+
+    /// Move from the browser to the `git init` confirm step, rewriting the
+    /// draft to the directory that would be initialized.
+    pub fn confirm_init_prompt(&mut self, dir: String) {
+        self.mode = Mode::ConfirmInit;
+        self.draft = dir;
+    }
+
+    /// Close the open-project flow after a successful open/switch.
+    pub fn finish_open_project(&mut self) {
+        self.mode = Mode::Normal;
+        self.draft.clear();
+        self.open_browser = None;
+    }
+
+    /// Back out of the init-confirm step to the browser (keeps the listing).
+    pub fn back_to_open_project(&mut self) {
+        self.mode = Mode::OpenProject;
+    }
+
+    pub fn set_error(&mut self, msg: String) {
+        self.error = Some(msg);
+    }
+
+    pub fn set_browser_error(&mut self, msg: String) {
+        if let Some(b) = self.open_browser.as_mut() {
+            b.error = Some(msg);
+        } else {
+            self.error = Some(msg);
+        }
     }
 
     pub(crate) fn files_scroll(&self) -> usize {
@@ -455,7 +729,9 @@ impl App {
                     Mode::NewBranch => self.submit_new_branch(),
                     Mode::StashPush => self.submit_stash_push(),
                     // FullDiff and FindFile return before reaching here.
-                    Mode::Normal | Mode::FullDiff | Mode::FindFile => {}
+                    // OpenProject/ConfirmInit submit through `Workspace`
+                    // (it owns all projects), so they are no-ops here.
+                    Mode::Normal | Mode::FullDiff | Mode::FindFile | Mode::OpenProject | Mode::ConfirmInit => {}
                 },
                 KeyCode::Esc => {
                     self.mode = Mode::Normal;

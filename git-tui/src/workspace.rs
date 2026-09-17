@@ -1,0 +1,924 @@
+use crate::app::{App, Mode};
+use crate::config::{Config, KeyBindings, Theme};
+use anyhow::{Context, Result};
+use crossterm::event::KeyCode;
+use git_tui_core::error::GitError;
+use git_tui_core::jobqueue::JobQueue;
+use git_tui_core::repo::Repo;
+use std::path::PathBuf;
+
+pub struct Workspace {
+    apps: Vec<App>,
+    /// Canonicalized workdir roots parallel to `apps` (dedup + switching).
+    roots: Vec<PathBuf>,
+    keys: KeyBindings,
+    config: Config,
+    current: usize,
+    quit: bool,
+}
+
+impl Workspace {
+    pub fn open(paths: Vec<PathBuf>, config: Config) -> Result<Self> {
+        let inputs = if paths.is_empty() {
+            vec![std::env::current_dir().context("cannot read current directory")?]
+        } else {
+            paths
+        };
+        let keys = config.keys.clone();
+        let mut ws = Self {
+            apps: Vec::new(),
+            roots: Vec::new(),
+            keys,
+            config,
+            current: 0,
+            quit: false,
+        };
+        for input in &inputs {
+            let root = Repo::discover(input)
+                .map_err(|e| anyhow::anyhow!("{e}"))?
+                .workdir()
+                .with_context(|| {
+                    format!("bare repositories are not supported: {}", input.display())
+                })?;
+            // Skip duplicates instead of failing the whole launch.
+            if ws
+                .roots
+                .iter()
+                .any(|r| r == &std::fs::canonicalize(&root).unwrap_or_else(|_| root.clone()))
+            {
+                continue;
+            }
+            ws.push_project(&root)?;
+        }
+        if ws.apps.is_empty() {
+            anyhow::bail!("no repositories to open");
+        }
+        // Launch order: first path is the selected tab.
+        ws.current = 0;
+        Ok(ws)
+    }
+
+    /// Spawn one project tab for `root` (already a workdir). Switches to it.
+    fn push_project(&mut self, root: &std::path::Path) -> Result<()> {
+        let canon = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+        if let Some(i) = self.roots.iter().position(|r| *r == canon) {
+            self.current = i;
+            return Ok(());
+        }
+        let queue =
+            JobQueue::spawn(root).map_err(|e| anyhow::anyhow!("cannot open {}: {e}", root.display()))?;
+        let mut app = App::new_with_config(queue, self.config.clone());
+        if let Some(name) = root
+            .file_name()
+            .and_then(|s| s.to_str())
+            .map(|s| s.to_string())
+        {
+            app.set_repo_name(name);
+        }
+        self.roots.push(canon);
+        self.apps.push(app);
+        self.current = self.apps.len() - 1;
+        Ok(())
+    }
+
+    /// Open `path` as a project tab (Enter on a browser row).
+    /// Every edge case stays inside the browser as an error except success
+    /// (opens/switches and closes it) and a non-repo directory (moves to
+    /// the `git init` confirm step).
+    pub fn open_path(&mut self, path: PathBuf) {
+        match Repo::discover_root(&path) {
+            Ok(root) => {
+                let canon = std::fs::canonicalize(&root).unwrap_or_else(|_| root.clone());
+                if let Some(i) = self.roots.iter().position(|r| *r == canon) {
+                    self.current = i;
+                    self.current_mut().finish_open_project();
+                    return;
+                }
+                match JobQueue::spawn(&root) {
+                    Ok(queue) => {
+                        let mut app = App::new_with_config(queue, self.config.clone());
+                        let name = root
+                            .file_name()
+                            .and_then(|s| s.to_str())
+                            .map(|s| s.to_string())
+                            .unwrap_or_else(|| root.display().to_string());
+                        app.set_repo_name(name);
+                        // Close the browser on the tab it was opened from:
+                        // the new tab starts clean, and switching back must
+                        // not resurrect the picker.
+                        let origin = self.current;
+                        self.roots.push(canon);
+                        self.apps.push(app);
+                        self.apps[origin].finish_open_project();
+                        self.current = self.apps.len() - 1;
+                    }
+                    Err(e) => self.current_mut().set_browser_error(format!(
+                        "cannot open {}: {e}",
+                        root.display()
+                    )),
+                }
+            }
+            Err(GitError::NotARepo(_)) => {
+                // Offer `git init` when the pick is a plain directory.
+                if path.is_dir() {
+                    self.current_mut()
+                        .confirm_init_prompt(path.display().to_string());
+                } else {
+                    self.current_mut().set_browser_error(format!(
+                        "not inside a git repository (searched upward from {})",
+                        path.display()
+                    ));
+                }
+            }
+            Err(e) => {
+                self.current_mut().set_browser_error(e.to_string());
+            }
+        }
+    }
+
+    /// Enter on the highlighted browser row: `.` opens this folder, `..`
+    /// goes up, a subfolder opens as a project. A query with no matches
+    /// is an error, never a fallback to `.`/`..`.
+    pub fn open_selected(&mut self) {
+        let no_match = self.current().open_browser().is_some_and(|b| {
+            !b.filter.is_empty() && b.view.is_empty()
+        });
+        if no_match {
+            let q = self
+                .current()
+                .open_browser()
+                .map(|b| b.filter.clone())
+                .unwrap_or_default();
+            self.current_mut()
+                .set_browser_error(format!("no folders matching {q:?} here"));
+            return;
+        }
+        let Some(target) = self.current().open_browser().map(|b| b.selected_path()) else {
+            return;
+        };
+        let is_parent_row = matches!(
+            self.current().open_browser().map(|b| b.selected_row()),
+            Some(crate::app::BrowserRow::Parent)
+        );
+        if is_parent_row {
+            self.goto_parent();
+            return;
+        }
+        self.open_path(target);
+    }
+
+    /// Descend into the highlighted subfolder (`→`/`l`). `.`/`..` are
+    /// handled by [`Self::open_selected`] instead.
+    pub fn descend_selected(&mut self) {
+        let Some(target) = self.current().open_browser().map(|b| b.selected_path()) else {
+            return;
+        };
+        let is_dir_row = matches!(
+            self.current().open_browser().map(|b| b.selected_row()),
+            Some(crate::app::BrowserRow::Dir(_))
+        );
+        if !is_dir_row {
+            return;
+        }
+        if let Some(b) = self.current_mut().open_browser_mut() {
+            b.goto(target);
+        }
+    }
+
+    pub fn goto_parent(&mut self) {
+        let parent = self
+            .current()
+            .open_browser()
+            .and_then(|b| b.cwd.parent().map(|p| p.to_path_buf()));
+        // No parent means the filesystem root: nothing to do.
+        if let Some(parent) = parent {
+            if let Some(b) = self.current_mut().open_browser_mut() {
+                b.goto(parent);
+            }
+        }
+    }
+
+    /// Go up one level regardless of the highlighted row (`←`/`h`).
+    pub fn browser_up(&mut self) {
+        let parent = self
+            .current()
+            .open_browser()
+            .and_then(|b| b.cwd.parent().map(|p| p.to_path_buf()));
+        if let Some(parent) = parent {
+            if let Some(b) = self.current_mut().open_browser_mut() {
+                b.goto(parent);
+            }
+        }
+    }
+
+    /// Submit the jump-to-path line (`tab` then Enter): move the browser to
+    /// the typed directory instead of only browsing from the start folder.
+    pub fn submit_jump_path(&mut self) {
+        let draft = self.current().draft().to_string();
+        let path = match Repo::normalize_project_input(&draft) {
+            Ok(p) => p,
+            Err(e) => {
+                self.current_mut().set_browser_error(e.to_string());
+                return;
+            }
+        };
+        if !path.is_dir() {
+            self.current_mut().set_browser_error(format!(
+                "not a directory: {}",
+                path.display()
+            ));
+            return;
+        }
+        let dir = std::fs::canonicalize(&path).unwrap_or(path);
+        let ok = self
+            .current_mut()
+            .open_browser_mut()
+            .map(|b| {
+                b.editing_path = false;
+                b.goto(dir)
+            })
+            .unwrap_or(false);
+        if ok {
+            self.current_mut().clear_draft();
+        }
+    }
+
+    /// Confirm the init step (Enter in `Mode::ConfirmInit`): `git init`
+    /// the prompted directory, then open it as a project.
+    pub fn confirm_init_project(&mut self) {
+        let draft = self.current().draft().to_string();
+        let dir = match Repo::normalize_project_input(&draft) {
+            Ok(p) => {
+                if p.is_dir() {
+                    p
+                } else {
+                    self.current_mut()
+                        .set_error(format!("cannot init here: {}", p.display()));
+                    return;
+                }
+            }
+            Err(e) => {
+                self.current_mut().set_error(e.to_string());
+                return;
+            }
+        };
+        match Repo::init(&dir) {
+            Ok(_) => match Repo::discover_root(&dir) {
+                Ok(root) => {
+                    let canon = std::fs::canonicalize(&root).unwrap_or_else(|_| root.clone());
+                    if let Some(i) = self.roots.iter().position(|r| *r == canon) {
+                        self.current = i;
+                        self.current_mut().finish_open_project();
+                        return;
+                    }
+                    match JobQueue::spawn(&root) {
+                        Ok(queue) => {
+                            let mut app = App::new_with_config(queue, self.config.clone());
+                            let name = root
+                                .file_name()
+                                .and_then(|s| s.to_str())
+                                .map(|s| s.to_string())
+                                .unwrap_or_else(|| root.display().to_string());
+                            app.set_repo_name(name);
+                            // Same as `open_path`: close the picker on the
+                            // originating tab so it stays closed when
+                            // switching back.
+                            let origin = self.current;
+                            self.roots.push(canon);
+                            self.apps.push(app);
+                            self.apps[origin].finish_open_project();
+                            self.current = self.apps.len() - 1;
+                        }
+                        Err(e) => self.current_mut().set_error(format!(
+                            "initialized {}, but cannot open it: {e}",
+                            dir.display()
+                        )),
+                    }
+                }
+                Err(e) => self
+                    .current_mut()
+                    .set_error(format!("initialized {}, but cannot open it: {e}", dir.display())),
+            },
+            Err(e) => self
+                .current_mut()
+                .set_error(format!("cannot init {}: {e}", dir.display())),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.apps.len()
+    }
+
+    pub fn index(&self) -> usize {
+        self.current
+    }
+
+    pub fn current(&self) -> &App {
+        &self.apps[self.current]
+    }
+
+    pub fn current_mut(&mut self) -> &mut App {
+        &mut self.apps[self.current]
+    }
+
+    pub fn project_name(&self, i: usize) -> &str {
+        self.apps[i].repo_name()
+    }
+
+    pub fn project_dirty_count(&self, i: usize) -> Option<usize> {
+        self.apps[i].status().map(|st| st.files.len())
+    }
+
+    /// Canonicalized workdir roots, parallel to the tabs (for the
+    /// browser's `[open]` badges).
+    pub fn project_roots(&self) -> &[PathBuf] {
+        &self.roots
+    }
+
+    pub fn theme(&self) -> Theme {
+        self.current().theme()
+    }
+
+    pub fn next(&mut self) {
+        if !self.apps.is_empty() {
+            self.current = (self.current + 1) % self.apps.len();
+        }
+    }
+
+    pub fn prev(&mut self) {
+        if !self.apps.is_empty() {
+            self.current = (self.current + self.apps.len() - 1) % self.apps.len();
+        }
+    }
+
+    pub fn on_key(&mut self, key: KeyCode) {
+        // The browser owns every key until it closes (Enter opens the
+        // highlighted folder, Esc closes). No global bindings leak in.
+        if self.current().mode() == Mode::OpenProject {
+            self.on_key_browser(key);
+            return;
+        }
+        if self.current().mode() == Mode::ConfirmInit {
+            match key {
+                // Any edit aborts the confirm and returns to the browser
+                // so another folder can be picked instead.
+                KeyCode::Char(_) | KeyCode::Backspace => {
+                    self.current_mut().back_to_open_project();
+                }
+                KeyCode::Enter => self.confirm_init_project(),
+                KeyCode::Esc => self.current_mut().back_to_open_project(),
+                _ => {}
+            }
+            return;
+        }
+        if self.current().mode() == Mode::Normal {
+            if self.keys.project_open.contains(&key) {
+                let start = self.roots[self.current].clone();
+                self.current_mut().begin_open_project(start);
+                return;
+            }
+            if self.apps.len() > 1 {
+                if self.keys.project_next.contains(&key) {
+                    self.next();
+                    return;
+                }
+                if self.keys.project_prev.contains(&key) {
+                    self.prev();
+                    return;
+                }
+            }
+        }
+        self.current_mut().on_key(key);
+    }
+
+    /// Keys inside the project browser. Typing filters the current
+    /// folder's list by default (no prefix key); everything else lives on
+    /// non-printable keys so search text never triggers actions.
+    fn on_key_browser(&mut self, key: KeyCode) {
+        let editing = self
+            .current()
+            .open_browser()
+            .is_some_and(|b| b.editing_path);
+        if editing {
+            match key {
+                KeyCode::Char(c) => self.current_mut().push_draft_char(c),
+                KeyCode::Backspace => self.current_mut().pop_draft_char(),
+                KeyCode::Enter => self.submit_jump_path(),
+                KeyCode::Esc => {
+                    if let Some(b) = self.current_mut().open_browser_mut() {
+                        b.editing_path = false;
+                    }
+                    self.current_mut().clear_draft();
+                }
+                _ => {}
+            }
+            return;
+        }
+        match key {
+            KeyCode::Char(c) => {
+                if let Some(b) = self.current_mut().open_browser_mut() {
+                    b.push_filter_char(c);
+                }
+            }
+            // Edit the query; an empty query + Backspace goes up a level.
+            KeyCode::Backspace => {
+                let empty = self
+                    .current()
+                    .open_browser()
+                    .is_some_and(|b| b.filter.is_empty());
+                if empty {
+                    self.browser_up();
+                } else if let Some(b) = self.current_mut().open_browser_mut() {
+                    b.pop_filter_char();
+                }
+            }
+            KeyCode::Up => {
+                if let Some(b) = self.current_mut().open_browser_mut() {
+                    b.move_cursor(-1);
+                }
+            }
+            KeyCode::Down => {
+                if let Some(b) = self.current_mut().open_browser_mut() {
+                    b.move_cursor(1);
+                }
+            }
+            KeyCode::Enter => self.open_selected(),
+            KeyCode::Right => self.descend_selected(),
+            KeyCode::Left => self.browser_up(),
+            // Jump to a typed path instead of clicking through.
+            KeyCode::Tab => {
+                if let Some(b) = self.current_mut().open_browser_mut() {
+                    b.editing_path = true;
+                }
+                self.current_mut().clear_draft();
+            }
+            // Clear the query first; close only with nothing to clear.
+            KeyCode::Esc => {
+                let has_filter = self
+                    .current()
+                    .open_browser()
+                    .is_some_and(|b| !b.filter.is_empty());
+                if has_filter {
+                    if let Some(b) = self.current_mut().open_browser_mut() {
+                        b.clear_filter();
+                    }
+                } else {
+                    self.current_mut().cancel_open_project();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    pub fn poll(&mut self) {
+        for app in &mut self.apps {
+            app.poll();
+        }
+    }
+
+    pub fn request_quit(&mut self) {
+        self.quit = true;
+        for app in &mut self.apps {
+            app.request_quit();
+        }
+    }
+
+    pub fn should_quit(&self) -> bool {
+        self.quit || self.apps.iter().any(App::should_quit)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn init_repo_with_file(name: &str, path: &str, contents: &str) -> tempfile::TempDir {
+        let dir = tempfile::TempDir::new().unwrap();
+        let repo = git2::Repository::init(dir.path()).unwrap();
+        repo.set_head("refs/heads/main").unwrap();
+        let mut cfg = repo.config().unwrap();
+        cfg.set_str("user.name", "Test User").unwrap();
+        cfg.set_str("user.email", "test@example.com").unwrap();
+        std::fs::write(dir.path().join(path), contents).unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(std::path::Path::new(path)).unwrap();
+        index.write().unwrap();
+        let tree_id = index.write_tree().unwrap();
+        let tree = repo.find_tree(tree_id).unwrap();
+        let sig = repo.signature().unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, name, &tree, &[])
+            .unwrap();
+        dir
+    }
+
+    fn type_text(ws: &mut Workspace, text: &str) {
+        for c in text.chars() {
+            ws.on_key(KeyCode::Char(c));
+        }
+    }
+
+    /// Drive the UI the way a user would: `o`, `tab`, type the path,
+    /// Enter (jump there), Enter (open the folder via `.`).
+    fn ui_open_path(ws: &mut Workspace, path: &std::path::Path) {
+        ws.on_key(KeyCode::Char('o'));
+        ws.on_key(KeyCode::Tab);
+        type_text(ws, path.to_str().unwrap());
+        ws.on_key(KeyCode::Enter);
+        ws.on_key(KeyCode::Enter);
+    }
+
+    /// Jump the browser via the `tab` editor (mirrors `ui_open_path`
+    /// without opening anything afterwards).
+    fn ui_jump_to(ws: &mut Workspace, path: &std::path::Path) {
+        ws.on_key(KeyCode::Char('o'));
+        ws.on_key(KeyCode::Tab);
+        type_text(ws, path.to_str().unwrap());
+        ws.on_key(KeyCode::Enter);
+    }
+
+    fn browser_error(ws: &Workspace) -> String {
+        ws.current()
+            .open_browser()
+            .and_then(|b| b.error.clone())
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn opens_each_repo_with_isolated_state() {
+        let a = init_repo_with_file("a", "a.txt", "a\n");
+        let b = init_repo_with_file("b", "b.txt", "b\n");
+        let ws = Workspace::open(
+            vec![a.path().to_path_buf(), b.path().to_path_buf()],
+            Config::default(),
+        )
+        .unwrap();
+        assert_eq!(ws.len(), 2);
+        let base =
+            |d: &tempfile::TempDir| d.path().file_name().unwrap().to_string_lossy().into_owned();
+        assert_eq!(ws.current().repo_name(), base(&a));
+        assert_eq!(ws.project_name(1), base(&b));
+    }
+
+    #[test]
+    fn switching_wraps_around() {
+        let a = init_repo_with_file("a", "a.txt", "a\n");
+        let b = init_repo_with_file("b", "b.txt", "b\n");
+        let mut ws = Workspace::open(
+            vec![a.path().to_path_buf(), b.path().to_path_buf()],
+            Config::default(),
+        )
+        .unwrap();
+        ws.next();
+        assert_eq!(ws.index(), 1);
+        ws.next();
+        assert_eq!(ws.index(), 0);
+        ws.prev();
+        assert_eq!(ws.index(), 1);
+    }
+
+    #[test]
+    fn duplicate_paths_open_only_once() {
+        let a = init_repo_with_file("a", "a.txt", "a\n");
+        let ws = Workspace::open(
+            vec![a.path().to_path_buf(), a.path().to_path_buf()],
+            Config::default(),
+        )
+        .unwrap();
+        assert_eq!(ws.len(), 1);
+    }
+
+    #[test]
+    fn invalid_path_is_an_error() {
+        let missing = std::env::temp_dir().join("git-tui-definitely-not-a-repo-xyz");
+        assert!(Workspace::open(vec![missing], Config::default()).is_err());
+    }
+
+    #[test]
+    fn project_keys_cycle_only_from_normal_mode() {
+        use crossterm::event::KeyCode;
+        let a = init_repo_with_file("a", "a.txt", "a\n");
+        let b = init_repo_with_file("b", "b.txt", "b\n");
+        let mut ws = Workspace::open(
+            vec![a.path().to_path_buf(), b.path().to_path_buf()],
+            Config::default(),
+        )
+        .unwrap();
+        ws.on_key(KeyCode::Char(']'));
+        assert_eq!(ws.index(), 1);
+        ws.current_mut().on_key(KeyCode::Char('c'));
+        ws.on_key(KeyCode::Char(']'));
+        assert_eq!(ws.index(), 1, "commit draft must win over project switch");
+    }
+
+    #[test]
+    fn open_key_shows_browser_at_current_root() {
+        let a = init_repo_with_file("a", "a.txt", "a\n");
+        let mut ws = Workspace::open(vec![a.path().to_path_buf()], Config::default()).unwrap();
+        ws.on_key(KeyCode::Char('o'));
+        assert_eq!(ws.current().mode(), Mode::OpenProject);
+        let browser = ws.current().open_browser().expect("browser is open");
+        assert_eq!(
+            browser.cwd,
+            std::fs::canonicalize(a.path()).unwrap(),
+            "browser starts at the current project so siblings are nearby"
+        );
+        assert!(!browser.editing_path);
+    }
+
+    #[test]
+    fn open_project_from_app_adds_and_selects_tab() {
+        let a = init_repo_with_file("a", "a.txt", "a\n");
+        let b = init_repo_with_file("b", "b.txt", "b\n");
+        let mut ws = Workspace::open(vec![a.path().to_path_buf()], Config::default()).unwrap();
+        ui_open_path(&mut ws, b.path());
+        assert_eq!(ws.len(), 2);
+        assert_eq!(ws.index(), 1);
+        assert_eq!(ws.current().mode(), Mode::Normal);
+        // The picker closed on the tab it was opened from too: switching
+        // back must land on a clean Normal mode, not the open browser.
+        ws.prev();
+        assert_eq!(ws.index(), 0);
+        assert_eq!(ws.current().mode(), Mode::Normal);
+        assert!(ws.current().open_browser().is_none());
+    }
+
+    #[test]
+    fn open_duplicate_switches_without_new_tab() {
+        let a = init_repo_with_file("a", "a.txt", "a\n");
+        let b = init_repo_with_file("b", "b.txt", "b\n");
+        let mut ws = Workspace::open(
+            vec![a.path().to_path_buf(), b.path().to_path_buf()],
+            Config::default(),
+        )
+        .unwrap();
+        assert_eq!(ws.index(), 0);
+        ws.next();
+        assert_eq!(ws.index(), 1);
+        ui_open_path(&mut ws, a.path());
+        assert_eq!(ws.len(), 2, "duplicate must not add a tab");
+        assert_eq!(ws.index(), 0);
+    }
+
+    #[test]
+    fn enter_on_dot_opens_current_folder() {
+        let a = init_repo_with_file("a", "a.txt", "a\n");
+        let mut ws = Workspace::open(vec![a.path().to_path_buf()], Config::default()).unwrap();
+        ws.on_key(KeyCode::Char('o'));
+        // `.` is pre-selected: Enter opens the browsed folder itself,
+        // which here is already open, so it just closes the browser.
+        ws.on_key(KeyCode::Enter);
+        assert_eq!(ws.current().mode(), Mode::Normal);
+        assert_eq!(ws.len(), 1);
+    }
+
+    #[test]
+    fn browser_navigates_down_up_and_marks_repo_roots() {
+        let parent = tempfile::TempDir::new().unwrap();
+        let repo_dir = parent.path().join("aaa-repo");
+        std::fs::create_dir_all(&repo_dir).unwrap();
+        git2::Repository::init(&repo_dir).unwrap();
+        let plain_dir = parent.path().join("zzz-plain");
+        std::fs::create_dir_all(&plain_dir).unwrap();
+        let a = init_repo_with_file("a", "a.txt", "a\n");
+        let mut ws = Workspace::open(vec![a.path().to_path_buf()], Config::default()).unwrap();
+        ui_jump_to(&mut ws, parent.path());
+        {
+            let b = ws.current().open_browser().unwrap();
+            let names: Vec<&str> = b.entries.iter().map(|e| e.name.as_str()).collect();
+            assert_eq!(names, vec!["aaa-repo", "zzz-plain"]);
+            assert!(b.entries[0].is_repo_root);
+            assert!(!b.entries[1].is_repo_root);
+        }
+        // Down past `.`/`..` onto the repo dir, then descend into it.
+        ws.on_key(KeyCode::Down);
+        ws.on_key(KeyCode::Down);
+        assert!(ws
+            .current()
+            .open_browser()
+            .unwrap()
+            .selected_path()
+            .ends_with("aaa-repo"));
+        ws.on_key(KeyCode::Right);
+        assert_eq!(
+            ws.current().open_browser().unwrap().cwd,
+            std::fs::canonicalize(&repo_dir).unwrap()
+        );
+        // Back up to the parent.
+        ws.on_key(KeyCode::Left);
+        assert_eq!(
+            ws.current().open_browser().unwrap().cwd,
+            std::fs::canonicalize(parent.path()).unwrap()
+        );
+    }
+
+    #[test]
+    fn jump_to_tilde_via_tab_editor() {
+        let a = init_repo_with_file("a", "a.txt", "a\n");
+        let mut ws = Workspace::open(vec![a.path().to_path_buf()], Config::default()).unwrap();
+        ws.on_key(KeyCode::Char('o'));
+        ws.on_key(KeyCode::Tab);
+        assert!(ws.current().open_browser().unwrap().editing_path);
+        type_text(&mut ws, "~");
+        ws.on_key(KeyCode::Enter);
+        let home = std::env::var("HOME").unwrap();
+        assert_eq!(
+            ws.current().open_browser().unwrap().cwd,
+            std::fs::canonicalize(&home).unwrap()
+        );
+    }
+
+    #[test]
+    fn typing_filters_this_folder_and_enter_opens_match() {
+        let parent = tempfile::TempDir::new().unwrap();
+        for name in ["alpha-proj", "beta-proj", "gamma-other"] {
+            let dir = parent.path().join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            git2::Repository::init(&dir).unwrap();
+        }
+        let a = init_repo_with_file("a", "a.txt", "a\n");
+        let mut ws = Workspace::open(vec![a.path().to_path_buf()], Config::default()).unwrap();
+        ui_jump_to(&mut ws, parent.path());
+        // No prefix key: typing narrows the listing to this folder's matches.
+        type_text(&mut ws, "proj");
+        {
+            let b = ws.current().open_browser().unwrap();
+            assert_eq!(b.filter, "proj");
+            let names: Vec<&str> = b.view.iter().map(|e| e.name.as_str()).collect();
+            assert_eq!(names, vec!["alpha-proj", "beta-proj"]);
+            // Fresh filter jumps the highlight to the first match.
+            assert!(b.selected_path().ends_with("alpha-proj"));
+        }
+        ws.on_key(KeyCode::Enter);
+        assert_eq!(ws.len(), 2);
+        assert_eq!(ws.current().mode(), Mode::Normal);
+    }
+
+    #[test]
+    fn filter_no_match_stays_with_error_and_esc_clears() {
+        let parent = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(parent.path().join("alpha")).unwrap();
+        let a = init_repo_with_file("a", "a.txt", "a\n");
+        let mut ws = Workspace::open(vec![a.path().to_path_buf()], Config::default()).unwrap();
+        ui_jump_to(&mut ws, parent.path());
+        type_text(&mut ws, "zzz-nope");
+        assert!(ws.current().open_browser().unwrap().view.is_empty());
+        ws.on_key(KeyCode::Enter);
+        assert_eq!(ws.current().mode(), Mode::OpenProject);
+        assert!(
+            browser_error(&ws).contains("no folders matching"),
+            "got: {}",
+            browser_error(&ws)
+        );
+        // Esc clears the filter and restores the full listing.
+        ws.on_key(KeyCode::Esc);
+        let b = ws.current().open_browser().unwrap();
+        assert!(b.filter.is_empty());
+        assert_eq!(b.view.len(), b.entries.len());
+        assert_eq!(ws.current().mode(), Mode::OpenProject);
+        // Second Esc closes the browser.
+        ws.on_key(KeyCode::Esc);
+        assert_eq!(ws.current().mode(), Mode::Normal);
+    }
+
+    #[test]
+    fn filter_backspace_edits_then_goes_up_when_empty() {
+        let parent = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(parent.path().join("alpha")).unwrap();
+        let a = init_repo_with_file("a", "a.txt", "a\n");
+        let mut ws = Workspace::open(vec![a.path().to_path_buf()], Config::default()).unwrap();
+        ui_jump_to(&mut ws, parent.path());
+        type_text(&mut ws, "ab");
+        assert_eq!(ws.current().open_browser().unwrap().filter, "ab");
+        ws.on_key(KeyCode::Backspace);
+        assert_eq!(ws.current().open_browser().unwrap().filter, "a");
+        ws.on_key(KeyCode::Backspace);
+        {
+            let b = ws.current().open_browser().unwrap();
+            assert!(b.filter.is_empty());
+            assert_eq!(b.view.len(), b.entries.len());
+        }
+        // Empty filter + Backspace goes up a level (old Backspace behavior).
+        let expected = parent.path().parent().map(|p| p.to_path_buf()).unwrap();
+        ws.on_key(KeyCode::Backspace);
+        assert_eq!(
+            ws.current().open_browser().unwrap().cwd,
+            std::fs::canonicalize(&expected).unwrap()
+        );
+    }
+
+    #[test]
+    fn jump_to_file_is_an_error() {
+        let a = init_repo_with_file("a", "a.txt", "a\n");
+        let mut ws = Workspace::open(vec![a.path().to_path_buf()], Config::default()).unwrap();
+        ws.on_key(KeyCode::Char('o'));
+        ws.on_key(KeyCode::Tab);
+        type_text(&mut ws, a.path().join("a.txt").to_str().unwrap());
+        ws.on_key(KeyCode::Enter);
+        assert_eq!(ws.current().mode(), Mode::OpenProject);
+        assert!(
+            browser_error(&ws).contains("not a directory"),
+            "got: {}",
+            browser_error(&ws)
+        );
+    }
+
+    #[test]
+    fn open_empty_input_stays_in_modal_with_error() {
+        let a = init_repo_with_file("a", "a.txt", "a\n");
+        let mut ws = Workspace::open(vec![a.path().to_path_buf()], Config::default()).unwrap();
+        ws.on_key(KeyCode::Char('o'));
+        ws.on_key(KeyCode::Tab);
+        ws.on_key(KeyCode::Enter);
+        assert_eq!(ws.current().mode(), Mode::OpenProject);
+        assert!(!browser_error(&ws).is_empty());
+        assert_eq!(ws.len(), 1);
+    }
+
+    #[test]
+    fn open_missing_path_stays_in_modal_with_error() {
+        let a = init_repo_with_file("a", "a.txt", "a\n");
+        let mut ws = Workspace::open(vec![a.path().to_path_buf()], Config::default()).unwrap();
+        ws.on_key(KeyCode::Char('o'));
+        ws.on_key(KeyCode::Tab);
+        type_text(&mut ws, "/definitely/not/here-git-tui-xyz");
+        ws.on_key(KeyCode::Enter);
+        assert_eq!(ws.current().mode(), Mode::OpenProject);
+        assert!(
+            browser_error(&ws).contains("no such path"),
+            "got: {}",
+            browser_error(&ws)
+        );
+    }
+
+    #[test]
+    fn open_bare_repo_stays_in_modal_with_error() {
+        let a = init_repo_with_file("a", "a.txt", "a\n");
+        let bare_parent = tempfile::TempDir::new().unwrap();
+        let bare = bare_parent.path().join("bare.git");
+        git2::Repository::init_bare(&bare).unwrap();
+        let mut ws = Workspace::open(vec![a.path().to_path_buf()], Config::default()).unwrap();
+        ui_open_path(&mut ws, &bare);
+        assert_eq!(ws.current().mode(), Mode::OpenProject);
+        assert!(
+            browser_error(&ws).contains("bare"),
+            "got: {}",
+            browser_error(&ws)
+        );
+    }
+
+    #[test]
+    fn open_non_repo_dir_offers_init_then_opens() {
+        let a = init_repo_with_file("a", "a.txt", "a\n");
+        let plain = tempfile::TempDir::new().unwrap();
+        std::fs::write(plain.path().join("notes.txt"), "hello\n").unwrap();
+        let mut ws = Workspace::open(vec![a.path().to_path_buf()], Config::default()).unwrap();
+        ui_open_path(&mut ws, plain.path());
+        assert_eq!(ws.current().mode(), Mode::ConfirmInit);
+        ws.on_key(KeyCode::Enter);
+        assert_eq!(ws.len(), 2);
+        assert_eq!(ws.current().mode(), Mode::Normal);
+        assert!(plain.path().join(".git").exists());
+        // Same as a plain open: the originating tab's picker is closed.
+        ws.prev();
+        assert_eq!(ws.current().mode(), Mode::Normal);
+        assert!(ws.current().open_browser().is_none());
+    }
+
+    #[test]
+    fn open_empty_repo_works_with_no_files() {
+        let a = init_repo_with_file("a", "a.txt", "a\n");
+        // Fresh `git init`, no commits, no files: the empty project.
+        let empty = tempfile::TempDir::new().unwrap();
+        git2::Repository::init(empty.path()).unwrap();
+        let mut ws = Workspace::open(vec![a.path().to_path_buf()], Config::default()).unwrap();
+        ui_open_path(&mut ws, empty.path());
+        assert_eq!(ws.len(), 2);
+        assert_eq!(ws.current().mode(), Mode::Normal);
+    }
+
+    #[test]
+    fn esc_clears_filter_then_closes_and_keys_do_not_leak() {
+        let a = init_repo_with_file("a", "a.txt", "a\n");
+        let b = init_repo_with_file("b", "b.txt", "b\n");
+        let mut ws = Workspace::open(
+            vec![a.path().to_path_buf(), b.path().to_path_buf()],
+            Config::default(),
+        )
+        .unwrap();
+        ws.on_key(KeyCode::Char('o'));
+        // `[`, `]` and `q` are filter text now, not actions.
+        ws.on_key(KeyCode::Char('['));
+        assert_eq!(ws.index(), 0, "project_prev must not fire inside the browser");
+        ws.on_key(KeyCode::Char('q'));
+        assert!(!ws.should_quit(), "quit must not fire inside the browser");
+        assert_eq!(ws.current().open_browser().unwrap().filter, "[q");
+        assert_eq!(ws.current().mode(), Mode::OpenProject);
+        // First Esc clears the query, second closes the browser.
+        ws.on_key(KeyCode::Esc);
+        assert!(ws.current().open_browser().unwrap().filter.is_empty());
+        assert_eq!(ws.current().mode(), Mode::OpenProject);
+        ws.on_key(KeyCode::Esc);
+        assert_eq!(ws.current().mode(), Mode::Normal);
+        assert_eq!(ws.len(), 2);
+    }
+}

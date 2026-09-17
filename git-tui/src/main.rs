@@ -4,21 +4,22 @@ mod fuzzy;
 mod syntax;
 mod ui;
 mod words;
+mod workspace;
 
 use anyhow::{Context, Result};
-use app::App;
 use config::{Config, Theme};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
-use git_tui_core::jobqueue::JobQueue;
-use git_tui_core::repo::Repo;
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
+use std::ffi::OsString;
 use std::io::stdout;
+use std::path::PathBuf;
 use std::time::Duration;
+use workspace::Workspace;
 
 fn main() -> Result<()> {
     // Stage 5 — raw mode, explained:
@@ -30,28 +31,17 @@ fn main() -> Result<()> {
     // below + the explicit restore after `run` returns.
     install_panic_hook();
 
-    let cwd = std::env::current_dir().context("cannot read current directory")?;
-    let root = Repo::discover(&cwd)
-        .map_err(|e| anyhow::anyhow!("{e}"))?
-        .workdir()
-        .context("bare repositories are not supported")?;
-    let queue = JobQueue::spawn(&root).map_err(|e| anyhow::anyhow!("{e}"))?;
     // Missing/invalid config fails fast here (path + value in the error);
     // missing file falls back to defaults inside `Config::load`.
     // Precedence: `--theme` flag > config file > default.
-    let cli = parse_args(std::env::args().skip(1))?;
+    // Positional paths and `--repo` flags select the projects; empty means
+    // the current directory. Each path is resolved to its enclosing repo.
+    let cli = parse_args(std::env::args_os().skip(1))?;
     let mut config = Config::load().context("cannot load config")?;
     if let Some(name) = cli.theme {
         config.theme = Theme::by_name(&name).with_context(|| format!("unknown theme {name:?}"))?;
     }
-    let mut app = App::new_with_config(queue, config);
-    if let Some(name) = root
-        .file_name()
-        .and_then(|s| s.to_str())
-        .map(|s| s.to_string())
-    {
-        app.set_repo_name(name);
-    }
+    let mut workspace = Workspace::open(cli.paths, config)?;
 
     enable_raw_mode().context("cannot enable raw mode")?;
     let mut out = stdout();
@@ -63,7 +53,7 @@ fn main() -> Result<()> {
     let backend = CrosstermBackend::new(out);
     let mut terminal = Terminal::new(backend).context("cannot create terminal")?;
 
-    let res = run(&mut terminal, &mut app);
+    let res = run(&mut terminal, &mut workspace);
 
     restore_terminal(&mut terminal);
     res
@@ -87,28 +77,51 @@ fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) 
     let _ = terminal.show_cursor();
 }
 
-/// Parsed CLI flags. Only `--theme` for now; the app takes no positionals.
 struct Cli {
     theme: Option<String>,
+    paths: Vec<PathBuf>,
 }
 
-const USAGE: &str = "usage: git-tui [--theme <default|tokyo-night>]";
+const USAGE: &str =
+    "usage: git-tui [--theme <default|tokyo-night>] [--repo <path>]... [<path>...] [-- <path>...]";
 
-fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Cli> {
-    let mut cli = Cli { theme: None };
-    let mut args = args.into_iter().peekable();
+fn parse_args(args: impl IntoIterator<Item = impl Into<OsString>>) -> Result<Cli> {
+    let mut cli = Cli {
+        theme: None,
+        paths: Vec::new(),
+    };
+    let mut args = args.into_iter().map(Into::into);
     while let Some(arg) = args.next() {
-        if arg == "-h" || arg == "--help" {
+        if arg == "--" {
+            cli.paths.extend(args.map(PathBuf::from));
+            break;
+        } else if arg == "-h" || arg == "--help" {
             println!("{USAGE}");
             std::process::exit(0);
         } else if arg == "--theme" {
             let name = args.next().context("--theme needs a value")?;
-            cli.theme = Some(name);
-        } else if let Some(name) = arg.strip_prefix("--theme=") {
+            cli.theme = Some(
+                name.into_string()
+                    .map_err(|_| anyhow::anyhow!("theme must be UTF-8"))?,
+            );
+        } else if let Some(name) = arg.to_str().and_then(|s| s.strip_prefix("--theme=")) {
             anyhow::ensure!(!name.is_empty(), "--theme needs a value");
             cli.theme = Some(name.to_string());
-        } else {
+        } else if arg == "--repo" {
+            let path = args.next().context("--repo needs a value")?;
+            anyhow::ensure!(
+                !path.is_empty() && !path.as_encoded_bytes().starts_with(b"-"),
+                "--repo needs a value"
+            );
+            cli.paths.push(path.into());
+        } else if arg.as_encoded_bytes().starts_with(b"--repo=") {
+            let path: OsString = arg.to_string_lossy()["--repo=".len()..].into();
+            anyhow::ensure!(!path.is_empty(), "--repo needs a value");
+            cli.paths.push(path.into());
+        } else if arg.as_encoded_bytes().starts_with(b"-") {
             anyhow::bail!("{USAGE} (unexpected argument {arg:?})");
+        } else {
+            cli.paths.push(arg.into());
         }
     }
     Ok(cli)
@@ -123,7 +136,10 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Cli> {
 /// (here 100ms so a frame still renders with no input) → update state →
 /// `draw` the whole screen → repeat. `draw` diffs the previous frame and
 /// emits only the changed ANSI sequences.
-fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>, app: &mut App) -> Result<()> {
+fn run(
+    terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+    workspace: &mut Workspace,
+) -> Result<()> {
     loop {
         if event::poll(Duration::from_millis(100)).context("cannot poll input")? {
             if let Event::Key(key) = event::read().context("cannot read input")? {
@@ -135,17 +151,17 @@ fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>, app: &mut App
                 if key.modifiers.contains(KeyModifiers::CONTROL)
                     && matches!(key.code, KeyCode::Char('c' | 'C'))
                 {
-                    app.request_quit();
+                    workspace.request_quit();
                 } else {
-                    app.on_key(key.code);
+                    workspace.on_key(key.code);
                 }
             }
         }
-        app.poll();
+        workspace.poll();
         terminal
-            .draw(|f| ui::render(f, app))
+            .draw(|f| ui::render_workspace(f, workspace))
             .context("cannot render")?;
-        if app.should_quit() {
+        if workspace.should_quit() {
             return Ok(());
         }
     }
@@ -183,9 +199,57 @@ mod tests {
     }
 
     #[test]
-    fn unexpected_positional_errors() {
-        assert!(parse_args(args(&["some-repo"])).is_err());
-        assert!(parse_args(args(&["--bogus"])).is_err());
+    fn positional_repo_paths_are_accepted() {
+        assert!(parse_args(args(&["some-repo", "other-repo"])).is_ok());
+    }
+
+    #[test]
+    fn multiple_repo_flags_and_positionals_are_accepted() {
+        assert!(parse_args(args(&[
+            "first",
+            "--repo",
+            "second",
+            "--theme=tokyo-night",
+            "--repo=third",
+            "--repo",
+            "fourth",
+            "fifth",
+        ]))
+        .is_ok());
+    }
+
+    #[test]
+    fn repo_flag_needs_a_value() {
+        for input in [
+            vec!["--repo"],
+            vec!["--repo="],
+            vec!["--repo", ""],
+            vec!["--repo", "--theme=default"],
+            vec!["--repo", "--"],
+        ] {
+            assert!(parse_args(args(&input)).is_err(), "{input:?}");
+        }
+    }
+
+    #[test]
+    fn unknown_flags_are_rejected() {
+        for input in [vec!["--bogus"], vec!["-x"], vec!["repo", "--bogus=value"]] {
+            assert!(parse_args(args(&input)).is_err(), "{input:?}");
+        }
+    }
+
+    #[test]
+    fn separator_treats_remaining_arguments_as_paths() {
+        assert!(parse_args(args(&[
+            "first",
+            "--",
+            "--repo",
+            "--theme=default",
+            "--help",
+            "--",
+            "-last",
+        ]))
+        .is_ok());
     }
 
     #[test]

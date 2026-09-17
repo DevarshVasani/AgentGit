@@ -4,6 +4,7 @@ use crate::app::{App, Focus, Mode};
 use crate::config::Theme;
 use crate::syntax::{highlight_line, HiToken};
 use crate::words::{word_diff, WordSeg};
+use crate::workspace::Workspace;
 use git_tui_core::branch::BranchInfo;
 use git_tui_core::diff::{FileDiff, LineKind};
 use git_tui_core::log::CommitInfo;
@@ -86,12 +87,14 @@ pub fn render(frame: &mut Frame, app: &App) {
     render_branches_panel(frame, layout.branches, app);
     render_commits_panel(frame, layout.commits, app);
     render_stash_panel(frame, layout.stash, app);
-    render_footer(frame, layout.footer, app);
+    render_footer(frame, layout.footer, app, false);
 
     match app.mode() {
         Mode::Committing => render_input_modal(frame, area, app, " Commit message "),
         Mode::NewBranch => render_input_modal(frame, area, app, " New branch name "),
         Mode::StashPush => render_input_modal(frame, area, app, " Stash message "),
+        Mode::OpenProject => render_open_browser_modal(frame, area, app, &[]),
+        Mode::ConfirmInit => render_confirm_init_modal(frame, area, app),
         Mode::FindFile => {
             // Opened fullscreen: keep the diff behind the modal.
             if app.finder_return() == Mode::FullDiff {
@@ -102,6 +105,90 @@ pub fn render(frame: &mut Frame, app: &App) {
         Mode::FullDiff => render_fullscreen_diff(frame, area, app),
         Mode::Normal => {}
     }
+}
+
+/// Render a workspace of one or more projects. A single project renders
+/// exactly like [`render`]; multiple projects gain a project bar on top
+/// that stays visible even with a fullscreen diff open.
+pub fn render_workspace(frame: &mut Frame, ws: &Workspace) {
+    let area = frame.area();
+    if ws.len() <= 1 {
+        render(frame, ws.current());
+        return;
+    }
+    let theme = ws.theme();
+    frame.render_widget(Block::default().style(Style::default().bg(theme.bg)), area);
+    let bar_h = 3u16.min(area.height);
+    let bar = Rect {
+        x: area.x,
+        y: area.y,
+        width: area.width,
+        height: bar_h,
+    };
+    let body = Rect {
+        x: area.x,
+        y: area.y + bar_h,
+        width: area.width,
+        height: area.height.saturating_sub(bar_h),
+    };
+    render_project_bar(frame, bar, ws);
+    let app = ws.current();
+    let footer_len = if app.error().is_some() { 2 } else { 1 };
+    let layout = compute_layout(body, footer_len);
+
+    render_status_panel(frame, layout.status, app);
+    render_files_panel(frame, layout.files, app);
+    render_diff_preview_panel(frame, layout.diff, app);
+    render_branches_panel(frame, layout.branches, app);
+    render_commits_panel(frame, layout.commits, app);
+    render_stash_panel(frame, layout.stash, app);
+    render_footer(frame, layout.footer, app, true);
+
+    match app.mode() {
+        Mode::Committing => render_input_modal(frame, area, app, " Commit message "),
+        Mode::NewBranch => render_input_modal(frame, area, app, " New branch name "),
+        Mode::StashPush => render_input_modal(frame, area, app, " Stash message "),
+        Mode::OpenProject => render_open_browser_modal(frame, area, app, ws.project_roots()),
+        Mode::ConfirmInit => render_confirm_init_modal(frame, area, app),
+        Mode::FindFile => {
+            if app.finder_return() == Mode::FullDiff {
+                render_fullscreen_diff(frame, body, app);
+            }
+            render_finder_modal(frame, area, app);
+        }
+        // The project bar stays on screen; only the body goes fullscreen.
+        Mode::FullDiff => render_fullscreen_diff(frame, body, app),
+        Mode::Normal => {}
+    }
+}
+
+/// One tab per project: `1:name (dirty)`, highlighted when active.
+fn render_project_bar(frame: &mut Frame, area: Rect, ws: &Workspace) {
+    if area.is_empty() {
+        return;
+    }
+    let theme = ws.theme();
+    let mut spans = Vec::new();
+    for i in 0..ws.len() {
+        let dirty = ws
+            .project_dirty_count(i)
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "…".to_string());
+        let label = format!(" {}:{} ({}) ", i + 1, ws.project_name(i), dirty);
+        if i == ws.index() {
+            spans.push(Span::styled(label, selection_style(theme)));
+        } else {
+            spans.push(Span::styled(label, Style::default().fg(theme.hint)));
+        }
+    }
+    frame.render_widget(
+        Paragraph::new(Line::from(spans)).block(panel_block(
+            false,
+            theme,
+            " Projects ".to_string(),
+        )),
+        area,
+    );
 }
 
 /// Geometry of the screen. Pure function of the area so tests can predict
@@ -982,7 +1069,7 @@ fn render_diff_pane(frame: &mut Frame, area: Rect, app: &App) {
     );
 }
 
-fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
+fn render_footer(frame: &mut Frame, area: Rect, app: &App, multi: bool) {
     let theme = app.theme();
     if let Some(err) = app.error() {
         let chunks = Layout::default()
@@ -1001,14 +1088,14 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
             ])),
             chunks[0],
         );
-        frame.render_widget(footer_hints(app, theme), chunks[1]);
+        frame.render_widget(footer_hints(app, theme, multi), chunks[1]);
     } else {
-        frame.render_widget(footer_hints(app, theme), area);
+        frame.render_widget(footer_hints(app, theme, multi), area);
     }
 }
 
-fn footer_hints(app: &App, theme: Theme) -> Paragraph<'static> {
-    let hints = match app.mode() {
+fn footer_hints(app: &App, theme: Theme, multi: bool) -> Paragraph<'static> {
+    let base = match app.mode() {
         Mode::Committing => "Enter commit · Esc cancel",
         Mode::NewBranch => "Enter create branch · Esc cancel",
         Mode::StashPush => "Enter stash · Esc cancel",
@@ -1023,11 +1110,23 @@ fn footer_hints(app: &App, theme: Theme) -> Paragraph<'static> {
             "enter pop · a stash · D drop · tab files · q quit"
         }
         Mode::FindFile => "type to filter · ↑/↓ move · enter open · esc cancel",
+        Mode::OpenProject => {
+            "type to filter · ↑/↓ move · enter open · → descend · ← up · tab jump to path · esc clear/close"
+        }
+        Mode::ConfirmInit => "enter git init here · esc back · any other key picks another folder",
         Mode::Normal => {
-            "space stage/unstage · on ▶ dir stages all · c commit · / find · enter full diff · r refresh · q quit"
+            "space stage/unstage · on ▶ dir stages all · c commit · / find · enter full diff · o open project · r refresh · q quit"
         }
     };
-    Paragraph::new(Line::styled(hints, Style::default().fg(theme.hint)))
+    let switch = if multi && app.mode() == Mode::Normal {
+        " · [ ] project"
+    } else {
+        ""
+    };
+    Paragraph::new(Line::styled(
+        format!("{base}{switch}"),
+        Style::default().fg(theme.hint),
+    ))
 }
 
 fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
@@ -1135,6 +1234,183 @@ fn render_input_modal(frame: &mut Frame, area: Rect, app: &App, title: &'static 
     if cursor_x < popup.x + popup.width.saturating_sub(1) {
         frame.set_cursor_position((cursor_x, cursor_y));
     }
+}
+
+/// Project browser (`o`): pick a folder to open. `.` opens the shown
+/// folder itself, `..` goes up, subfolders open as projects (plain ones
+/// offer `git init`). Repo roots carry a `[repo]` badge, folders already
+/// open as tabs carry `[open]`.
+fn render_open_browser_modal(
+    frame: &mut Frame,
+    area: Rect,
+    app: &App,
+    open_roots: &[std::path::PathBuf],
+) {
+    use crate::app::BrowserRow;
+    let theme = app.theme();
+    let Some(browser) = app.open_browser() else {
+        return;
+    };
+    let popup = centered_rect(area, 76, 18);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Block::default().style(Style::default().bg(theme.bg)),
+        popup,
+    );
+    let block = panel_block(true, theme, " Open project ".to_string());
+    let inner_w = popup.width.saturating_sub(2) as usize;
+    let inner_h = popup.height.saturating_sub(2) as usize;
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(inner_h);
+
+    // Current folder on top (left-truncated when too long).
+    let mut cwd = browser.cwd.display().to_string();
+    if cwd.len() > inner_w.saturating_sub(2) {
+        cwd = format!("…{}", &cwd[cwd.len().saturating_sub(inner_w - 3)..]);
+    }
+    lines.push(Line::from(vec![
+        Span::styled(
+            "> ",
+            Style::default()
+                .fg(theme.border_focused)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            cwd,
+            Style::default()
+                .fg(theme.fg)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ]));
+    if browser.editing_path {
+        lines.push(Line::from(vec![
+            Span::styled("path: ", Style::default().fg(theme.hint)),
+            Span::styled(app.draft().to_string(), Style::default().fg(theme.fg)),
+        ]));
+    }
+    if !browser.filter.is_empty() {
+        lines.push(Line::from(vec![
+            Span::styled("filter: ", Style::default().fg(theme.hint)),
+            Span::styled(browser.filter.clone(), Style::default().fg(theme.fg)),
+        ]));
+    }
+    if let Some(err) = browser.error.as_deref() {
+        let mut text = err.to_string();
+        if text.len() > inner_w {
+            text.truncate(inner_w.saturating_sub(1));
+        }
+        lines.push(Line::from(vec![Span::styled(
+            text,
+            Style::default().fg(theme.error).add_modifier(Modifier::BOLD),
+        )]));
+    }
+
+    // Scrollable rows follow the highlight (stateless, like the finder).
+    let total = browser.row_count();
+    let cursor = browser.selected.min(total.saturating_sub(1));
+    let rows = inner_h.saturating_sub(lines.len());
+    let start = cursor
+        .saturating_sub(rows.saturating_sub(1))
+        .min(total);
+    for (row, index) in (start..total).take(rows).enumerate() {
+        let selected = start + row == cursor;
+        let style = if selected {
+            selection_style(theme)
+        } else {
+            Style::default().fg(theme.fg).bg(theme.bg)
+        };
+        let mut spans = vec![Span::styled(
+            if selected { "> " } else { "  " }.to_string(),
+            style,
+        )];
+        match browser.row(index) {
+            BrowserRow::Current => {
+                spans.push(Span::styled(".".to_string(), style));
+                spans.push(Span::styled(
+                    "  (open this folder)".to_string(),
+                    Style::default().fg(theme.hint).bg(style.bg.unwrap_or(theme.bg)),
+                ));
+            }
+            BrowserRow::Parent => {
+                spans.push(Span::styled("../".to_string(), style));
+            }
+            BrowserRow::Dir(i) => {
+                let (name, is_repo) = browser
+                    .view
+                    .get(i)
+                    .map(|e| (e.name.clone(), e.is_repo_root))
+                    .unwrap_or_default();
+                spans.push(Span::styled(format!("{name}/"), style));
+                if is_repo {
+                    spans.push(Span::styled(
+                        " [repo]".to_string(),
+                        Style::default()
+                            .fg(theme.branch_current)
+                            .bg(style.bg.unwrap_or(theme.bg))
+                            .add_modifier(Modifier::BOLD),
+                    ));
+                }
+                let abs = browser.cwd.join(&name);
+                let canon = std::fs::canonicalize(&abs).unwrap_or(abs);
+                if open_roots.contains(&canon) {
+                    spans.push(Span::styled(
+                        " [open]".to_string(),
+                        Style::default()
+                            .fg(theme.commit_id)
+                            .bg(style.bg.unwrap_or(theme.bg))
+                            .add_modifier(Modifier::BOLD),
+                    ));
+                }
+            }
+        }
+        let used: usize = spans
+            .iter()
+            .map(|s| s.content.width())
+            .sum();
+        spans.push(Span::styled(" ".repeat(inner_w.saturating_sub(used)), style));
+        lines.push(Line::from(spans));
+    }
+    frame.render_widget(Paragraph::new(lines).block(block), popup);
+    if browser.editing_path {
+        let cursor_x = popup.x + 1 + "path: ".len() as u16 + app.draft().len() as u16;
+        let cursor_y = popup.y + 2;
+        if cursor_x < popup.x + popup.width.saturating_sub(1) {
+            frame.set_cursor_position((cursor_x, cursor_y));
+        }
+    } else if !browser.filter.is_empty() {
+        let cursor_x = popup.x + 1 + "filter: ".len() as u16 + browser.filter.len() as u16;
+        let cursor_y = popup.y + 2;
+        if cursor_x < popup.x + popup.width.saturating_sub(1) {
+            frame.set_cursor_position((cursor_x, cursor_y));
+        }
+    }
+}
+
+/// Confirm step for opening a plain directory: not a git repo yet, so the
+/// user explicitly opts into `git init` instead of it happening silently.
+fn render_confirm_init_modal(frame: &mut Frame, area: Rect, app: &App) {
+    let theme = app.theme();
+    let popup = centered_rect(area, 64, 6);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(Block::default().style(Style::default().bg(theme.bg)), popup);
+    let block = panel_block(true, theme, " Init new repository? ".to_string());
+    let inner_w = popup.width.saturating_sub(2) as usize;
+    let mut path = app.draft().to_string();
+    if path.len() > inner_w {
+        path = format!("…{}", &path[path.len().saturating_sub(inner_w - 1)..]);
+    }
+    let lines = vec![
+        Line::raw("Not a git repository:"),
+        Line::from(vec![Span::styled(
+            path,
+            Style::default().fg(theme.fg).add_modifier(Modifier::BOLD),
+        )]),
+        Line::raw(""),
+        Line::from(vec![Span::styled(
+            "Enter: git init here · Esc: back · any other key: edit path",
+            Style::default().fg(theme.hint),
+        )]),
+    ];
+    frame.render_widget(Paragraph::new(lines).block(block), popup);
 }
 
 fn branch_list_items(branches: &[BranchInfo], theme: Theme) -> Vec<ListItem<'static>> {
@@ -1335,6 +1611,8 @@ fn render_stash_panel(frame: &mut Frame, area: Rect, app: &App) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Config;
+    use crate::workspace::Workspace;
     use git_tui_core::jobqueue::JobQueue;
     use git_tui_core::status::{RepoStatus, StatusEntry};
     use ratatui::backend::TestBackend;
@@ -1521,6 +1799,47 @@ mod tests {
         assert!(s.contains("[1]-Status"), "panel number missing:\n{s}");
         assert!(s.contains("repo → main"), "repo/branch missing:\n{s}");
         assert!(s.contains("(1)"), "dirty count missing:\n{s}");
+    }
+
+    #[test]
+    fn workspace_bar_lists_every_project() {
+        let dir_a = tempfile::TempDir::new().unwrap();
+        git2::Repository::init(dir_a.path()).unwrap();
+        let dir_b = tempfile::TempDir::new().unwrap();
+        git2::Repository::init(dir_b.path()).unwrap();
+        let ws = Workspace::open(
+            vec![dir_a.path().to_path_buf(), dir_b.path().to_path_buf()],
+            Config::default(),
+        )
+        .unwrap();
+        let backend = TestBackend::new(170, 32);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| render_workspace(f, &ws)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let mut out = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                out.push_str(buf[(x, y)].symbol());
+            }
+            out.push('\n');
+        }
+        assert!(out.contains("Projects"), "project bar missing:\n{out}");
+        assert!(
+            out.contains(ws.project_name(0)),
+            "first project missing:\n{out}"
+        );
+        assert!(
+            out.contains(ws.project_name(1)),
+            "second project missing:\n{out}"
+        );
+        assert!(out.contains("[ ] project"), "switch hint missing:\n{out}");
+    }
+
+    #[test]
+    fn single_project_has_no_project_bar() {
+        let (_dir, app) = with_files(&[("a.txt", FileState::Unstaged)]);
+        let s = screen(&app, 80, 28);
+        assert!(!s.contains("Projects"), "bar should be hidden:\n{s}");
     }
 
     #[test]

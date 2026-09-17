@@ -20,6 +20,61 @@ impl Repo {
         Ok(Self { inner })
     }
 
+    /// Init a new repository at `path` (creates the dir if missing).
+    /// Idempotent on an existing repo; a fresh repo points unborn HEAD at
+    /// `main` so the first commit lands there and `branch()` reports `main`.
+    pub fn init(path: impl AsRef<Path>) -> Result<Self, GitError> {
+        let p = path.as_ref();
+        if let Err(e) = std::fs::create_dir_all(p) {
+            return Err(GitError::HunkStaging(format!(
+                "cannot create directory {}: {e}",
+                p.display()
+            )));
+        }
+        let inner = git2::Repository::init(p)?;
+        if inner.head().is_err() {
+            // Unborn repo: default to `main`. Ignore failure (e.g. HEAD
+            // already set by global init.defaultBranch template).
+            let _ = inner.set_head("refs/heads/main");
+        }
+        Ok(Self { inner })
+    }
+
+    /// Normalize raw user input into a path to discover from.
+    /// Trims whitespace, rejects empty input, expands a leading `~` to
+    /// `$HOME`, and rejects paths that do not exist.
+    pub fn normalize_project_input(raw: &str) -> Result<std::path::PathBuf, GitError> {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return Err(GitError::EmptyPath);
+        }
+        let expanded = if trimmed == "~" || trimmed.starts_with("~/") {
+            match std::env::var("HOME") {
+                Ok(home) if !home.is_empty() => format!("{home}{}", &trimmed[1..]),
+                _ => trimmed.to_string(),
+            }
+        } else {
+            trimmed.to_string()
+        };
+        let path = std::path::PathBuf::from(expanded);
+        if !path.exists() {
+            return Err(GitError::NotFound(path.display().to_string()));
+        }
+        Ok(path)
+    }
+
+    /// Discover the workdir root for a user-supplied path. Maps every
+    /// edge case to a typed [`GitError`]: empty input, missing path,
+    /// outside-a-repo, and bare repos.
+    pub fn discover_root(input: impl AsRef<Path>) -> Result<std::path::PathBuf, GitError> {
+        let start = input.as_ref().to_path_buf();
+        let repo = git2::Repository::discover(&start)
+            .map_err(|_| GitError::NotARepo(start.display().to_string()))?;
+        repo.workdir().map(|p| p.to_path_buf()).ok_or_else(|| {
+            GitError::BareRepo(start.display().to_string())
+        })
+    }
+
     /// Walk upward from `path` to find `.git`.
     pub fn discover(path: impl AsRef<Path>) -> Result<Self, GitError> {
         let start = path.as_ref().to_path_buf();
@@ -232,5 +287,65 @@ mod tests {
         testutil::commit_file(&repo, "a.txt", "x\n", "init");
         let r = Repo::from_inner(repo);
         assert_eq!(r.workdir().unwrap(), dir.path());
+    }
+
+    #[test]
+    fn normalize_rejects_empty_and_missing_paths() {
+        assert!(matches!(
+            Repo::normalize_project_input(""),
+            Err(GitError::EmptyPath)
+        ));
+        assert!(matches!(
+            Repo::normalize_project_input("   "),
+            Err(GitError::EmptyPath)
+        ));
+        assert!(matches!(
+            Repo::normalize_project_input("/definitely/not/here-xyz-123"),
+            Err(GitError::NotFound(_))
+        ));
+    }
+
+    #[test]
+    fn normalize_trims_and_accepts_existing_paths() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let padded = format!("  {}  ", dir.path().display());
+        assert_eq!(
+            Repo::normalize_project_input(&padded).unwrap(),
+            dir.path().to_path_buf()
+        );
+    }
+
+    #[test]
+    fn discover_root_maps_bare_and_non_repos() {
+        // Plain dir: NotARepo.
+        let plain = tempfile::TempDir::new().unwrap();
+        assert!(matches!(
+            Repo::discover_root(plain.path()),
+            Err(GitError::NotARepo(_))
+        ));
+        // Bare repo: BareRepo.
+        let bare_dir = tempfile::TempDir::new().unwrap();
+        let bare_path = bare_dir.path().join("bare.git");
+        git2::Repository::init_bare(&bare_path).unwrap();
+        assert!(matches!(
+            Repo::discover_root(&bare_path),
+            Err(GitError::BareRepo(_))
+        ));
+    }
+
+    #[test]
+    fn init_creates_repo_pointing_at_main() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let target = dir.path().join("fresh");
+        let r = Repo::init(&target).unwrap();
+        assert!(target.join(".git").exists());
+        assert_eq!(r.branch().unwrap(), "main");
+        assert_eq!(r.head_summary().unwrap(), "(no commits yet)");
+        // Discoverable from a nested subdir, and status works on the
+        // empty (unborn, no-file) project.
+        let nested = target.join("sub");
+        std::fs::create_dir_all(&nested).unwrap();
+        assert_eq!(Repo::discover_root(&nested).unwrap(), target);
+        assert!(r.status().unwrap().files.is_empty());
     }
 }
