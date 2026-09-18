@@ -212,7 +212,14 @@ fn find_syntax<'a>(ss: &'a SyntaxSet, path: &str) -> &'a syntect::parsing::Synta
         return s;
     }
     if let Some(ext) = path.rsplit('.').next() {
-        if let Some(s) = ss.find_syntax_by_extension(ext) {
+        // syntect's default set ships no TypeScript/JSX grammar; fall back
+        // to JavaScript, which covers keywords/strings/comments for the
+        // whole TS/JS family (.ts/.tsx/.mts/.cts/.jsx/.mjs/.cjs).
+        let mapped: &str = match ext.to_ascii_lowercase().as_str() {
+            "ts" | "mts" | "cts" | "tsx" | "jsx" | "mjs" | "cjs" => "js",
+            _ => ext,
+        };
+        if let Some(s) = ss.find_syntax_by_extension(mapped) {
             return s;
         }
     }
@@ -317,6 +324,25 @@ pub fn highlight_file_lines(path: &str, lines: &[&str], theme: Theme) -> Vec<Vec
 mod tests {
     use super::*;
     use crate::config::Theme;
+
+    #[test]
+    fn typescript_files_get_keyword_and_comment_colors() {
+        // syntect's default set ships no TypeScript/TSX grammar; .ts files
+        // must still highlight (via the JavaScript grammar), not render flat.
+        let theme = Theme::tokyo_night();
+        for path in ["a.ts", "a.tsx", "a.mts", "a.jsx", "a.mjs"] {
+            let toks = highlight_line(path, "const x = 1; // hi", theme);
+            assert!(
+                toks.iter()
+                    .any(|t| t.text.contains("const") && t.fg == theme.syntax_keyword),
+                "{path}: `const` should carry the keyword color: {toks:?}"
+            );
+            assert!(
+                toks.iter().any(|t| t.fg == theme.syntax_comment),
+                "{path}: comment should carry the comment color: {toks:?}"
+            );
+        }
+    }
 
     #[test]
     fn rust_keywords_get_keyword_color() {

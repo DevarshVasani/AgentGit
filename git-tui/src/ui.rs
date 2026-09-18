@@ -627,6 +627,13 @@ pub(crate) fn diff_rows(diff: &FileDiff) -> Vec<DiffRow> {
     rows
 }
 
+/// Total unified lines the preview expands to (headers count as one,
+/// context one line, del/add pairs two). The preview scroll offset is
+/// clamped to this so scrolling can't run past the end into blank space.
+pub(crate) fn diff_unified_len(diff: &FileDiff) -> usize {
+    diff_rows(diff).iter().map(unified_row_count).sum()
+}
+
 /// Rendered row offset where hunk `index` starts (its header row), so hunk
 /// navigation can snap the view to the selected hunk.
 pub(crate) fn hunk_start_row(diff: &FileDiff, index: usize) -> u16 {
@@ -956,35 +963,37 @@ fn render_unified_lines(
     (out, total)
 }
 
-/// Inline single-column diff preview of the selected file. Not focusable;
-/// PgUp/PgDn scroll it, Enter opens the fullscreen side-by-side view.
+/// Inline single-column diff preview of the selected file on the right.
+/// Focusable (`tab` / `5`): j/k/Up/Down scroll line by line, PgUp/PgDn
+/// page, Enter opens the fullscreen side-by-side view.
 fn render_diff_preview_panel(frame: &mut Frame, area: Rect, app: &App) {
     if area.is_empty() {
         return;
     }
     let theme = app.theme();
+    let focused = app.focus() == Focus::Diff;
     let Some(diff) = app.diff() else {
         let title = if app.has_files() {
-            " Diff (loading…) ".to_string()
+            " [5]-Diff (loading…) ".to_string()
         } else {
-            " Diff ".to_string()
+            " [5]-Diff ".to_string()
         };
         frame.render_widget(
-            Paragraph::new("").block(panel_block(false, theme, title)),
+            Paragraph::new("").block(panel_block(focused, theme, title)),
             area,
         );
         return;
     };
     let title = if app.diff_whole_file() {
-        format!(" File: {} ", diff.path)
+        format!(" [5]-File: {} ", diff.path)
     } else if app.diff_viewing_staged() == Some(true) {
-        format!(" Diff: {} (staged) ", diff.path)
+        format!(" [5]-Diff: {} (staged) ", diff.path)
     } else {
-        format!(" Diff: {} (unstaged) ", diff.path)
+        format!(" [5]-Diff: {} (unstaged) ", diff.path)
     };
     if diff.hunks.is_empty() {
         frame.render_widget(
-            Paragraph::new("(no changes)").block(panel_block(false, theme, title)),
+            Paragraph::new("(no changes)").block(panel_block(focused, theme, title)),
             area,
         );
         return;
@@ -992,7 +1001,7 @@ fn render_diff_preview_panel(frame: &mut Frame, area: Rect, app: &App) {
     let inner_w = area.width.saturating_sub(2) as usize;
     let inner_h = area.height.saturating_sub(2) as usize;
     // Total (cheap, no highlighting) for the "more lines" hint…
-    let total: usize = diff_rows(diff).iter().map(unified_row_count).sum();
+    let total: usize = diff_unified_len(diff);
     let off = (app.diff_scroll() as usize).min(total);
     // …then highlight only the visible window so large files stay fast.
     let take = if total.saturating_sub(off) > inner_h && inner_h > 0 {
@@ -1014,7 +1023,7 @@ fn render_diff_preview_panel(frame: &mut Frame, area: Rect, app: &App) {
         }
     }
     frame.render_widget(
-        Paragraph::new(shown).block(panel_block(false, theme, title)),
+        Paragraph::new(shown).block(panel_block(focused, theme, title)),
         area,
     );
 }
@@ -1187,6 +1196,9 @@ fn footer_hints(app: &App, theme: Theme, multi: bool) -> Paragraph<'static> {
         Mode::Normal if app.focus() == Focus::Stash => {
             "enter pop · a stash · D drop · tab files · q close · Q quit"
         }
+        Mode::Normal if app.focus() == Focus::Diff => {
+            "j/k/↑/↓ scroll file · PgUp/PgDn page · enter full screen · ←/1 files · tab files · q close · Q quit"
+        }
         Mode::FindFile => "type to filter · ↑/↓ move · ←/→ edit · enter open · esc cancel",
         Mode::LlmSettings => "tab/↑↓ switch field · ←/→ edit · enter save · esc cancel",
         Mode::OpenProject => {
@@ -1194,7 +1206,7 @@ fn footer_hints(app: &App, theme: Theme, multi: bool) -> Paragraph<'static> {
         }
         Mode::ConfirmInit => "enter git init here · esc back · any other key picks another folder",
         Mode::Normal => {
-            "space stage/unstage · on ▶ dir stages all · c commit · A llm · p pull · P push · / find · enter full diff · o open project · r refresh · q close · Q quit"
+            "space stage · ▶ dir all · c commit · A llm · p pull · P push · / find · enter diff · Shift+→/5 file · o open · r refresh · q close · Q quit"
         }
     };
     let switch = if multi && app.mode() == Mode::Normal {

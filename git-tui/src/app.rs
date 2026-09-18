@@ -48,13 +48,15 @@ pub enum Mode {
 }
 
 /// Which panel receives navigation keys. Everything is vertical: Tab cycles
-/// the four rail panels; Enter opens the selected file fullscreen.
+/// the rail panels plus the right-side diff preview; Enter opens the
+/// selected file fullscreen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
     Status,
     Branches,
     Log,
     Stash,
+    Diff,
 }
 
 /// UI state. Owns the [`JobQueue`]; git state itself lives on the worker
@@ -1017,6 +1019,16 @@ impl App {
             self.begin_generate_commit_message();
             return;
         }
+        // Shift+Right in the file list jumps to the right-side diff
+        // preview (plain Right expands folders, so it must stay put).
+        if self.mode == Mode::Normal
+            && self.focus == Focus::Status
+            && key == KeyCode::Right
+            && shift_held
+        {
+            self.focus = Focus::Diff;
+            return;
+        }
         self.on_key_inner(key);
     }
 
@@ -1105,11 +1117,16 @@ impl App {
         // the arms below take &mut self.
         let k = self.keys.clone();
         if k.focus_next.contains(&key) {
+            // Tab cycles the left rail only (Status -> Branches -> Log ->
+            // Stash -> Status). The right-side Diff preview is reached via
+            // `5` / Shift+Right, never via Tab; Tab from Diff drops back
+            // to the file list.
             self.focus = match self.focus {
                 Focus::Status => Focus::Branches,
                 Focus::Branches => Focus::Log,
                 Focus::Log => Focus::Stash,
                 Focus::Stash => Focus::Status,
+                Focus::Diff => Focus::Status,
             };
             self.maybe_load_branches();
             self.maybe_load_log();
@@ -1117,7 +1134,7 @@ impl App {
         } else if self.focus == Focus::Status && key == KeyCode::Left {
             self.toggle_folder();
         } else if self.focus == Focus::Status && key == KeyCode::Right {
-            self.expand_selected();
+            self.expand_at_cursor();
         } else if k.focus_status.contains(&key) {
             self.focus = Focus::Status;
         } else if k.focus_branches.contains(&key) {
@@ -1129,6 +1146,8 @@ impl App {
         } else if k.focus_stash.contains(&key) {
             self.focus = Focus::Stash;
             self.maybe_load_stash();
+        } else if k.focus_diff.contains(&key) {
+            self.focus = Focus::Diff;
         } else if k.nav_down.contains(&key) {
             self.move_down();
         } else if k.nav_up.contains(&key) {
@@ -1137,9 +1156,10 @@ impl App {
             self.checkout_selected_branch();
         } else if k.stash_pop.contains(&key) && self.focus == Focus::Stash {
             self.pop_selected_stash();
-        } else if key == KeyCode::Enter && self.focus == Focus::Status {
+        } else if key == KeyCode::Enter && matches!(self.focus, Focus::Status | Focus::Diff) {
             // Enter on a file opens it fullscreen (checkout/pop own Enter
-            // in their own panels, so no conflict).
+            // in their own panels, so no conflict). Works from the file
+            // list and from the focused diff preview on the right.
             self.open_full_diff();
         } else if k.stage.contains(&key) {
             if self.focus == Focus::Status {
@@ -1156,9 +1176,9 @@ impl App {
         } else if k.stash_drop.contains(&key) && self.focus == Focus::Stash {
             self.drop_selected_stash();
         } else if k.scroll_up.contains(&key) {
-            self.diff_scroll = self.diff_scroll.saturating_sub(10);
+            self.scroll_diff_by(-10);
         } else if k.scroll_down.contains(&key) {
-            self.diff_scroll = self.diff_scroll.saturating_add(10);
+            self.scroll_diff_by(10);
         } else if k.commit.contains(&key) {
             self.mode = Mode::Committing;
             self.draft.clear();
@@ -1189,9 +1209,9 @@ impl App {
         } else if key == KeyCode::Up {
             // Arrows scroll line-by-line so long single-hunk diffs stay
             // viewable; j/k below jump by hunk.
-            self.diff_scroll = self.diff_scroll.saturating_sub(1);
+            self.scroll_diff_by(-1);
         } else if key == KeyCode::Down {
-            self.diff_scroll = self.diff_scroll.saturating_add(1);
+            self.scroll_diff_by(1);
         } else if k.nav_down.contains(&key) {
             self.select_hunk(self.hunk.saturating_add(1));
         } else if k.nav_up.contains(&key) {
@@ -1199,9 +1219,9 @@ impl App {
         } else if k.stage.contains(&key) {
             self.stage_selected_hunk();
         } else if k.scroll_up.contains(&key) {
-            self.diff_scroll = self.diff_scroll.saturating_sub(10);
+            self.scroll_diff_by(-10);
         } else if k.scroll_down.contains(&key) {
-            self.diff_scroll = self.diff_scroll.saturating_add(10);
+            self.scroll_diff_by(10);
         } else if k.sync_pull.contains(&key) {
             self.start_pull();
         } else if k.sync_push.contains(&key) {
@@ -1221,11 +1241,21 @@ impl App {
     fn move_down(&mut self) {
         match self.focus {
             Focus::Status => {
-                self.selected = self
-                    .selected
-                    .saturating_add(1)
-                    .min(self.file_count().saturating_sub(1));
-                self.skip_collapsed();
+                // Tree navigation: one step at a time so a collapsed
+                // header (`▶`) is a real cursor stop. Stepping onto a
+                // hidden file lands on its header (the UI highlights the
+                // header, never the hidden file rows); stepping out of a
+                // hidden anchor jumps to the next visible file. Hidden
+                // files are therefore never shown while navigating, yet
+                // every folder stays reachable for expand/stage.
+                if self.is_hidden_index(self.selected) {
+                    if let Some(n) = self.nearest_visible_after(self.selected) {
+                        self.selected = n;
+                    }
+                } else {
+                    self.selected = (self.selected + 1)
+                        .min(self.file_count().saturating_sub(1));
+                }
                 self.maybe_load_diff();
             }
             Focus::Branches => {
@@ -1236,7 +1266,7 @@ impl App {
             }
             // Read-only log: navigation scrolls.
             Focus::Log => {
-                self.log_scroll = self.log_scroll.saturating_add(1);
+                self.scroll_log_by(1);
             }
             Focus::Stash => {
                 self.stash_selected = self
@@ -1244,70 +1274,68 @@ impl App {
                     .saturating_add(1)
                     .min(self.stash_count().saturating_sub(1));
             }
+            // Right-side preview: navigation scrolls the file line by line
+            // (PgUp/PgDn below page by 10 regardless of focus).
+            Focus::Diff => {
+                self.scroll_diff_by(1);
+            }
         }
     }
 
     fn move_up(&mut self) {
         match self.focus {
             Focus::Status => {
-                self.selected = self.selected.saturating_sub(1);
-                // Deliberately no skip here: moving down jumps over a
-                // collapsed dir, but moving up re-enters it at its last
-                // hidden file so the user can get back in and expand
-                // with Right (see folders_collapse_expand test).
+                // Mirror of move_down: single step onto a hidden anchor
+                // (its header takes the highlight), escape jump when
+                // already on one; clamps at the top.
+                if self.is_hidden_index(self.selected) {
+                    if let Some(n) = self.nearest_visible_before(self.selected) {
+                        self.selected = n;
+                    }
+                } else {
+                    self.selected = self.selected.saturating_sub(1);
+                }
                 self.maybe_load_diff();
             }
             Focus::Branches => {
                 self.branch_selected = self.branch_selected.saturating_sub(1);
             }
             Focus::Log => {
-                self.log_scroll = self.log_scroll.saturating_sub(1);
+                self.scroll_log_by(-1);
             }
             Focus::Stash => {
                 self.stash_selected = self.stash_selected.saturating_sub(1);
             }
-        }
-    }
-
-    /// Skip a collapsed region when stepping the cursor down: walk forward
-    /// until the selection no longer sits inside a collapsed dir. Moving
-    /// up intentionally does not skip, so the cursor can re-enter a
-    /// collapsed dir from below (and collapsing stays put for the same
-    /// reason — Down is the way out).
-    fn skip_collapsed(&mut self) {
-        loop {
-            let Some(file) = self.selected_file().cloned() else {
-                return;
-            };
-            let Some(hiding) = file
-                .path
-                .rmatch_indices('/')
-                .map(|(i, _)| file.path[..i].to_string())
-                .find(|dir| self.collapsed.contains(dir.as_str()))
-            else {
-                return;
-            };
-            let next = if self.selected < self.file_count().saturating_sub(1) {
-                Some(self.selected + 1)
-            } else {
-                None
-            };
-            match next {
-                Some(i) => self.selected = i,
-                None => {
-                    self.selected = self.first_visible_before(&hiding);
-                    return;
-                }
+            Focus::Diff => {
+                self.scroll_diff_by(-1);
             }
         }
     }
 
-    /// Closest visible file index above `dir` (or 0 when none).
-    fn first_visible_before(&self, dir: &str) -> usize {
-        (0..self.selected)
-            .rev()
-            .find(|&i| !self.file_list[i].path.starts_with(&format!("{dir}/")))
-            .unwrap_or(0)
+    /// Whether `path` sits under a collapsed dir (i.e. its tree rows are
+    /// folded away; only the `▶` header renders).
+    fn is_hidden_path(&self, path: &str) -> bool {
+        ancestors_of(path)
+            .into_iter()
+            .any(|dir| self.collapsed.contains(dir.as_str()))
+    }
+
+    pub(crate) fn is_hidden_index(&self, index: usize) -> bool {
+        self.file_list
+            .get(index)
+            .is_some_and(|f| self.is_hidden_path(&f.path))
+    }
+
+    /// First visible file index strictly after `from` (None when there is
+    /// none: end of list or everything after is folded).
+    fn nearest_visible_after(&self, from: usize) -> Option<usize> {
+        (from + 1..self.file_count()).find(|&i| !self.is_hidden_index(i))
+    }
+
+    /// First visible file index strictly before `from` (None at the top or
+    /// when everything above is folded).
+    fn nearest_visible_before(&self, from: usize) -> Option<usize> {
+        (0..from).rev().find(|&i| !self.is_hidden_index(i))
     }
 
     /// Toggle collapse on the deepest collapsed-capable ancestor of the
@@ -1324,9 +1352,11 @@ impl App {
         };
         let collapsed = !self.collapsed.contains(&deepest);
         self.set_collapsed(&deepest, collapsed);
-        // Stay put when collapsing under the cursor: the cursor may now
-        // sit on a hidden file, and Down skips out while Up re-enters,
-        // so collapsing never yanks the selection elsewhere.
+        // Stay put when collapsing under the cursor: the cursor becomes a
+        // hidden anchor and the `▶` header takes the highlight, so Space
+        // still stages the whole dir and Right still expands it. The next
+        // Up/Down escapes to the nearest visible file (skipped both ways),
+        // so hidden files never render while navigating.
     }
 
     /// Right on a file: expand every collapsed ancestor so the file is
@@ -1339,6 +1369,39 @@ impl App {
         for i in 0..path.len() {
             if path.as_bytes()[i] == b'/' {
                 self.set_collapsed(&path[..i], false);
+            }
+        }
+    }
+
+    /// Right on the file list: open the fold at the cursor.
+    ///
+    /// - Hidden anchor (just collapsed, or a finder jump): expand its own
+    ///   collapsed ancestors, like `expand_selected`.
+    /// - Visible file: expand the folded region immediately below the
+    ///   cursor, else the one immediately above. This is the way back in
+    ///   after Up/Down skipped away from a `▶` header, since the highlight
+    ///   never rests on hidden files while navigating.
+    fn expand_at_cursor(&mut self) {
+        let Some(file) = self.selected_file().cloned() else {
+            return;
+        };
+        if self.is_hidden_path(&file.path) {
+            self.expand_selected();
+            return;
+        }
+        if self.selected + 1 < self.file_count()
+            && self.is_hidden_index(self.selected + 1)
+        {
+            let path = self.file_list[self.selected + 1].path.clone();
+            if let Some(dir) = self.collapsed_dir_for(&path) {
+                self.set_collapsed(&dir, false);
+                return;
+            }
+        }
+        if self.selected > 0 && self.is_hidden_index(self.selected - 1) {
+            let path = self.file_list[self.selected - 1].path.clone();
+            if let Some(dir) = self.collapsed_dir_for(&path) {
+                self.set_collapsed(&dir, false);
             }
         }
     }
@@ -1361,6 +1424,50 @@ impl App {
             .as_ref()
             .map(|d| crate::ui::hunk_start_row(d, index))
             .unwrap_or(0)
+    }
+
+    /// Last valid preview scroll offset (unified lines), so scrolling the
+    /// [5] tab stops on the last line instead of running into blank space.
+    fn diff_preview_max(&self) -> u16 {
+        self.diff
+            .as_ref()
+            .map(|d| crate::ui::diff_unified_len(d).saturating_sub(1))
+            .unwrap_or(0)
+            .min(u16::MAX as usize) as u16
+    }
+
+    /// Last valid fullscreen offset (side-by-side rows).
+    fn diff_full_max(&self) -> u16 {
+        self.diff
+            .as_ref()
+            .map(|d| crate::ui::diff_rows(d).len().saturating_sub(1))
+            .unwrap_or(0)
+            .min(u16::MAX as usize) as u16
+    }
+
+    /// Scroll the diff by `delta` lines, clamped to the content of the
+    /// currently shown view (unified preview in Normal, side-by-side rows
+    /// in FullDiff).
+    fn scroll_diff_by(&mut self, delta: isize) {
+        let max = if self.mode == Mode::FullDiff {
+            self.diff_full_max()
+        } else {
+            self.diff_preview_max()
+        };
+        let cur = self.diff_scroll as isize;
+        self.diff_scroll = (cur + delta).clamp(0, max as isize) as u16;
+    }
+
+    /// Scroll the log by `delta` lines, clamped to the loaded entries.
+    fn scroll_log_by(&mut self, delta: isize) {
+        let max = self
+            .log
+            .as_ref()
+            .map(|l| l.len().saturating_sub(1))
+            .unwrap_or(0)
+            .min(u16::MAX as usize) as isize;
+        let cur = self.log_scroll as isize;
+        self.log_scroll = (cur + delta).clamp(0, max) as u16;
     }
 
     /// Space: stage unless already fully staged (then unstage). When the
@@ -1723,7 +1830,8 @@ impl App {
         self.finder_selected = (cur + delta).clamp(0, n as isize - 1) as usize;
     }
 
-    /// Enter in the finder: jump the file cursor to the chosen match
+    /// Enter in the finder: jump the file cursor to the chosen match,
+    /// expanding any collapsed ancestors so the match is actually visible,
     /// and return where the finder was opened from (staying fullscreen
     /// when opened fullscreen, with the new file's diff loading).
     fn submit_finder(&mut self) {
@@ -1732,6 +1840,7 @@ impl App {
             return;
         };
         self.selected = index;
+        self.expand_selected();
         self.focus = Focus::Status;
         self.mode = self.finder_return;
         self.draft.clear();
@@ -1919,6 +2028,10 @@ impl App {
                         } else {
                             self.diff = Some(d);
                             self.hunk = self.hunk.min(self.hunk_count().saturating_sub(1));
+                            // The fresh content may be shorter: keep the
+                            // offset inside the new content.
+                            self.diff_scroll =
+                                self.diff_scroll.min(self.diff_preview_max());
                         }
                     }
                 }
@@ -2086,22 +2199,50 @@ mod tests {
     #[test]
     fn folders_collapse_expand_and_skip_hidden_files() {
         let mut fx = harness(&["src/a.rs", "src/nested/b.rs", "z.txt"]);
+        // Left collapses src/; the cursor stays as a hidden anchor so the
+        // `▶ src/` header takes the highlight (cursor is on the folder).
         fx.app.on_key(KeyCode::Left);
+        assert!(fx.app.is_collapsed("src"));
+        // Down escapes the anchor to the next visible file.
         fx.app.on_key(KeyCode::Down);
         assert_eq!(
             fx.app.selected_file().unwrap().path,
             "z.txt",
             "collapsed src/ must be skipped when moving down"
         );
+        // Up from below steps onto the folded header (cursor back on the
+        // folder), never showing its hidden files as rows.
         fx.app.on_key(KeyCode::Up);
         assert_eq!(
             fx.app.selected_file().unwrap().path,
             "src/nested/b.rs",
-            "moving up into a collapsed dir lands on its last hidden file"
+            "moving up must stop on the collapsed header's anchor"
+        );
+        assert!(
+            fx.app.is_hidden_index(fx.app.selected()),
+            "anchor must be hidden so the header takes the highlight"
+        );
+        // Right on the header expands it back.
+        fx.app.on_key(KeyCode::Right);
+        assert!(
+            !fx.app.is_collapsed("src"),
+            "Right on the header must expand it"
+        );
+        assert_eq!(
+            fx.app.selected_file().unwrap().path,
+            "src/nested/b.rs",
+            "expand restores the anchored file"
+        );
+        fx.app.on_key(KeyCode::Left);
+        assert!(
+            fx.app.is_collapsed("src/nested"),
+            "Left collapses the deepest parent"
         );
         fx.app.on_key(KeyCode::Right);
-        fx.app.on_key(KeyCode::Left);
-        fx.app.on_key(KeyCode::Right);
+        assert!(
+            !fx.app.is_collapsed("src/nested"),
+            "Right on the hidden anchor expands it back"
+        );
         assert_eq!(
             fx.app.selected_file().unwrap().path,
             "src/nested/b.rs",
@@ -2117,20 +2258,43 @@ mod tests {
     #[test]
     fn finder_reveals_a_file_inside_collapsed_ancestors() {
         let mut fx = harness(&["src/a.rs", "src/nested/b.rs"]);
+        // Collapse src/ (both files fold away; the cursor stays anchored).
         fx.app.on_key(KeyCode::Left);
-        fx.app.on_key(KeyCode::Left);
+        assert!(fx.app.is_collapsed("src"));
         fx.app.on_key(KeyCode::Char('/'));
         for c in "b.rs".chars() {
             fx.app.on_key(KeyCode::Char(c));
         }
         fx.app.on_key(KeyCode::Enter);
         assert_eq!(fx.app.selected_file().unwrap().path, "src/nested/b.rs");
+        assert!(
+            !fx.app.is_collapsed("src"),
+            "jumping to a match must expand its ancestors"
+        );
         fx.app.on_key(KeyCode::Down);
         assert_eq!(
             fx.app.selected_file().unwrap().path,
             "src/nested/b.rs",
-            "collapsed regions are skipped when moving down"
+            "at the end of the list Down clamps"
         );
+    }
+
+    #[test]
+    fn up_escapes_hidden_anchor_to_nearest_visible() {
+        let mut fx = harness(&["src/a.rs", "src/nested/b.rs", "z.txt"]);
+        // Move onto b.rs, then collapse its deepest parent: the cursor is
+        // now a hidden anchor on the `▶ nested/` header.
+        fx.app.on_key(KeyCode::Char('j'));
+        assert_eq!(fx.app.selected_file().unwrap().path, "src/nested/b.rs");
+        fx.app.on_key(KeyCode::Left);
+        assert!(fx.app.is_collapsed("src/nested"));
+        // Up escapes to the nearest visible file above, not into hiding.
+        fx.app.on_key(KeyCode::Up);
+        assert_eq!(fx.app.selected_file().unwrap().path, "src/a.rs");
+        // Down jumps back over the folded region to z.txt.
+        fx.app.on_key(KeyCode::Down);
+        fx.app.on_key(KeyCode::Down);
+        assert_eq!(fx.app.selected_file().unwrap().path, "z.txt");
     }
 
     #[test]
@@ -2962,8 +3126,10 @@ mod tests {
         assert_eq!(fx.app.focus(), Focus::Log);
         fx.app.on_key(KeyCode::Tab);
         assert_eq!(fx.app.focus(), Focus::Stash);
+        // Tab skips the right-side Diff preview: Stash wraps to Status.
         fx.app.on_key(KeyCode::Tab);
         assert_eq!(fx.app.focus(), Focus::Status);
+        // Diff is reached via `5` / Shift+Right, not via Tab.
         fx.app.on_key(KeyCode::Char('4'));
         assert_eq!(fx.app.focus(), Focus::Stash);
         fx.app.on_key(KeyCode::Char('3'));
@@ -2972,6 +3138,97 @@ mod tests {
         assert_eq!(fx.app.focus(), Focus::Branches);
         fx.app.on_key(KeyCode::Char('1'));
         assert_eq!(fx.app.focus(), Focus::Status);
+        fx.app.on_key(KeyCode::Char('5'));
+        assert_eq!(fx.app.focus(), Focus::Diff);
+        // Tab from Diff drops back to the file list.
+        fx.app.on_key(KeyCode::Tab);
+        assert_eq!(fx.app.focus(), Focus::Status);
+    }
+
+    #[test]
+    fn shift_right_from_files_focuses_diff_preview() {
+        let mut fx = harness(&["a.txt"]);
+        assert_eq!(fx.app.focus(), Focus::Status);
+        // Plain Right expands folders and must stay in the file list.
+        fx.app.on_key(KeyCode::Right);
+        assert_eq!(fx.app.focus(), Focus::Status);
+        // Shift+Right jumps to the right-side diff tab.
+        fx.app.on_key_with_modifiers(KeyCode::Right, true);
+        assert_eq!(fx.app.focus(), Focus::Diff);
+        // Shift+Left (Left already owns focus_status) jumps back.
+        fx.app.on_key_with_modifiers(KeyCode::Left, true);
+        assert_eq!(fx.app.focus(), Focus::Status);
+    }
+
+    #[test]
+    fn diff_focus_scrolls_preview_without_moving_selection() {
+        let mut fx = two_hunk_fixture();
+        assert_eq!(fx.app.focus(), Focus::Status);
+        fx.app.on_key(KeyCode::Char('5'));
+        assert_eq!(fx.app.focus(), Focus::Diff);
+        let sel = fx.app.selected();
+        assert_eq!(fx.app.diff_scroll(), 0);
+        fx.app.on_key(KeyCode::Char('j'));
+        assert_eq!(fx.app.diff_scroll(), 1);
+        assert_eq!(fx.app.selected(), sel, "file cursor must not move");
+        fx.app.on_key(KeyCode::Down);
+        assert_eq!(fx.app.diff_scroll(), 2);
+        fx.app.on_key(KeyCode::Char('k'));
+        assert_eq!(fx.app.diff_scroll(), 1);
+        // Left jumps back to the file list (focus_status owns Left).
+        fx.app.on_key(KeyCode::Left);
+        assert_eq!(fx.app.focus(), Focus::Status);
+        // Enter from the preview opens fullscreen too.
+        fx.app.on_key(KeyCode::Char('5'));
+        fx.app.on_key(KeyCode::Enter);
+        assert_eq!(fx.app.mode(), Mode::FullDiff);
+    }
+
+    #[test]
+    fn diff_preview_scroll_clamps_at_content_end() {
+        let mut fx = two_hunk_fixture();
+        fx.app.on_key(KeyCode::Char('5'));
+        assert_eq!(fx.app.focus(), Focus::Diff);
+        let max = crate::ui::diff_unified_len(fx.app.diff().unwrap())
+            .saturating_sub(1)
+            .min(u16::MAX as usize) as u16;
+        assert!(max > 2, "fixture must have scrollable content");
+        for _ in 0..500 {
+            fx.app.on_key(KeyCode::Char('j'));
+        }
+        assert_eq!(fx.app.diff_scroll(), max);
+        for _ in 0..10 {
+            fx.app.on_key(KeyCode::PageDown);
+        }
+        assert_eq!(fx.app.diff_scroll(), max, "PageDown must clamp too");
+        for _ in 0..500 {
+            fx.app.on_key(KeyCode::Char('k'));
+        }
+        assert_eq!(fx.app.diff_scroll(), 0);
+        for _ in 0..10 {
+            fx.app.on_key(KeyCode::PageUp);
+        }
+        assert_eq!(fx.app.diff_scroll(), 0, "PageUp must not underflow");
+    }
+
+    #[test]
+    fn fullscreen_scroll_clamps_at_content_end() {
+        let mut fx = two_hunk_fixture();
+        fx.app.on_key(KeyCode::Enter);
+        assert_eq!(fx.app.mode(), Mode::FullDiff);
+        let max = crate::ui::diff_rows(fx.app.diff().unwrap())
+            .len()
+            .saturating_sub(1)
+            .min(u16::MAX as usize) as u16;
+        assert!(max > 2, "fixture must have scrollable content");
+        for _ in 0..500 {
+            fx.app.on_key(KeyCode::Down);
+        }
+        assert_eq!(fx.app.diff_scroll(), max);
+        for _ in 0..500 {
+            fx.app.on_key(KeyCode::Up);
+        }
+        assert_eq!(fx.app.diff_scroll(), 0);
     }
 
     #[test]

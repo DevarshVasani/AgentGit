@@ -70,7 +70,7 @@ Key names: single characters, plus `space`, `tab`, `enter`, `esc`,
 `pagedown`, `home`, `end`. Action names are listed in
 `git-tui/src/config.rs` (`ACTIONS`): `nav_down`, `nav_up`, `stage`, `commit`,
 `refresh`, `quit`, `focus_next`, `focus_status`, `focus_branches`,
-`focus_log`, `focus_stash`, `scroll_up`, `scroll_down`, `branch_new`,
+`focus_log`, `focus_stash`, `focus_diff`, `scroll_up`, `scroll_down`, `branch_new`,
 `branch_delete`, `checkout`, `stash_pop`, `stash_push`, `stash_drop`,
  `find_files`, `project_next`, `project_prev`, `project_open`, `project_close`,
  `sync_pull`, `sync_push`, `llm_settings`.
@@ -82,7 +82,10 @@ changes show the whole file automatically, changed files show the diff —
 `space` stages, `c` commits (`Shift+A` inside the commit box generates the
 message from staged files, `A` in the file list opens the LLM setup),
 `p` pulls, `P` pushes,
-`1`–`4`/`tab` switch panels. Text boxes
+`1`–`5` switch panels (`tab` cycles the left rail only and never lands
+on the preview; `Shift+→` or `5` from `[2]-Files` focuses the
+right-side file/diff for `j`/`k`/`↑`/`↓` scrolling, `←`/`1`/`tab`
+jumps back). Text boxes
 (commit message, new branch, stash message, jump-to-path, file finder)
 are fully editable: `←`/`→` move the cursor, `Home`/`End` jump,
 `backspace`/`Del` delete, and long lines scroll horizontally so the
