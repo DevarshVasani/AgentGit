@@ -94,12 +94,7 @@ pub fn render(frame: &mut Frame, app: &App) {
     render_footer(frame, layout.footer, app, false);
 
     match app.mode() {
-        Mode::Committing => render_input_modal(
-            frame,
-            area,
-            app,
-            commit_title(app),
-        ),
+        Mode::Committing => render_commit_modal(frame, area, app),
         Mode::NewBranch => render_input_modal(frame, area, app, " New branch name "),
         Mode::StashPush => render_input_modal(frame, area, app, " Stash message "),
         Mode::SetUpstream => render_input_modal(frame, area, app, " Push - set upstream (remote) "),
@@ -163,12 +158,7 @@ pub fn render_workspace(frame: &mut Frame, ws: &Workspace) {
     render_footer(frame, layout.footer, app, true);
 
     match app.mode() {
-        Mode::Committing => render_input_modal(
-            frame,
-            area,
-            app,
-            commit_title(app),
-        ),
+        Mode::Committing => render_commit_modal(frame, area, app),
         Mode::NewBranch => render_input_modal(frame, area, app, " New branch name "),
         Mode::StashPush => render_input_modal(frame, area, app, " Stash message "),
         Mode::SetUpstream => render_input_modal(frame, area, app, " Push - set upstream (remote) "),
@@ -701,6 +691,7 @@ fn render_side_unclipped(
     gutter_w: usize,
     theme: Theme,
 ) -> Vec<Span<'static>> {
+    use unicode_width::UnicodeWidthChar;
     let gutter_text = match side.no {
         Some(no) => format!("{:>gutter_w$} ", no),
         None => " ".repeat(gutter_w + 1),
@@ -745,19 +736,43 @@ fn render_side_unclipped(
     // Both derive from `full_text`, so lengths match; truncate defensively
     // rather than panicking on grapheme edge cases.
     let n = syntax_chars.len().min(changed_chars.len());
+    // Expand tabs to spaces and drop carriage returns before styling.
+    // Terminals render a raw tab as a jump to the next 8-cell stop while
+    // the width math counted it as zero cells, so tab-indented lines were
+    // clipped at the wrong column and the side-by-side divider shifted.
+    // Columns start after the gutter so stops match terminal behavior.
+    const TAB_STOP: usize = 8;
+    let mut cells: Vec<(char, (Color, Modifier), bool)> = Vec::new();
+    let mut col = gutter_w + 1;
+    for (k, ch) in full_text.chars().enumerate().take(n) {
+        let style = syntax_chars[k];
+        let changed = changed_chars[k];
+        if ch == '\r' {
+            continue;
+        }
+        if ch == '\t' {
+            let spaces = TAB_STOP - (col % TAB_STOP);
+            for _ in 0..spaces {
+                cells.push((' ', style, changed));
+            }
+            col += spaces;
+            continue;
+        }
+        cells.push((ch, style, changed));
+        col += ch.width().unwrap_or(0);
+    }
     let mut idx = 0;
-    while idx < n {
-        let (fg, modifier) = syntax_chars[idx];
-        let changed_flag = changed_chars[idx];
+    while idx < cells.len() {
+        let (fg, modifier) = cells[idx].1;
+        let changed_flag = cells[idx].2;
         let mut j = idx + 1;
-        while j < n
-            && syntax_chars[j].0 == fg
-            && syntax_chars[j].1 == modifier
-            && changed_chars[j] == changed_flag
+        while j < cells.len()
+            && cells[j].1 == (fg, modifier)
+            && cells[j].2 == changed_flag
         {
             j += 1;
         }
-        let text: String = full_text_chars(&full_text, idx, j);
+        let text: String = cells[idx..j].iter().map(|c| c.0).collect();
         let mut style = Style::default().fg(fg).add_modifier(modifier);
         // Changed runs take the stronger word wash when the kind has one
         // (deletions); kinds without it (additions) keep the single line
@@ -809,11 +824,6 @@ fn expand_changed(segs: &[WordSeg]) -> Vec<bool> {
         }
     }
     out
-}
-
-/// Slice `full_text` by char indices [start, end).
-fn full_text_chars(full_text: &str, start: usize, end: usize) -> String {
-    full_text.chars().skip(start).take(end - start).collect()
 }
 
 /// A unified preview line: single text column with a `-`/`+` marker.
@@ -1180,7 +1190,7 @@ fn footer_hints(app: &App, theme: Theme, multi: bool) -> Paragraph<'static> {
             "generating from staged diff… · Esc cancel"
         }
         Mode::Committing => {
-            "←/→ move · Home/End jump · Del deletes · Shift+A generate from staged · Enter commit · Esc cancel"
+            "←/→/↑/↓ move · Home/End jump · Del deletes · Shift+A generate · Enter commit · Esc cancel"
         }
         Mode::NewBranch => "←/→ move · Home/End jump · Del deletes · Enter create branch · Esc cancel",
         Mode::StashPush => "←/→ move · Home/End jump · Del deletes · Enter stash · Esc cancel",
@@ -1407,6 +1417,101 @@ fn render_llm_modal(frame: &mut Frame, area: Rect, app: &App) {
     let cursor_x = popup.x + 1 + prefix_len as u16 + cursor_col as u16;
     let cursor_y = popup.y + 1 + cursor_row as u16;
     if cursor_x < popup.x + popup.width.saturating_sub(1) {
+        frame.set_cursor_position((cursor_x, cursor_y));
+    }
+}
+
+/// Wrap a (possibly multi-line) draft into display rows of `width` cells,
+/// plus the cursor's (row, col) inside them. Hard newlines (e.g. from a
+/// generated message) break rows; long rows soft-wrap so the commit box
+/// grows vertically instead of scrolling horizontally.
+fn wrap_draft_lines(text: &str, cursor: usize, width: usize) -> (Vec<String>, usize, usize) {
+    use unicode_width::UnicodeWidthChar;
+    let width = width.max(1);
+    let chars: Vec<char> = text.chars().collect();
+    let cursor = cursor.min(chars.len());
+    let mut rows: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut col = 0usize;
+    let (mut crow, mut ccol) = (0usize, 0usize);
+    for (i, ch) in chars.iter().enumerate() {
+        if i == cursor {
+            crow = rows.len();
+            ccol = col;
+        }
+        if *ch == '\n' {
+            rows.push(std::mem::take(&mut cur));
+            col = 0;
+            continue;
+        }
+        let w = ch.width().unwrap_or(0);
+        if w > 0 && col + w > width {
+            rows.push(std::mem::take(&mut cur));
+            col = 0;
+        }
+        cur.push(*ch);
+        col += w;
+    }
+    if cursor == chars.len() {
+        crow = rows.len();
+        ccol = col;
+    }
+    rows.push(cur);
+    (rows, crow, ccol)
+}
+
+/// Commit message box: wraps and grows vertically with the message.
+/// Single-line subjects stay one row; long lines soft-wrap and generated
+/// multi-line messages keep their hard breaks. Enter still commits,
+/// Up/Down move between lines, Esc cancels.
+fn render_commit_modal(frame: &mut Frame, area: Rect, app: &App) {
+    // While the LLM call is in flight and the draft is still empty, show a
+    // placeholder so the modal doesn't look stuck on a blank line.
+    let text = if app.is_generating() && app.draft().is_empty() {
+        "generating…"
+    } else {
+        app.draft()
+    };
+    // Width is fixed; height follows the wrapped content (centered_rect
+    // clamps both to the screen).
+    let inner_w = 60u16.min(area.width.saturating_sub(2)).max(1).saturating_sub(2).max(1) as usize;
+    let (rows, crow, ccol) = wrap_draft_lines(text, app.draft_cursor(), inner_w);
+    let popup = centered_rect(
+        area,
+        60,
+        rows.len().saturating_add(2).min(u16::MAX as usize) as u16,
+    );
+    frame.render_widget(Clear, popup);
+    let inner_h = popup.height.saturating_sub(2) as usize;
+    // Scroll vertically only when the message outgrows the screen: keep
+    // the cursor row visible.
+    let start = if inner_h == 0 {
+        0
+    } else {
+        crow.saturating_sub(inner_h.saturating_sub(1))
+            .min(rows.len().saturating_sub(inner_h))
+    };
+    let lines: Vec<Line<'static>> = rows
+        .iter()
+        .skip(start)
+        .take(inner_h.max(1))
+        .map(|r| Line::raw(r.clone()))
+        .collect();
+    frame.render_widget(
+        Paragraph::new(lines).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .title(commit_title(app)),
+        ),
+        popup,
+    );
+    // Cursor tracks the true edit position, even when wrapped/scrolled.
+    let cursor_x = popup.x + 1 + ccol as u16;
+    let cursor_y = popup.y + 1 + crow.saturating_sub(start) as u16;
+    if cursor_x < popup.x + popup.width.saturating_sub(1)
+        && cursor_y < popup.y + popup.height.saturating_sub(1)
+    {
         frame.set_cursor_position((cursor_x, cursor_y));
     }
 }
@@ -2079,6 +2184,45 @@ mod tests {
     }
 
     #[test]
+    fn tab_indented_lines_expand_to_tab_stops() {
+        let side = Side {
+            no: Some(1),
+            segs: vec![WordSeg {
+                text: "\tfn main() {}".into(),
+                changed: false,
+            }],
+            kind: SideKind::Context,
+        };
+        let spans = render_side(&side, "main.rs", 40, 4, Theme::tokyo_night());
+        let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(!text.contains('\t'), "raw tab leaks into rendering: {text:?}");
+        // Gutter is "   1 " (5 cells); the tab jumps to stop 8: 3 spaces.
+        assert!(
+            text.starts_with("   1    fn main() {}"),
+            "tab must expand to the next stop, got: {text:?}"
+        );
+        assert_eq!(spans.iter().map(Span::width).sum::<usize>(), 40);
+    }
+
+    #[test]
+    fn long_tabbed_lines_clip_to_exact_width() {
+        let side = Side {
+            no: Some(1),
+            segs: vec![WordSeg {
+                text: format!("\t{}", "x".repeat(100)),
+                changed: false,
+            }],
+            kind: SideKind::Context,
+        };
+        for width in [10, 20, 40] {
+            let spans = render_side(&side, "main.rs", width, 4, Theme::tokyo_night());
+            let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
+            assert!(!text.contains('\t'), "raw tab leaks into rendering: {text:?}");
+            assert_eq!(spans.iter().map(Span::width).sum::<usize>(), width);
+        }
+    }
+
+    #[test]
     fn split_sides_clip_long_unicode_lines_to_their_width() {
         let side = Side {
             no: Some(1),
@@ -2159,22 +2303,63 @@ mod tests {
     }
 
     #[test]
-    fn renders_scrolled_commit_modal_without_panic() {
+    fn wrap_draft_lines_wraps_and_tracks_cursor() {
+        // Soft wrap at the width; cursor at the boundary sits at the row end.
+        let (rows, crow, ccol) = wrap_draft_lines("hello world", 5, 5);
+        assert_eq!(rows, vec!["hello", " worl", "d"]);
+        assert_eq!((crow, ccol), (0, 5));
+        // Cursor inside the second row.
+        let (_, crow, ccol) = wrap_draft_lines("hello world", 7, 5);
+        assert_eq!((crow, ccol), (1, 2));
+        // Hard breaks split rows; trailing newline opens an empty row.
+        let (rows, crow, ccol) = wrap_draft_lines("ab\nc\n", 5, 10);
+        assert_eq!(rows, vec!["ab", "c", ""]);
+        assert_eq!((crow, ccol), (2, 0));
+        // Cursor clamps past the end.
+        let (_, crow, ccol) = wrap_draft_lines("hi", 99, 10);
+        assert_eq!((crow, ccol), (0, 2));
+        // Empty draft is one empty row.
+        let (rows, crow, ccol) = wrap_draft_lines("", 0, 10);
+        assert_eq!(rows, vec![""]);
+        assert_eq!((crow, ccol), (0, 0));
+    }
+
+    #[test]
+    fn commit_modal_grows_vertically_with_long_message() {
         use crossterm::event::KeyCode;
         let (_dir, mut app) = with_files(&[("a.txt", FileState::Unstaged)]);
         app.on_key(KeyCode::Char('c'));
-        // Far wider than the 60-cell modal: only the tail around the
-        // cursor can show, but the tail of the message must be visible.
+        // Far wider than the 60-cell modal: it wraps onto extra rows so
+        // head and tail are visible at the same time (no horizontal scroll).
         for c in "commit-message-".chars().cycle().take(120) {
             app.on_key(KeyCode::Char(c));
         }
         let s = screen(&app, 80, 24);
         assert!(s.contains("Commit"), "modal title missing:\n{s}");
         assert!(s.contains("message-"), "tail of long draft missing:\n{s}");
-        // Move to the front: the head scrolls back into view.
-        app.on_key(KeyCode::Home);
+        assert!(s.contains("commit-m"), "head and tail show together:\n{s}");
+        assert!(
+            s.matches("commit-message-").count() >= 3,
+            "long message must wrap over several rows:\n{s}"
+        );
+    }
+
+    #[test]
+    fn commit_modal_renders_hard_breaks_on_separate_rows() {
+        use crossterm::event::KeyCode;
+        let (_dir, mut app) = with_files(&[("a.txt", FileState::Unstaged)]);
+        app.on_key(KeyCode::Char('c'));
+        for c in "subject".chars() {
+            app.on_key(KeyCode::Char(c));
+        }
+        app.push_draft_char('\n');
+        for c in "body line".chars() {
+            app.on_key(KeyCode::Char(c));
+        }
         let s = screen(&app, 80, 24);
-        assert!(s.contains("commit-m"), "head of long draft missing:\n{s}");
+        let subject_row = s.lines().position(|l| l.contains("subject")).expect("subject row");
+        let body_row = s.lines().position(|l| l.contains("body line")).expect("body row");
+        assert_eq!(body_row, subject_row + 1, "hard break must start a new row:\n{s}");
     }
 
     #[test]

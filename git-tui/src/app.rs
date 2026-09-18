@@ -519,6 +519,66 @@ impl App {
         self.draft_cursor = self.draft.chars().count();
     }
 
+    /// (0-based hard line, char col within it) of the cursor. Hard lines
+    /// are `\n`-separated; the wrapping renderer soft-wraps them further.
+    fn draft_line_col(&self) -> (usize, usize) {
+        let cursor = self.draft_cursor();
+        let mut line = 0;
+        let mut col = 0;
+        for (i, ch) in self.draft.chars().enumerate() {
+            if i == cursor {
+                break;
+            }
+            if ch == '\n' {
+                line += 1;
+                col = 0;
+            } else {
+                col += 1;
+            }
+        }
+        (line, col)
+    }
+
+    /// Char index where hard line `line` starts (clamped to the text end).
+    fn draft_hard_line_start(&self, line: usize) -> usize {
+        if line == 0 {
+            return 0;
+        }
+        let mut seen = 0;
+        for (i, ch) in self.draft.chars().enumerate() {
+            if ch == '\n' {
+                seen += 1;
+                if seen == line {
+                    return i + 1;
+                }
+            }
+        }
+        self.draft.chars().count()
+    }
+
+    /// Up in the commit box: to the start of the previous hard line (or
+    /// the very start on the first line).
+    pub fn move_draft_up_line(&mut self) {
+        let (line, _) = self.draft_line_col();
+        self.draft_cursor = if line == 0 {
+            0
+        } else {
+            self.draft_hard_line_start(line - 1)
+        };
+    }
+
+    /// Down in the commit box: to the start of the next hard line (or the
+    /// very end on the last line).
+    pub fn move_draft_down_line(&mut self) {
+        let (line, _) = self.draft_line_col();
+        let last = self.draft.chars().filter(|&c| c == '\n').count();
+        self.draft_cursor = if line >= last {
+            self.draft.chars().count()
+        } else {
+            self.draft_hard_line_start(line + 1)
+        };
+    }
+
     /// Cancel the open-project flow entirely (Esc in the browser).
     pub fn cancel_open_project(&mut self) {
         self.mode = Mode::Normal;
@@ -1082,6 +1142,8 @@ impl App {
                 KeyCode::Delete => self.delete_draft_after(),
                 KeyCode::Left => self.move_draft_left(),
                 KeyCode::Right => self.move_draft_right(),
+                KeyCode::Up if self.mode == Mode::Committing => self.move_draft_up_line(),
+                KeyCode::Down if self.mode == Mode::Committing => self.move_draft_down_line(),
                 KeyCode::Home => self.move_draft_home(),
                 KeyCode::End => self.move_draft_end(),
                 KeyCode::Enter => match self.mode {
@@ -2550,6 +2612,35 @@ mod tests {
         assert_eq!(fx.app.draft_cursor(), 1, "clamps at end");
         fx.app.on_key(KeyCode::Delete);
         assert_eq!(fx.app.draft(), "a", "nothing to delete at end");
+    }
+
+    #[test]
+    fn commit_box_up_down_moves_between_hard_lines() {
+        let mut fx = harness(&["a.txt"]);
+        fx.app.on_key(KeyCode::Char('c'));
+        for c in "subject".chars() {
+            fx.app.on_key(KeyCode::Char(c));
+        }
+        fx.app.push_draft_char('\n');
+        for c in "body".chars() {
+            fx.app.on_key(KeyCode::Char(c));
+        }
+        assert_eq!(fx.app.draft(), "subject\nbody");
+        assert_eq!(fx.app.draft_cursor(), 12);
+        // Up jumps to the start of the previous line.
+        fx.app.on_key(KeyCode::Up);
+        assert_eq!(fx.app.draft_cursor(), 0);
+        // Up on the first line stays at the start.
+        fx.app.on_key(KeyCode::Up);
+        assert_eq!(fx.app.draft_cursor(), 0);
+        // Down jumps to the start of the next line, then to the very end.
+        fx.app.on_key(KeyCode::Down);
+        assert_eq!(fx.app.draft_cursor(), 8);
+        fx.app.on_key(KeyCode::Down);
+        assert_eq!(fx.app.draft_cursor(), 12);
+        // Enter still commits a multi-line message.
+        fx.app.on_key(KeyCode::Enter);
+        assert_eq!(fx.app.mode(), Mode::Normal);
     }
 
     #[test]

@@ -1,6 +1,6 @@
 //! git-tui-core: git operations and the async job engine.
 //!
-//! No TUI dependencies in this crate. See docs/architecture.md.
+//! No TUI dependencies in this crate.
 
 pub mod branch;
 pub mod commit;
