@@ -1,5 +1,6 @@
 use crate::app::{App, Mode};
 use crate::config::{Config, KeyBindings, Theme};
+use crate::session::Session;
 use anyhow::{Context, Result};
 use crossterm::event::KeyCode;
 use git_tui_core::error::GitError;
@@ -15,6 +16,9 @@ pub struct Workspace {
     config: Config,
     current: usize,
     quit: bool,
+    /// Where to persist the open-project session. `None` disables
+    /// persistence (tests); the binary sets it to `Session::default_path()`.
+    session_path: Option<PathBuf>,
 }
 
 impl Workspace {
@@ -32,6 +36,7 @@ impl Workspace {
             config,
             current: 0,
             quit: false,
+            session_path: None,
         };
         for input in &inputs {
             let root = Repo::discover(input)
@@ -82,10 +87,42 @@ impl Workspace {
         Ok(())
     }
 
+    /// Enable session persistence (the binary sets this to
+    /// `Session::default_path()` right after [`Self::open`]).
+    pub fn set_session_path(&mut self, path: Option<PathBuf>) {
+        self.session_path = path;
+    }
+
+    /// Snapshot the current tabs for the session file.
+    pub fn snapshot_session(&self) -> Session {
+        Session::new(self.roots.clone(), self.current)
+    }
+
+    /// Write the open projects + selected tab to the session file.
+    /// No-op when no session path is set (tests) or there is nothing open.
+    /// Errors are swallowed: persistence must never break the UI.
+    pub fn save_session(&self) {
+        let Some(path) = self.session_path.clone() else {
+            return;
+        };
+        if self.roots.is_empty() {
+            return;
+        }
+        let _ = self.snapshot_session().save_to_path(&path);
+    }
+
+    /// Select tab `index` (clamped). Used to restore the session's tab.
+    pub fn set_current(&mut self, index: usize) {
+        if !self.apps.is_empty() {
+            self.current = index.min(self.apps.len() - 1);
+            self.save_session();
+        }
+    }
+
     /// Open `path` as a project tab (Enter on a browser row).
     /// Every edge case stays inside the browser as an error except success
-    /// (opens/switches and closes it) and a non-repo directory (moves to
-    /// the `git init` confirm step).
+    /// (opens/switches and closes it) and a plain directory picked via the
+    /// `.` row (moves to the `git init` confirm step).
     pub fn open_path(&mut self, path: PathBuf) {
         match Repo::discover_root(&path) {
             Ok(root) => {
@@ -93,6 +130,7 @@ impl Workspace {
                 if let Some(i) = self.roots.iter().position(|r| *r == canon) {
                     self.current = i;
                     self.current_mut().finish_open_project();
+                    self.save_session();
                     return;
                 }
                 match JobQueue::spawn(&root) {
@@ -113,6 +151,7 @@ impl Workspace {
                         self.apps.push(app);
                         self.apps[origin].finish_open_project();
                         self.current = self.apps.len() - 1;
+                        self.save_session();
                     }
                     Err(e) => self.current_mut().set_browser_error(format!(
                         "cannot open {}: {e}",
@@ -138,9 +177,11 @@ impl Workspace {
         }
     }
 
-    /// Enter on the highlighted browser row: `.` opens this folder, `..`
-    /// goes up, a subfolder opens as a project. A query with no matches
-    /// is an error, never a fallback to `.`/`..`.
+    /// Enter on the highlighted browser row: `.` opens this folder (offering
+    /// `git init` when it is a plain directory), `..` goes up, a subfolder
+    /// that is a repo opens as a project while a plain subfolder is browsed
+    /// into. A query with no matches is an error, never a fallback to
+    /// `.`/`..`.
     pub fn open_selected(&mut self) {
         let no_match = self.current().open_browser().is_some_and(|b| {
             !b.filter.is_empty() && b.view.is_empty()
@@ -158,12 +199,25 @@ impl Workspace {
         let Some(target) = self.current().open_browser().map(|b| b.selected_path()) else {
             return;
         };
-        let is_parent_row = matches!(
-            self.current().open_browser().map(|b| b.selected_row()),
-            Some(crate::app::BrowserRow::Parent)
-        );
-        if is_parent_row {
+        let selected_row = self
+            .current()
+            .open_browser()
+            .map(|b| b.selected_row());
+        if matches!(selected_row, Some(crate::app::BrowserRow::Parent)) {
             self.goto_parent();
+            return;
+        }
+        // A plain (non-repo) subfolder is browsed into so its contents stay
+        // reachable; `git init` for it is one more Enter away via the `.`
+        // row once inside. Anything else (repos, bare repos, files, missing
+        // paths) goes through `open_path` for the tab/error handling there.
+        if matches!(selected_row, Some(crate::app::BrowserRow::Dir(_)))
+            && target.is_dir()
+            && matches!(Repo::discover_root(&target), Err(GitError::NotARepo(_)))
+        {
+            if let Some(b) = self.current_mut().open_browser_mut() {
+                b.goto(target);
+            }
             return;
         }
         self.open_path(target);
@@ -271,6 +325,7 @@ impl Workspace {
                     if let Some(i) = self.roots.iter().position(|r| *r == canon) {
                         self.current = i;
                         self.current_mut().finish_open_project();
+                        self.save_session();
                         return;
                     }
                     match JobQueue::spawn(&root) {
@@ -291,6 +346,7 @@ impl Workspace {
                             self.apps.push(app);
                             self.apps[origin].finish_open_project();
                             self.current = self.apps.len() - 1;
+                            self.save_session();
                         }
                         Err(e) => self.current_mut().set_error(format!(
                             "initialized {}, but cannot open it: {e}",
@@ -345,12 +401,14 @@ impl Workspace {
     pub fn next(&mut self) {
         if !self.apps.is_empty() {
             self.current = (self.current + 1) % self.apps.len();
+            self.save_session();
         }
     }
 
     pub fn prev(&mut self) {
         if !self.apps.is_empty() {
             self.current = (self.current + self.apps.len() - 1) % self.apps.len();
+            self.save_session();
         }
     }
 
@@ -359,6 +417,7 @@ impl Workspace {
     /// last tab closed). With a single tab, closing exits the application.
     pub fn close_current_project(&mut self) {
         if self.apps.len() <= 1 {
+            self.save_session();
             self.request_quit();
             return;
         }
@@ -367,6 +426,7 @@ impl Workspace {
         if self.current >= self.apps.len() {
             self.current = self.apps.len() - 1;
         }
+        self.save_session();
     }
 
     /// Test/legacy path with no modifiers (see [`App::on_key`]). The binary
@@ -380,8 +440,9 @@ impl Workspace {
     /// Modifier-aware dispatch: Shift+A inside the commit box generates a
     /// commit message; everywhere else behaves like [`Self::on_key`].
     pub fn on_key_with_modifiers(&mut self, key: KeyCode, shift_held: bool) {
-        // The browser owns every key until it closes (Enter opens the
-        // highlighted folder, Esc closes). No global bindings leak in.
+        // The browser owns every key until it closes (Enter opens a repo
+        // or browses into a plain folder, Esc closes). No global bindings
+        // leak in.
         if self.current().mode() == Mode::OpenProject {
             self.on_key_browser(key);
             return;
@@ -523,6 +584,7 @@ impl Workspace {
     }
 
     pub fn request_quit(&mut self) {
+        self.save_session();
         self.quit = true;
         for app in &mut self.apps {
             app.request_quit();
@@ -952,6 +1014,57 @@ mod tests {
     }
 
     #[test]
+    fn enter_on_plain_subdir_browses_inside_and_dot_still_offers_init() {
+        let parent = tempfile::TempDir::new().unwrap();
+        let plain = parent.path().join("plain");
+        std::fs::create_dir_all(plain.join("inner")).unwrap();
+        let a = init_repo_with_file("a", "a.txt", "a\n");
+        let mut ws = Workspace::open(vec![a.path().to_path_buf()], Config::default()).unwrap();
+        ui_jump_to(&mut ws, parent.path());
+        // Past `.`/`..` onto `plain`: Enter browses into it (no init prompt).
+        ws.on_key(KeyCode::Down);
+        ws.on_key(KeyCode::Down);
+        assert!(ws
+            .current()
+            .open_browser()
+            .unwrap()
+            .selected_path()
+            .ends_with("plain"));
+        ws.on_key(KeyCode::Enter);
+        assert_eq!(ws.current().mode(), Mode::OpenProject);
+        assert_eq!(
+            ws.current().open_browser().unwrap().cwd,
+            std::fs::canonicalize(&plain).unwrap()
+        );
+        // `.` is highlighted inside the plain folder: Enter offers `git init`.
+        ws.on_key(KeyCode::Enter);
+        assert_eq!(ws.current().mode(), Mode::ConfirmInit);
+        ws.on_key(KeyCode::Enter);
+        assert_eq!(ws.len(), 2);
+        assert_eq!(ws.current().mode(), Mode::Normal);
+        assert!(plain.join(".git").exists());
+    }
+
+    #[test]
+    fn enter_on_bare_subdir_still_errors_instead_of_descending() {
+        let parent = tempfile::TempDir::new().unwrap();
+        let bare = parent.path().join("bare.git");
+        git2::Repository::init_bare(&bare).unwrap();
+        let a = init_repo_with_file("a", "a.txt", "a\n");
+        let mut ws = Workspace::open(vec![a.path().to_path_buf()], Config::default()).unwrap();
+        ui_jump_to(&mut ws, parent.path());
+        ws.on_key(KeyCode::Down);
+        ws.on_key(KeyCode::Down);
+        ws.on_key(KeyCode::Enter);
+        assert_eq!(ws.current().mode(), Mode::OpenProject);
+        assert!(
+            browser_error(&ws).contains("bare"),
+            "got: {}",
+            browser_error(&ws)
+        );
+    }
+
+    #[test]
     fn open_empty_repo_works_with_no_files() {
         let a = init_repo_with_file("a", "a.txt", "a\n");
         // Fresh `git init`, no commits, no files: the empty project.
@@ -1076,5 +1189,55 @@ mod tests {
         assert_eq!(ws.current().mode(), Mode::FullDiff);
         ws.on_key(KeyCode::Char('Q'));
         assert!(ws.should_quit(), "Q fullscreen must quit the app");
+    }
+
+    #[test]
+    fn snapshot_captures_roots_and_selection() {
+        let a = init_repo_with_file("a", "a.txt", "a\n");
+        let b = init_repo_with_file("b", "b.txt", "b\n");
+        let mut ws = Workspace::open(
+            vec![a.path().to_path_buf(), b.path().to_path_buf()],
+            Config::default(),
+        )
+        .unwrap();
+        ws.next();
+        let snap = ws.snapshot_session();
+        assert_eq!(snap.projects.len(), 2);
+        assert_eq!(snap.current, 1);
+    }
+
+    #[test]
+    fn save_session_writes_file_and_tab_switch_updates_it() {
+        use crate::session::Session;
+        let a = init_repo_with_file("a", "a.txt", "a\n");
+        let b = init_repo_with_file("b", "b.txt", "b\n");
+        let dir = tempfile::TempDir::new().unwrap();
+        let session_file = dir.path().join("session.toml");
+        let mut ws = Workspace::open(
+            vec![a.path().to_path_buf(), b.path().to_path_buf()],
+            Config::default(),
+        )
+        .unwrap();
+        ws.set_session_path(Some(session_file.clone()));
+        ws.save_session();
+        let loaded = Session::load_from_path(&session_file).unwrap();
+        assert_eq!(loaded.projects.len(), 2);
+        assert_eq!(loaded.current, 0);
+        // Switching tabs auto-persists the new selection.
+        ws.next();
+        let reloaded = Session::load_from_path(&session_file).unwrap();
+        assert_eq!(reloaded.current, 1);
+        // Closing a tab auto-persists the shorter list.
+        ws.close_current_project();
+        let closed = Session::load_from_path(&session_file).unwrap();
+        assert_eq!(closed.projects.len(), 1);
+    }
+
+    #[test]
+    fn save_session_without_path_is_a_noop() {
+        let a = init_repo_with_file("a", "a.txt", "a\n");
+        let ws = Workspace::open(vec![a.path().to_path_buf()], Config::default()).unwrap();
+        // No session path set (tests): must not panic or touch the disk.
+        ws.save_session();
     }
 }

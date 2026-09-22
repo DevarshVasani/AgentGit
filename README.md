@@ -11,7 +11,8 @@ helpers work unchanged.
 
 - Status tree with staged / unstaged / untracked / conflicted states
 - Inline unified diff preview + fullscreen side-by-side diff with syntax
-  highlighting and word-level change highlighting
+  highlighting (code + Markdown: headings, emphasis, code spans, links)
+  and word-level change highlighting
 - Stage whole files, directories, or single hunks; unstage files
 - Commit box that wraps and grows as you type
 - Branches (create / delete / checkout), log, stash (push / pop / drop)
@@ -20,7 +21,7 @@ helpers work unchanged.
 - Multiple projects (tabs) in one viewer, with directory browser to open more
 - Fuzzy file finder (`/`, fullscreen `enter` to jump)
 - AI commit messages from staged diffs (`Shift+A` in commit box, `A` for setup)
-- Themes (`default`, `tokyo-night`) + fully rebindable keys via TOML config
+- Themes (`default`, `tokyo-night`, `catppuccin`, `legacy`) + fully rebindable keys via TOML config
 
 ## Build & run
 
@@ -70,13 +71,14 @@ Each project keeps its own status, diff, selection, and staging state.
 `Q` (`quit`) quits the whole application;
 `o` (`project_open`) opens a directory browser without leaving the viewer.
 It starts at the current project; just start typing to filter the current
-folder's list (no prefix key), `enter` opens the highlighted folder (`.`
-opens the shown folder itself), `↑`/`↓` move, `→` descends, `←` goes up
+folder's list (no prefix key), `enter` opens a repo (`.` opens the shown
+folder itself) and descends into plain folders so you can keep browsing,
+`↑`/`↓` move, `→` descends, `←` goes up
 (`backspace` edits the query, or goes up when it is empty), `tab` jumps
 to a typed path, and `esc` clears the query first, then closes. Repo roots
 show a `[repo]` badge, open tabs `[open]`.
 Edge cases stay in the browser as errors (missing path, bare repos, files);
-a plain directory offers `enter` to `git init` it first, and an
+`enter` on `.` inside a plain directory offers to `git init` it first, and an
 already-open repo just switches to its tab. Empty repos (no commits yet)
 open fine.
 the project bar on top shows every repo with its dirty-file count and
@@ -110,7 +112,7 @@ fail fast with the offending value instead of being silently ignored.
 
 ```toml
 [theme]
-name = "tokyo-night"  # or "default"
+name = "tokyo-night"  # default | tokyo-night | catppuccin | legacy
 
 [keys]
 stage = "s"

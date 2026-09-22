@@ -1,6 +1,7 @@
 mod app;
 mod config;
 mod fuzzy;
+mod session;
 mod syntax;
 mod ui;
 mod words;
@@ -13,8 +14,10 @@ use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
+use git_tui_core::repo::Repo;
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
+use session::Session;
 use std::ffi::OsString;
 use std::io::stdout;
 use std::path::PathBuf;
@@ -35,13 +38,22 @@ fn main() -> Result<()> {
     // missing file falls back to defaults inside `Config::load`.
     // Precedence: `--theme` flag > config file > default.
     // Positional paths and `--repo` flags select the projects; empty means
-    // the current directory. Each path is resolved to its enclosing repo.
+    // restore the last session, falling back to the current directory.
+    // Each path is resolved to its enclosing repo.
     let cli = parse_args(std::env::args_os().skip(1))?;
     let mut config = Config::load().context("cannot load config")?;
     if let Some(name) = cli.theme {
         config.theme = Theme::by_name(&name).with_context(|| format!("unknown theme {name:?}"))?;
     }
-    let mut workspace = Workspace::open(cli.paths, config)?;
+    let (paths, restored_current) = resolve_startup_paths(cli.paths);
+    let mut workspace = Workspace::open(paths, config)?;
+    workspace.set_session_path(Session::default_path());
+    if let Some(idx) = restored_current {
+        workspace.set_current(idx);
+    } else {
+        // Explicit CLI paths (or fresh cwd): become the new session.
+        workspace.save_session();
+    }
 
     enable_raw_mode().context("cannot enable raw mode")?;
     let mut out = stdout();
@@ -56,7 +68,40 @@ fn main() -> Result<()> {
     let res = run(&mut terminal, &mut workspace);
 
     restore_terminal(&mut terminal);
+    // Persist the tabs that were open so the next launch restores them.
+    workspace.save_session();
     res
+}
+
+/// Decide which projects to open at startup.
+/// Explicit CLI paths always win (and become the new session). With no CLI
+/// paths, the last saved session is restored (dead entries dropped); an
+/// empty/missing session falls back to `Workspace::open`'s cwd default
+/// (empty vec). Returns the paths plus the session's selected tab, if any.
+fn resolve_startup_paths(explicit: Vec<PathBuf>) -> (Vec<PathBuf>, Option<usize>) {
+    if !explicit.is_empty() {
+        return (explicit, None);
+    }
+    resolve_from_session(&Session::load())
+}
+
+/// Pure core of [`resolve_startup_paths`] (testable without touching the
+/// real session file): explicit paths win; otherwise restore the session's
+/// still-valid projects; empty/invalid sessions fall back to cwd (empty vec).
+fn resolve_from_session(session: &Session) -> (Vec<PathBuf>, Option<usize>) {
+    if session.projects.is_empty() {
+        return (Vec::new(), None);
+    }
+    let valid: Vec<PathBuf> = session
+        .existing_projects()
+        .into_iter()
+        .filter(|p| Repo::discover_root(p).is_ok())
+        .collect();
+    if valid.is_empty() {
+        return (Vec::new(), None);
+    }
+    let current = session.current.min(valid.len() - 1);
+    (valid, Some(current))
 }
 
 /// Panic-hook pattern (ratatui docs): a panicking TUI must leave cooked mode
@@ -98,7 +143,7 @@ struct Cli {
 }
 
 const USAGE: &str =
-    "usage: git-tui [--theme <default|tokyo-night>] [--repo <path>]... [<path>...] [-- <path>...]";
+    "usage: git-tui [--theme <default|tokyo-night|catppuccin|legacy>] [--repo <path>]... [<path>...] [-- <path>...]";
 
 fn parse_args(args: impl IntoIterator<Item = impl Into<OsString>>) -> Result<Cli> {
     let mut cli = Cli {
@@ -306,5 +351,52 @@ mod tests {
             normalize_key(KeyCode::Char('Q'), KeyModifiers::SHIFT),
             KeyCode::Char('Q')
         );
+    }
+
+    fn init_repo(dir: &tempfile::TempDir) {
+        let repo = git2::Repository::init(dir.path()).unwrap();
+        repo.set_head("refs/heads/main").unwrap();
+    }
+
+    #[test]
+    fn empty_session_falls_back_to_cwd() {
+        let (paths, current) = resolve_from_session(&Session::empty());
+        assert!(paths.is_empty());
+        assert!(current.is_none());
+    }
+
+    #[test]
+    fn dead_session_entries_fall_back_to_cwd() {
+        let s = Session::new(
+            vec![PathBuf::from("/definitely/not/here-git-tui-xyz")],
+            0,
+        );
+        let (paths, current) = resolve_from_session(&s);
+        assert!(paths.is_empty());
+        assert!(current.is_none());
+    }
+
+    #[test]
+    fn valid_session_projects_are_restored_with_selection() {
+        let a = tempfile::TempDir::new().unwrap();
+        let b = tempfile::TempDir::new().unwrap();
+        init_repo(&a);
+        init_repo(&b);
+        let s = Session::new(
+            vec![a.path().to_path_buf(), b.path().to_path_buf()],
+            5, // out of range clamps to last tab
+        );
+        let (paths, current) = resolve_from_session(&s);
+        assert_eq!(paths.len(), 2);
+        assert_eq!(current, Some(1));
+    }
+
+    #[test]
+    fn plain_dir_in_session_is_dropped() {
+        let plain = tempfile::TempDir::new().unwrap();
+        let s = Session::new(vec![plain.path().to_path_buf()], 0);
+        let (paths, current) = resolve_from_session(&s);
+        assert!(paths.is_empty());
+        assert!(current.is_none());
     }
 }

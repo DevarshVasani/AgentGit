@@ -14,11 +14,16 @@
 //!   per-frame rendering cheap (only visible lines are highlighted).
 //! - `highlight_file_lines` reuses one `HighlightLines` across lines so a
 //!   whole-file view keeps block-comment/string state correctly.
+//! - Markdown gets LazyVim-style styling too: bold blue headings, bold/italic
+//!   emphasis, green inline code and fences, underlined cyan links, dimmed
+//!   `#`/`*`/`-`/`>`/`[]()` punctuation. The rules are prefixed with
+//!   `text.html.markdown` so code highlighting is never affected.
 
 use crate::config::Theme;
 use ratatui::style::{Color as RatColor, Modifier};
+use std::collections::HashMap;
 use std::str::FromStr;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 use syntect::easy::HighlightLines;
 use syntect::highlighting::{
     Color as SynColor, FontStyle, ScopeSelectors, StyleModifier, Theme as SynTheme, ThemeSettings,
@@ -163,6 +168,40 @@ fn rule(
     }
 }
 
+/// Built syntect themes, one per app [`Theme`]. Building parses a dozen
+/// scope selectors, so doing it per line per frame (~1ms) was the main
+/// source of UI lag — now it happens once per theme.
+fn syntect_theme_cached(theme: Theme) -> std::sync::Arc<SynTheme> {
+    static CACHE: OnceLock<Mutex<HashMap<Theme, std::sync::Arc<SynTheme>>>> =
+        OnceLock::new();
+    let mut cache = CACHE
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .expect("syntect theme cache poisoned");
+    cache
+        .entry(theme)
+        .or_insert_with(|| std::sync::Arc::new(syntect_theme(theme)))
+        .clone()
+}
+
+/// Highlighted-line cache: the TUI redraws up to 10x/sec and the same
+/// lines are visible across frames, so repeat renders become HashMap hits
+/// instead of regex highlighting. Pure function — no invalidation needed.
+/// Bounded: cleared once it grows past the cap.
+fn line_cache(
+) -> &'static Mutex<HashMap<(String, String, Theme), Vec<HiToken>>> {
+    static CACHE: OnceLock<Mutex<HashMap<(String, String, Theme), Vec<HiToken>>>> =
+        OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+const LINE_CACHE_CAP: usize = 4096;
+
+/// Lines past this length skip syntect (plain foreground): regex
+/// highlighting on multi-KB minified lines costs tens of ms per frame while
+/// scrolling, and flat text stays fully readable.
+const HIGHLIGHT_LEN_CAP: usize = 2000;
+
 /// Build a syntect theme from the app theme: LazyVim groups.
 fn syntect_theme(theme: Theme) -> SynTheme {
     let fg = rat_to_syn(theme.fg);
@@ -203,6 +242,37 @@ fn syntect_theme(theme: Theme) -> SynTheme {
                 theme.syntax_type,
                 None,
             ),
+            // --- Markdown (text.html.markdown) ---
+            // Prefixed with the root scope so these never recolor code:
+            // headings bold blue, emphasis keeps fg + modifier, inline code
+            // and fences green, link text/URLs underlined cyan, and the
+            // `#`/`*`/`-`/`>`/`[]()` punctuation dimmed.
+            rule(
+                "text.html.markdown markup.heading",
+                theme.syntax_function,
+                Some(FontStyle::BOLD),
+            ),
+            rule(
+                "text.html.markdown markup.bold",
+                theme.fg,
+                Some(FontStyle::BOLD),
+            ),
+            rule(
+                "text.html.markdown markup.italic",
+                theme.fg,
+                Some(FontStyle::ITALIC),
+            ),
+            rule("text.html.markdown markup.raw", theme.syntax_string, None),
+            rule(
+                "text.html.markdown markup.underline.link, text.html.markdown meta.link.inline.description, text.html.markdown constant.other.reference.link",
+                theme.syntax_type,
+                Some(FontStyle::UNDERLINE),
+            ),
+            rule(
+                "text.html.markdown punctuation.definition.heading, text.html.markdown punctuation.definition.bold, text.html.markdown punctuation.definition.italic, text.html.markdown punctuation.definition.raw, text.html.markdown punctuation.definition.link, text.html.markdown punctuation.definition.metadata, text.html.markdown punctuation.definition.blockquote, text.html.markdown punctuation.definition.list_item, text.html.markdown constant.other.language-name",
+                theme.hint,
+                None,
+            ),
         ],
     }
 }
@@ -217,6 +287,8 @@ fn find_syntax<'a>(ss: &'a SyntaxSet, path: &str) -> &'a syntect::parsing::Synta
         // whole TS/JS family (.ts/.tsx/.mts/.cts/.jsx/.mjs/.cjs).
         let mapped: &str = match ext.to_ascii_lowercase().as_str() {
             "ts" | "mts" | "cts" | "tsx" | "jsx" | "mjs" | "cjs" => "js",
+            // Markdown variants with no dedicated grammar render as Markdown.
+            "mdx" | "mkd" => "md",
             _ => ext,
         };
         if let Some(s) = ss.find_syntax_by_extension(mapped) {
@@ -263,8 +335,39 @@ pub fn highlight_line(path: &str, text: &str, theme: Theme) -> Vec<HiToken> {
     if text.is_empty() {
         return Vec::new();
     }
+    // Very long lines render in the plain foreground: full syntect on
+    // multi-KB lines costs tens of ms, and flat text stays readable.
+    if text.len() > HIGHLIGHT_LEN_CAP {
+        return vec![HiToken {
+            text: text.to_string(),
+            fg: theme.fg,
+            modifier: Modifier::empty(),
+        }];
+    }
+    // Repeat frames show the same lines: serve them from the cache.
+    let key = (path.to_string(), text.to_string(), theme);
+    if let Some(hit) = line_cache()
+        .lock()
+        .expect("highlight cache poisoned")
+        .get(&key)
+    {
+        return hit.clone();
+    }
+    let out = highlight_line_uncached(path, text, theme);
+    let mut cache = line_cache()
+        .lock()
+        .expect("highlight cache poisoned");
+    if cache.len() > LINE_CACHE_CAP {
+        cache.clear();
+    }
+    cache.insert(key, out.clone());
+    out
+}
+
+/// Uncached single-line highlight (fresh parser state).
+fn highlight_line_uncached(path: &str, text: &str, theme: Theme) -> Vec<HiToken> {
     let ss = syntaxes();
-    let syn = syntect_theme(theme);
+    let syn = syntect_theme_cached(theme);
     let syntax = find_syntax(ss, path);
     let mut hl = HighlightLines::new(syntax, &syn);
     match hl.highlight_line(text, ss) {
@@ -293,7 +396,7 @@ pub fn highlight_line(path: &str, text: &str, theme: Theme) -> Vec<HiToken> {
 /// comments/strings). Returns one token vec per input line.
 pub fn highlight_file_lines(path: &str, lines: &[&str], theme: Theme) -> Vec<Vec<HiToken>> {
     let ss = syntaxes();
-    let syn = syntect_theme(theme);
+    let syn = syntect_theme_cached(theme);
     let syntax = find_syntax(ss, path);
     let mut hl = HighlightLines::new(syntax, &syn);
     lines
@@ -324,6 +427,71 @@ pub fn highlight_file_lines(path: &str, lines: &[&str], theme: Theme) -> Vec<Vec
 mod tests {
     use super::*;
     use crate::config::Theme;
+
+    #[test]
+    fn markdown_headings_are_bold_function_color() {
+        let theme = Theme::tokyo_night();
+        for (line, word) in [("# Hello world", "Hello"), ("## Sub head", "Sub")] {
+            let toks = highlight_line("README.md", line, theme);
+            let joined: String = toks.iter().map(|t| t.text.as_str()).collect();
+            assert_eq!(joined, line);
+            let head = toks
+                .iter()
+                .find(|t| t.text.contains(word))
+                .expect("heading text token");
+            assert_eq!(head.fg, theme.syntax_function, "{toks:?}");
+            assert!(
+                head.modifier.contains(Modifier::BOLD),
+                "heading should be bold: {toks:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn markdown_emphasis_code_and_links_are_styled() {
+        let theme = Theme::tokyo_night();
+        let line = "**bold** *em* `code` [link](https://x.y)";
+        let toks = highlight_line("notes.md", line, theme);
+        let joined: String = toks.iter().map(|t| t.text.as_str()).collect();
+        assert_eq!(joined, line);
+        let bold = toks.iter().find(|t| t.text == "bold").expect("bold token");
+        assert!(
+            bold.modifier.contains(Modifier::BOLD),
+            "bold should be bold: {toks:?}"
+        );
+        let em = toks.iter().find(|t| t.text == "em").expect("italic token");
+        assert!(
+            em.modifier.contains(Modifier::ITALIC),
+            "italic should be italic: {toks:?}"
+        );
+        let code = toks.iter().find(|t| t.text == "code").expect("code token");
+        assert_eq!(code.fg, theme.syntax_string, "{toks:?}");
+        assert!(
+            toks.iter().any(|t| t.fg == theme.syntax_type
+                && t.modifier.contains(Modifier::UNDERLINED)),
+            "link should be underlined cyan: {toks:?}"
+        );
+    }
+
+    #[test]
+    fn markdown_punctuation_is_dimmed() {
+        let theme = Theme::tokyo_night();
+        let toks = highlight_line("README.md", "# Title", theme);
+        let hash = toks.iter().find(|t| t.text == "#").expect("hash token");
+        assert_eq!(hash.fg, theme.hint, "{toks:?}");
+    }
+
+    #[test]
+    fn markdown_extension_variants_use_markdown_grammar() {
+        let theme = Theme::tokyo_night();
+        for path in ["notes.markdown", "page.mdx", "doc.mkd"] {
+            let toks = highlight_line(path, "# Title", theme);
+            assert!(
+                toks.iter().any(|t| t.fg == theme.syntax_function),
+                "{path} should highlight as Markdown: {toks:?}"
+            );
+        }
+    }
 
     #[test]
     fn typescript_files_get_keyword_and_comment_colors() {
@@ -381,5 +549,38 @@ mod tests {
         assert_eq!(out.len(), 3);
         let joined: String = out[0].iter().map(|t| t.text.as_str()).collect();
         assert_eq!(joined, "fn a() {}");
+    }
+
+    #[test]
+    fn very_long_lines_use_plain_foreground() {
+        // Multi-KB lines (minified files) must not run regex highlighting:
+        // tens of ms per frame while scrolling.
+        let theme = Theme::tokyo_night();
+        let long = "x".repeat(5000);
+        let toks = highlight_line("src/main.rs", &long, theme);
+        let joined: String = toks.iter().map(|t| t.text.as_str()).collect();
+        assert_eq!(joined, long);
+        assert!(toks.iter().all(|t| t.fg == theme.fg));
+    }
+
+    #[test]
+    fn highlight_cache_keys_on_theme() {
+        // Same line under two themes must not share cached tokens: a custom
+        // keyword color must show up only under its own theme.
+        let line = "fn main() {}";
+        let base = Theme::tokyo_night();
+        let custom = Theme {
+            syntax_keyword: ratatui::style::Color::Red,
+            ..base
+        };
+        let base_fn = highlight_line("a.rs", line, base);
+        let custom_fn = highlight_line("a.rs", line, custom);
+        let fg_base = base_fn.iter().find(|t| t.text == "fn").unwrap().fg;
+        let fg_custom = custom_fn.iter().find(|t| t.text == "fn").unwrap().fg;
+        assert_eq!(fg_base, base.syntax_keyword);
+        assert_ne!(fg_custom, fg_base, "custom theme must not get cached tokens");
+        // And the base theme still resolves correctly afterwards.
+        let again = highlight_line("a.rs", line, base);
+        assert_eq!(again.iter().find(|t| t.text == "fn").unwrap().fg, fg_base);
     }
 }

@@ -17,6 +17,7 @@ use std::cell::Cell;
 
 use crate::config::{Config, KeyBindings, Theme};
 use crate::fuzzy;
+use crate::ui::{diff_rows, DiffRow};
 
 /// Labels for the LLM setup form rows: provider, model, API key, base URL.
 pub const LLM_FIELD_LABELS: [&str; 4] = [
@@ -109,6 +110,10 @@ pub struct App {
     error: Option<String>,
     quit: bool,
     diff: Option<FileDiff>,
+    /// Side-by-side rows paired from `diff`, computed once when the diff
+    /// arrives. Frames and scroll steps read this instead of rerunning the
+    /// word diffs over the whole diff every time.
+    diff_rows: Vec<DiffRow>,
     /// (path, staged) the loaded/loading diff belongs to.
     diff_for: Option<(String, bool)>,
     /// The loaded diff is a whole-file view (clean file), not a real diff.
@@ -157,7 +162,8 @@ pub enum BrowserRow {
     Current,
     /// `..`: go up to the parent.
     Parent,
-    /// A subdirectory: open it, or descend into it.
+    /// A subdirectory: opens as a project when it is a repo, otherwise
+    /// Enter descends into it for browsing.
     Dir(usize),
 }
 
@@ -386,6 +392,7 @@ impl App {
             error: None,
             quit: false,
             diff: None,
+            diff_rows: Vec::new(),
             diff_for: None,
             diff_whole_file: false,
             fallback_whole_file: false,
@@ -728,6 +735,19 @@ impl App {
         self.diff.as_ref()
     }
 
+    /// Side-by-side rows for the loaded diff, paired once on arrival.
+    /// Empty when no diff is loaded.
+    pub(crate) fn diff_rows(&self) -> &[DiffRow] {
+        &self.diff_rows
+    }
+
+    /// Replace the loaded diff and re-pair its side-by-side rows.
+    /// All `self.diff` writes go through here so the cache never stales.
+    fn set_diff(&mut self, diff: Option<FileDiff>) {
+        self.diff_rows = diff.as_ref().map(diff_rows).unwrap_or_default();
+        self.diff = diff;
+    }
+
     /// Whether the loaded diff shows staged (`Some(true)`) or unstaged
     /// (`Some(false)`) changes; `None` when no diff is loaded.
     pub fn diff_viewing_staged(&self) -> Option<bool> {
@@ -992,7 +1012,7 @@ impl App {
     pub(crate) fn set_diff_for_test(&mut self, diff: git_tui_core::diff::FileDiff, staged: bool) {
         self.diff_for = Some((diff.path.clone(), staged));
         self.diff_whole_file = false;
-        self.diff = Some(diff);
+        self.set_diff(Some(diff));
         self.hunk = 0;
         self.diff_scroll = 0;
     }
@@ -1480,30 +1500,24 @@ impl App {
     }
 
     /// Rendered row offset where hunk `index` starts (its header row in the
-    /// side-by-side layout built by [`crate::ui::hunk_start_row`]).
+    /// side-by-side rows cached from the loaded diff).
     fn hunk_start_row(&self, index: usize) -> u16 {
-        self.diff
-            .as_ref()
-            .map(|d| crate::ui::hunk_start_row(d, index))
-            .unwrap_or(0)
+        crate::ui::rows_hunk_start(&self.diff_rows, index)
     }
 
     /// Last valid preview scroll offset (unified lines), so scrolling the
     /// [5] tab stops on the last line instead of running into blank space.
     fn diff_preview_max(&self) -> u16 {
-        self.diff
-            .as_ref()
-            .map(|d| crate::ui::diff_unified_len(d).saturating_sub(1))
-            .unwrap_or(0)
+        crate::ui::rows_unified_len(&self.diff_rows)
+            .saturating_sub(1)
             .min(u16::MAX as usize) as u16
     }
 
     /// Last valid fullscreen offset (side-by-side rows).
     fn diff_full_max(&self) -> u16 {
-        self.diff
-            .as_ref()
-            .map(|d| crate::ui::diff_rows(d).len().saturating_sub(1))
-            .unwrap_or(0)
+        self.diff_rows
+            .len()
+            .saturating_sub(1)
             .min(u16::MAX as usize) as u16
     }
 
@@ -1714,7 +1728,7 @@ impl App {
         }
         self.diff_for = target.clone();
         // Stale view: show loading until the fresh diff arrives.
-        self.diff = None;
+        self.set_diff(None);
         self.hunk = 0;
         self.diff_scroll = 0;
         self.diff_whole_file = whole;
@@ -2079,7 +2093,7 @@ impl App {
                             // Listed but no content diff (e.g. mode-only
                             // change): show the whole file automatically.
                             self.fallback_whole_file = true;
-                            self.diff = None;
+                            self.set_diff(None);
                             self.hunk = 0;
                             self.diff_scroll = 0;
                             self.diff_whole_file = true;
@@ -2088,7 +2102,7 @@ impl App {
                                 self.error = Some(e.to_string());
                             }
                         } else {
-                            self.diff = Some(d);
+                            self.set_diff(Some(d));
                             self.hunk = self.hunk.min(self.hunk_count().saturating_sub(1));
                             // The fresh content may be shorter: keep the
                             // offset inside the new content.
@@ -3280,7 +3294,7 @@ mod tests {
         let mut fx = two_hunk_fixture();
         fx.app.on_key(KeyCode::Char('5'));
         assert_eq!(fx.app.focus(), Focus::Diff);
-        let max = crate::ui::diff_unified_len(fx.app.diff().unwrap())
+        let max = crate::ui::rows_unified_len(fx.app.diff_rows())
             .saturating_sub(1)
             .min(u16::MAX as usize) as u16;
         assert!(max > 2, "fixture must have scrollable content");
@@ -3307,7 +3321,7 @@ mod tests {
         let mut fx = two_hunk_fixture();
         fx.app.on_key(KeyCode::Enter);
         assert_eq!(fx.app.mode(), Mode::FullDiff);
-        let max = crate::ui::diff_rows(fx.app.diff().unwrap())
+        let max = fx.app.diff_rows()
             .len()
             .saturating_sub(1)
             .min(u16::MAX as usize) as u16;
@@ -3320,6 +3334,38 @@ mod tests {
             fx.app.on_key(KeyCode::Up);
         }
         assert_eq!(fx.app.diff_scroll(), 0);
+    }
+
+    #[test]
+    fn diff_rows_are_paired_once_on_arrival() {
+        use git_tui_core::diff::{DiffLine, FileDiff, Hunk, LineKind};
+        let mut fx = harness(&["a.txt"]);
+        assert!(fx.app.diff_rows().is_empty(), "no diff, no rows");
+        fx.app.set_diff_for_test(
+            FileDiff {
+                path: "a.txt".into(),
+                hunks: vec![Hunk {
+                    header: "@@ -1,1 +1,1 @@".into(),
+                    old_start: 1,
+                    new_start: 1,
+                    lines: vec![
+                        DiffLine {
+                            kind: LineKind::Del,
+                            text: "old".into(),
+                        },
+                        DiffLine {
+                            kind: LineKind::Add,
+                            text: "new".into(),
+                        },
+                    ],
+                }],
+            },
+            false,
+        );
+        // Header + one paired del/add row, matching a fresh pairing.
+        assert_eq!(fx.app.diff_rows().len(), 2);
+        let fresh = crate::ui::diff_rows(fx.app.diff().unwrap());
+        assert_eq!(fx.app.diff_rows(), fresh.as_slice());
     }
 
     #[test]

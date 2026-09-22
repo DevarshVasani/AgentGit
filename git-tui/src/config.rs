@@ -138,11 +138,13 @@ impl Default for KeyBindings {
     }
 }
 
-/// Named UI palette. `default` preserves the legacy hardcoded colors.
+/// Named UI palette. `default` is Catppuccin Mocha (proper RGB colors
+/// with a Telescope-style selection wash); `legacy` keeps the original
+/// 16-color ANSI look.
 /// Syntax colors follow LazyVim (tokyo-night + treesitter): comments are
 /// dim italic gray, strings green, keywords magenta italic, functions blue,
 /// types cyan, numbers orange.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Theme {
     pub border_focused: Color,
     pub border_unfocused: Color,
@@ -185,7 +187,14 @@ pub struct Theme {
 }
 
 impl Theme {
+    /// The out-of-the-box look: Catppuccin Mocha with proper RGB colors
+    /// and a Telescope-style selection wash.
     pub fn default_theme() -> Self {
+        Self::catppuccin()
+    }
+
+    /// Legacy 16-color ANSI palette for terminals without truecolor.
+    pub fn legacy() -> Self {
         Self {
             border_focused: Color::White,
             border_unfocused: Color::DarkGray,
@@ -251,11 +260,48 @@ impl Theme {
         }
     }
 
+    /// https://catppuccin.com — Mocha palette.
+    pub fn catppuccin() -> Self {
+        let rgb = Color::Rgb;
+        Self {
+            border_focused: rgb(137, 180, 250),    // blue #89b4fa
+            border_unfocused: rgb(69, 71, 90),     // surface1 #45475a
+            hint: rgb(108, 112, 134),              // overlay0 #6c7086
+            error: rgb(243, 139, 168),             // red #f38ba8
+            staged: rgb(166, 227, 161),            // green #a6e3a1
+            unstaged: rgb(249, 226, 175),          // yellow #f9e2af
+            untracked: rgb(108, 112, 134),         // overlay0 #6c7086
+            conflicted: rgb(243, 139, 168),        // red #f38ba8
+            both_staged: rgb(203, 166, 247),       // mauve #cba6f7
+            hunk_header: rgb(137, 220, 235),       // sky #89dceb
+            commit_id: rgb(250, 179, 135),         // peach #fab387
+            branch_current: rgb(166, 227, 161),    // green #a6e3a1
+            context: rgb(108, 112, 134),           // overlay0 #6c7086
+            diff_del_bg: rgb(58, 36, 48),
+            diff_add_bg: rgb(30, 49, 42),
+            diff_del_word_bg: rgb(79, 42, 56),
+            bg: rgb(30, 30, 46),                   // base #1e1e2e
+            fg: rgb(205, 214, 244),                // text #cdd6f4
+            line_nr: rgb(69, 71, 90),              // surface1 #45475a
+            selection_bg: rgb(49, 50, 68),         // surface0 #313244
+            syntax_comment: rgb(108, 112, 134),    // overlay0 #6c7086
+            syntax_string: rgb(166, 227, 161),     // green #a6e3a1
+            syntax_keyword: rgb(203, 166, 247),    // mauve #cba6f7
+            syntax_function: rgb(137, 180, 250),   // blue #89b4fa
+            syntax_type: rgb(137, 220, 235),       // sky #89dceb
+            syntax_number: rgb(250, 179, 135),     // peach #fab387
+        }
+    }
+
     pub fn by_name(name: &str) -> Result<Self> {
         match name {
             "default" => Ok(Self::default_theme()),
             "tokyo-night" => Ok(Self::tokyo_night()),
-            _ => anyhow::bail!("unknown theme {name:?} (expected \"default\" or \"tokyo-night\")"),
+            "catppuccin" => Ok(Self::catppuccin()),
+            "legacy" => Ok(Self::legacy()),
+            _ => anyhow::bail!(
+                "unknown theme {name:?} (expected \"default\", \"tokyo-night\", \"catppuccin\", or \"legacy\")"
+            ),
         }
     }
 }
@@ -546,6 +592,12 @@ mod tests {
         let tn = Theme::by_name("tokyo-night").unwrap();
         assert_eq!(tn.error, Color::Rgb(247, 118, 142));
         assert_eq!(tn.hunk_header, Color::Rgb(125, 207, 255));
+        // Default ships the Catppuccin Mocha palette; legacy keeps bare ANSI.
+        assert_eq!(Theme::default_theme().bg, Color::Rgb(30, 30, 46));
+        assert_eq!(Theme::default_theme().error, Color::Rgb(243, 139, 168));
+        assert_eq!(Theme::by_name("legacy").unwrap().staged, Color::Green);
+        let mocha = Theme::by_name("catppuccin").unwrap();
+        assert_eq!(mocha, Theme::default_theme());
         assert!(Theme::by_name("dracula").is_err());
     }
 
@@ -556,7 +608,8 @@ mod tests {
             Theme::by_name("tokyo-night").unwrap().bg,
             Color::Rgb(36, 40, 59)
         );
-        assert_eq!(Theme::default_theme().bg, Color::Black);
+        assert_eq!(Theme::default_theme().bg, Color::Rgb(30, 30, 46));
+        assert_eq!(Theme::by_name("legacy").unwrap().bg, Color::Black);
     }
 
     #[test]
@@ -567,7 +620,9 @@ mod tests {
         // syntax fg remains readable on top.
         for theme in [
             Theme::by_name("tokyo-night").unwrap(),
+            Theme::by_name("catppuccin").unwrap(),
             Theme::default_theme(),
+            Theme::legacy(),
         ] {
             let Color::Rgb(ar, ag, ab) = theme.diff_add_bg else {
                 panic!("expected RGB add wash, got {:?}", theme.diff_add_bg);
@@ -584,8 +639,8 @@ mod tests {
     }
 
     #[test]
-    fn default_theme_matches_legacy_colors() {
-        let t = Theme::default_theme();
+    fn legacy_theme_matches_old_ansi_colors() {
+        let t = Theme::legacy();
         assert_eq!(t.staged, Color::Green);
         assert_eq!(t.unstaged, Color::Yellow);
         assert_eq!(t.conflicted, Color::Red);

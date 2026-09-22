@@ -617,17 +617,17 @@ pub(crate) fn diff_rows(diff: &FileDiff) -> Vec<DiffRow> {
     rows
 }
 
-/// Total unified lines the preview expands to (headers count as one,
-/// context one line, del/add pairs two). The preview scroll offset is
-/// clamped to this so scrolling can't run past the end into blank space.
-pub(crate) fn diff_unified_len(diff: &FileDiff) -> usize {
-    diff_rows(diff).iter().map(unified_row_count).sum()
+/// Unified logical-line count over precomputed rows. Used per frame
+/// against the rows cached in `App` so no word diffs rerun.
+pub(crate) fn rows_unified_len(rows: &[DiffRow]) -> usize {
+    rows.iter().map(unified_row_count).sum()
 }
 
-/// Rendered row offset where hunk `index` starts (its header row), so hunk
-/// navigation can snap the view to the selected hunk.
-pub(crate) fn hunk_start_row(diff: &FileDiff, index: usize) -> u16 {
-    diff_rows(diff)
+/// Hunk header offset over precomputed rows, so hunk navigation can snap
+/// the view to the selected hunk. Used against the rows cached in `App`
+/// so no word diffs rerun.
+pub(crate) fn rows_hunk_start(rows: &[DiffRow], index: usize) -> u16 {
+    rows
         .iter()
         .position(|r| matches!(r, DiffRow::Header { index: i } if *i == index))
         .unwrap_or(0)
@@ -647,55 +647,32 @@ fn gutter_width(rows: &[DiffRow]) -> usize {
     digits
 }
 
-/// Render one side (gutter + text) padded to exactly `width` cells.
-/// LazyVim-style: syntax-highlighted foreground (treesitter-like colors)
-/// on a tinted diff wash, with exactly the changed words getting a
-/// stronger wash. Whole-file views are all-`Context` with no wash, so they
-/// read like a LazyVim buffer: line numbers + full syntax colors.
-fn render_side(
-    side: &Side,
-    path: &str,
-    width: usize,
-    gutter_w: usize,
-    theme: Theme,
-) -> Vec<Span<'static>> {
-    use unicode_width::UnicodeWidthChar;
-    let mut remaining = width;
-    let mut out = Vec::new();
-    for span in render_side_unclipped(side, path, width, gutter_w, theme) {
-        let mut text = String::new();
-        for ch in span.content.chars() {
-            let cells = ch.width().unwrap_or(0);
-            if cells > remaining {
-                text.push_str(&" ".repeat(remaining));
-                remaining = 0;
-                break;
-            }
-            text.push(ch);
-            remaining -= cells;
-        }
-        if !text.is_empty() {
-            out.push(Span::styled(text, span.style));
-        }
-        if remaining == 0 {
-            break;
-        }
+/// Max visual rows one code line expands to. Overlong lines soft-wrap onto
+/// a continuation row (blank gutter — the line number shows only on the
+/// first row) instead of being clipped; anything past the last row is cut
+/// with a trailing `…` so no content is silently lost.
+const WRAP_MAX_LINES: usize = 2;
+
+/// Empty counterpart of a side for padding short halves when the two
+/// sides wrap to different heights: same wash, no number, no text.
+fn blank_side(side: &Side) -> Side {
+    Side {
+        no: None,
+        segs: Vec::new(),
+        kind: side.kind.clone(),
     }
-    out
 }
 
-fn render_side_unclipped(
+/// Styled content cells of a side: tabs expanded, `\r` dropped, syntax
+/// foreground merged with the diff wash per char. No gutter, no padding,
+/// no clipping — the caller wraps these into visual lines.
+fn side_content_cells(
     side: &Side,
     path: &str,
-    width: usize,
     gutter_w: usize,
     theme: Theme,
-) -> Vec<Span<'static>> {
+) -> (Vec<(char, Style)>, Option<Color>) {
     use unicode_width::UnicodeWidthChar;
-    let gutter_text = match side.no {
-        Some(no) => format!("{:>gutter_w$} ", no),
-        None => " ".repeat(gutter_w + 1),
-    };
     let (bg, word_bg) = match side.kind {
         // Plain code rows sit on the opaque editor background. Deleted rows
         // carry a red wash (stronger on changed words); added rows carry a
@@ -706,26 +683,13 @@ fn render_side_unclipped(
         SideKind::Add => (Some(theme.diff_add_bg), None),
         SideKind::Blank => (Some(theme.bg), None),
     };
-    let mut spans = vec![Span::styled(
-        gutter_text,
-        Style::default().fg(theme.line_nr).bg(theme.bg),
-    )];
-    let mut used = gutter_w + 1;
     // Blank counterparts stay empty even if pairing left stray segments.
     let segs: &[WordSeg] = match side.kind {
         SideKind::Blank => &[],
         _ => &side.segs,
     };
     if segs.is_empty() {
-        let pad = width.saturating_sub(used);
-        if pad > 0 {
-            let mut style = Style::default();
-            if let Some(bg) = bg {
-                style = style.bg(bg);
-            }
-            spans.push(Span::styled(" ".repeat(pad), style));
-        }
-        return spans;
+        return (Vec::new(), bg);
     }
     // Syntax colors for the whole line, then re-split by word-diff boundaries
     // so changed words keep their stronger wash without losing syntax fg.
@@ -742,7 +706,7 @@ fn render_side_unclipped(
     // clipped at the wrong column and the side-by-side divider shifted.
     // Columns start after the gutter so stops match terminal behavior.
     const TAB_STOP: usize = 8;
-    let mut cells: Vec<(char, (Color, Modifier), bool)> = Vec::new();
+    let mut expanded: Vec<(char, (Color, Modifier), bool)> = Vec::new();
     let mut col = gutter_w + 1;
     for (k, ch) in full_text.chars().enumerate().take(n) {
         let style = syntax_chars[k];
@@ -753,26 +717,26 @@ fn render_side_unclipped(
         if ch == '\t' {
             let spaces = TAB_STOP - (col % TAB_STOP);
             for _ in 0..spaces {
-                cells.push((' ', style, changed));
+                expanded.push((' ', style, changed));
             }
             col += spaces;
             continue;
         }
-        cells.push((ch, style, changed));
+        expanded.push((ch, style, changed));
         col += ch.width().unwrap_or(0);
     }
+    let mut cells = Vec::with_capacity(expanded.len());
     let mut idx = 0;
-    while idx < cells.len() {
-        let (fg, modifier) = cells[idx].1;
-        let changed_flag = cells[idx].2;
+    while idx < expanded.len() {
+        let (fg, modifier) = expanded[idx].1;
+        let changed_flag = expanded[idx].2;
         let mut j = idx + 1;
-        while j < cells.len()
-            && cells[j].1 == (fg, modifier)
-            && cells[j].2 == changed_flag
+        while j < expanded.len()
+            && expanded[j].1 == (fg, modifier)
+            && expanded[j].2 == changed_flag
         {
             j += 1;
         }
-        let text: String = cells[idx..j].iter().map(|c| c.0).collect();
         let mut style = Style::default().fg(fg).add_modifier(modifier);
         // Changed runs take the stronger word wash when the kind has one
         // (deletions); kinds without it (additions) keep the single line
@@ -786,21 +750,150 @@ fn render_side_unclipped(
         if matches!(side.kind, SideKind::Del | SideKind::Add) {
             style = style.add_modifier(Modifier::BOLD);
         }
-        used += text.width();
-        spans.push(Span::styled(text, style));
+        for k in idx..j {
+            cells.push((expanded[k].0, style));
+        }
         idx = j;
     }
-    // Pad to the full cell width so the wash covers the whole half-pane.
-    // Context/blank rows paint the opaque editor background.
-    let pad = width.saturating_sub(used);
-    if pad > 0 {
-        let mut style = Style::default();
-        if let Some(bg) = bg {
-            style = style.bg(bg);
+    (cells, bg)
+}
+
+/// Split styled cells into at most `WRAP_MAX_LINES` chunks of at most
+/// `content_w` cells each (wide chars never split across rows). Returns the
+/// chunks plus whether content remains past the last chunk.
+fn wrap_cells(
+    cells: &[(char, Style)],
+    content_w: usize,
+) -> (Vec<Vec<(char, Style)>>, bool) {
+    use unicode_width::UnicodeWidthChar;
+    let mut chunks: Vec<Vec<(char, Style)>> = vec![Vec::new()];
+    let mut used = 0;
+    for (ch, style) in cells.iter().copied() {
+        let w = ch.width().unwrap_or(0);
+        if used + w > content_w {
+            if chunks.len() < WRAP_MAX_LINES {
+                if w > content_w {
+                    // A single char wider than the whole row: no place for it.
+                    return (chunks, true);
+                }
+                chunks.push(Vec::new());
+                used = 0;
+            } else {
+                return (chunks, true);
+            }
         }
-        spans.push(Span::styled(" ".repeat(pad), style));
+        chunks.last_mut().expect("wrap always has a chunk").push((ch, style));
+        used += w;
+    }
+    (chunks, false)
+}
+
+/// Group consecutive same-style chars of one visual row into spans.
+fn spans_for_chunk(chunk: &[(char, Style)]) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    let mut idx = 0;
+    while idx < chunk.len() {
+        let style = chunk[idx].1;
+        let mut j = idx + 1;
+        while j < chunk.len() && chunk[j].1 == style {
+            j += 1;
+        }
+        spans.push(Span::styled(
+            chunk[idx..j].iter().map(|c| c.0).collect::<String>(),
+            style,
+        ));
+        idx = j;
     }
     spans
+}
+
+/// Render one side (gutter + text) as up to `WRAP_MAX_LINES` visual rows of
+/// exactly `width` cells each.
+/// LazyVim-style: syntax-highlighted foreground (treesitter-like colors)
+/// on a tinted diff wash, with exactly the changed words getting a
+/// stronger wash. Whole-file views are all-`Context` with no wash, so they
+/// read like a LazyVim buffer: line numbers + full syntax colors.
+///
+/// The line number shows only on the first row; continuation rows carry a
+/// blank gutter so wrapped text never masquerades as new numbered lines.
+fn render_side(
+    side: &Side,
+    path: &str,
+    width: usize,
+    gutter_w: usize,
+    theme: Theme,
+) -> Vec<Vec<Span<'static>>> {
+    use unicode_width::UnicodeWidthChar;
+    let gutter_style = Style::default().fg(theme.line_nr).bg(theme.bg);
+    let gutter_text = match side.no {
+        Some(no) => format!("{:>gutter_w$} ", no),
+        None => " ".repeat(gutter_w + 1),
+    };
+    // Degenerate pane: the gutter alone doesn't fit — clip it, no content.
+    if width <= gutter_w + 1 {
+        let mut text = String::new();
+        let mut used = 0;
+        for ch in gutter_text.chars() {
+            let w = ch.width().unwrap_or(0);
+            if used + w > width {
+                break;
+            }
+            text.push(ch);
+            used += w;
+        }
+        text.push_str(&" ".repeat(width.saturating_sub(used)));
+        return vec![vec![Span::styled(text, gutter_style)]];
+    }
+    let (cells, bg) = side_content_cells(side, path, gutter_w, theme);
+    let content_w = width - (gutter_w + 1);
+    let (mut chunks, truncated) = wrap_cells(&cells, content_w);
+    if truncated {
+        // Make room for the `…` overflow marker (1 cell) at the end of the
+        // last row, preserving wide-char boundaries.
+        let mut ellipsis_style = Style::default().fg(theme.hint);
+        if let Some(bg) = bg {
+            ellipsis_style = ellipsis_style.bg(bg);
+        }
+        let last = chunks.last_mut().expect("wrap always has a chunk");
+        let mut used: usize = last.iter().map(|(ch, _)| ch.width().unwrap_or(0)).sum();
+        while used + 1 > content_w {
+            let Some((ch, _)) = last.pop() else {
+                break;
+            };
+            used = used.saturating_sub(ch.width().unwrap_or(0));
+        }
+        last.push(('…', ellipsis_style));
+    }
+    let blank_gutter = " ".repeat(gutter_w + 1);
+    chunks
+        .into_iter()
+        .enumerate()
+        .map(|(i, chunk)| {
+            // First row carries the line number; continuation rows get a
+            // blank gutter so wrapped text never looks like new lines.
+            let mut spans = vec![Span::styled(
+                if i == 0 {
+                    gutter_text.clone()
+                } else {
+                    blank_gutter.clone()
+                },
+                gutter_style,
+            )];
+            spans.extend(spans_for_chunk(&chunk));
+            // Pad to the full cell width so the wash covers the whole pane.
+            // Context/blank rows paint the opaque editor background.
+            let used: usize = chunk.iter().map(|(ch, _)| ch.width().unwrap_or(0)).sum();
+            let pad = content_w.saturating_sub(used);
+            if pad > 0 {
+                let mut style = Style::default();
+                if let Some(bg) = bg {
+                    style = style.bg(bg);
+                }
+                spans.push(Span::styled(" ".repeat(pad), style));
+            }
+            spans
+        })
+        .collect()
 }
 
 /// Flatten highlight tokens to per-char (fg, modifier) for merging with
@@ -827,7 +920,9 @@ fn expand_changed(segs: &[WordSeg]) -> Vec<bool> {
 }
 
 /// A unified preview line: single text column with a `-`/`+` marker.
-fn unified_line(
+/// Overlong lines wrap onto a continuation row (blank marker + blank
+/// gutter) so the whole line stays visible instead of being clipped.
+fn unified_lines(
     marker: &'static str,
     marker_style: Style,
     side: &Side,
@@ -835,16 +930,19 @@ fn unified_line(
     gutter_w: usize,
     width: usize,
     theme: Theme,
-) -> Line<'static> {
-    let mut spans = vec![Span::styled(marker, marker_style)];
-    spans.extend(render_side(
-        side,
-        path,
-        width.saturating_sub(2),
-        gutter_w,
-        theme,
-    ));
-    Line::from(spans)
+) -> Vec<Line<'static>> {
+    render_side(side, path, width.saturating_sub(2), gutter_w, theme)
+        .into_iter()
+        .enumerate()
+        .map(|(i, spans)| {
+            let mut out = vec![Span::styled(
+                if i == 0 { marker } else { "  " },
+                marker_style,
+            )];
+            out.extend(spans);
+            Line::from(out)
+        })
+        .collect()
 }
 
 /// How many unified lines a row expands to (headers count as one).
@@ -861,22 +959,26 @@ fn unified_row_count(row: &DiffRow) -> usize {
     }
 }
 
-/// Render one DiffRow into 0-2 unified lines (syntax-highlighted).
+/// Render one DiffRow into logical lines, each expanded to 1-2 visual
+/// rows (syntax-highlighted). The outer vec is per logical line (headers
+/// count as one); the inner vec holds that line's visual rows after
+/// soft-wrapping. Scroll offsets count logical lines; the viewport fills
+/// with visual rows.
 fn render_unified_row(
     diff: &FileDiff,
     row: &DiffRow,
     gutter_w: usize,
     width: usize,
     theme: Theme,
-) -> Vec<Line<'static>> {
+) -> Vec<Vec<Line<'static>>> {
     let path = diff.path.as_str();
     match row {
-        DiffRow::Header { index } => vec![Line::from(vec![Span::styled(
+        DiffRow::Header { index } => vec![vec![Line::from(vec![Span::styled(
             format!("  {}", diff.hunks[*index].header),
             Style::default().fg(theme.hint),
-        )])],
+        )])]],
         DiffRow::Split { left, right } => match (&left.kind, &right.kind) {
-            (SideKind::Context, _) => vec![unified_line(
+            (SideKind::Context, _) => vec![unified_lines(
                 "  ",
                 Style::default(),
                 left,
@@ -886,7 +988,7 @@ fn render_unified_row(
                 theme,
             )],
             (SideKind::Del, SideKind::Add) => vec![
-                unified_line(
+                unified_lines(
                     "- ",
                     Style::default()
                         .fg(theme.conflicted)
@@ -897,7 +999,7 @@ fn render_unified_row(
                     width,
                     theme,
                 ),
-                unified_line(
+                unified_lines(
                     "+ ",
                     Style::default()
                         .fg(theme.staged)
@@ -909,7 +1011,7 @@ fn render_unified_row(
                     theme,
                 ),
             ],
-            (SideKind::Del, _) => vec![unified_line(
+            (SideKind::Del, _) => vec![unified_lines(
                 "- ",
                 Style::default()
                     .fg(theme.conflicted)
@@ -920,7 +1022,7 @@ fn render_unified_row(
                 width,
                 theme,
             )],
-            (_, SideKind::Add) => vec![unified_line(
+            (_, SideKind::Add) => vec![unified_lines(
                 "+ ",
                 Style::default()
                     .fg(theme.staged)
@@ -937,36 +1039,36 @@ fn render_unified_row(
 }
 
 /// Flatten side-by-side rows into single-column unified lines for the
-/// inline preview: context stays one line, del/add pairs become two.
-/// Only the visible window (`skip`, `take`) is syntax-highlighted so
+/// inline preview: context stays one logical line, del/add pairs become
+/// two. `skip` counts logical lines (stable scroll units); the viewport
+/// fills with visual rows so wrapped lines stay fully visible.
+/// Takes precomputed `rows` (cached in `App`) so no word diffs rerun;
+/// only the visible window (`skip`, `take`) is syntax-highlighted so
 /// opening a large file stays fast.
 fn render_unified_lines(
     diff: &FileDiff,
+    rows: &[DiffRow],
     theme: Theme,
     width: usize,
     skip: usize,
     take: usize,
 ) -> (Vec<Line<'static>>, usize) {
-    let rows = diff_rows(diff);
-    let gutter_w = gutter_width(&rows);
-    let total: usize = rows.iter().map(unified_row_count).sum();
+    let gutter_w = gutter_width(rows);
+    let total: usize = rows_unified_len(rows);
     let mut out = Vec::new();
-    let mut idx = 0;
-    for row in &rows {
-        for line in render_unified_row(diff, row, gutter_w, width, theme) {
-            if idx >= skip && out.len() < take {
-                out.push(line);
-            } else if idx >= skip + take {
-                // Still need `total` (computed above); skip highlighting rest
-                // by breaking early — but `render_unified_row` already ran for
-                // this row; remaining rows are untouched.
-                // Fall through to fast count: total already known.
+    let mut logical = 0;
+    'rows: for row in rows {
+        for visual in render_unified_row(diff, row, gutter_w, width, theme) {
+            if logical < skip {
+                logical += 1;
+                continue;
             }
-            idx += 1;
-            if idx >= skip + take && out.len() >= take {
-                // No more visible lines; stop highlighting further rows.
-                // Total was precomputed, so we can return early.
-                return (out, total);
+            logical += 1;
+            for vline in visual {
+                if out.len() >= take {
+                    break 'rows;
+                }
+                out.push(vline);
             }
         }
     }
@@ -1010,8 +1112,9 @@ fn render_diff_preview_panel(frame: &mut Frame, area: Rect, app: &App) {
     }
     let inner_w = area.width.saturating_sub(2) as usize;
     let inner_h = area.height.saturating_sub(2) as usize;
-    // Total (cheap, no highlighting) for the "more lines" hint…
-    let total: usize = diff_unified_len(diff);
+    // Total over cached rows (cheap, no highlighting) for the "more lines" hint…
+    let rows = app.diff_rows();
+    let total: usize = rows_unified_len(rows);
     let off = (app.diff_scroll() as usize).min(total);
     // …then highlight only the visible window so large files stay fast.
     let take = if total.saturating_sub(off) > inner_h && inner_h > 0 {
@@ -1019,7 +1122,7 @@ fn render_diff_preview_panel(frame: &mut Frame, area: Rect, app: &App) {
     } else {
         inner_h
     };
-    let (mut shown, _) = render_unified_lines(diff, theme, inner_w, off, take.max(1));
+    let (mut shown, _) = render_unified_lines(diff, rows, theme, inner_w, off, take.max(1));
     let remaining = total.saturating_sub(off + shown.len());
     if remaining > 0 && !shown.is_empty() {
         shown.push(Line::from(vec![Span::styled(
@@ -1076,18 +1179,27 @@ fn render_diff_pane(frame: &mut Frame, area: Rect, app: &App) {
         );
         return;
     }
-    // One Line per row: left half + divider + right half, so both panes
-    // scroll together under a single scroll offset. Only the visible window
-    // is syntax-highlighted (large whole-file views stay fast).
+    // One visual row per wrapped line: left half + divider + right half,
+    // so both panes scroll together under a single scroll offset. Overlong
+    // code lines soft-wrap onto a continuation row (blank gutters) instead
+    // of being clipped. Only the visible window is syntax-highlighted
+    // (large whole-file views stay fast).
     let inner = area.width.saturating_sub(2) as usize;
     let inner_h = area.height.saturating_sub(2) as usize;
     let half = inner.saturating_sub(1) / 2;
-    let rows = diff_rows(diff);
-    let gutter_w = gutter_width(&rows);
+    let right_w = inner.saturating_sub(half + 1);
+    // Rows are cached in `App` when the diff arrives: scrolling/highlighting
+    // per frame must not rerun the word diffs over the whole diff.
+    let rows = app.diff_rows();
+    let gutter_w = gutter_width(rows);
     let off = (app.diff_scroll() as usize).min(rows.len());
     let path = diff.path.as_str();
+    let divider_style = Style::default().fg(theme.line_nr).bg(theme.bg);
     let mut lines: Vec<Line<'static>> = Vec::with_capacity(inner_h);
-    for row in rows.iter().skip(off).take(inner_h.max(1)) {
+    'rows: for row in rows.iter().skip(off) {
+        if lines.len() >= inner_h {
+            break;
+        }
         match row {
             DiffRow::Header { index } => {
                 let selected = *index == app.hunk();
@@ -1112,29 +1224,59 @@ fn render_diff_pane(frame: &mut Frame, area: Rect, app: &App) {
                 // painted once, full width — never mirrored into both halves.
                 if app.diff_whole_file() {
                     if left.kind == SideKind::Context {
-                        lines.push(Line::from(render_side(left, path, inner, gutter_w, theme)));
+                        for spans in render_side(left, path, inner, gutter_w, theme) {
+                            if lines.len() >= inner_h {
+                                break 'rows;
+                            }
+                            lines.push(Line::from(spans));
+                        }
                     } else {
                         // Defensive (production whole-file diffs are all
                         // context): stack old/new full-width so no side is
                         // silently dropped.
-                        lines.push(Line::from(render_side(left, path, inner, gutter_w, theme)));
-                        lines.push(Line::from(render_side(right, path, inner, gutter_w, theme)));
+                        for side in [left, right] {
+                            for spans in render_side(side, path, inner, gutter_w, theme) {
+                                if lines.len() >= inner_h {
+                                    break 'rows;
+                                }
+                                lines.push(Line::from(spans));
+                            }
+                        }
                     }
                     continue;
                 }
-                let mut spans = render_side(left, path, half, gutter_w, theme);
-                spans.push(Span::styled(
-                    "│",
-                    Style::default().fg(theme.line_nr).bg(theme.bg),
-                ));
-                spans.extend(render_side(
-                    right,
-                    path,
-                    inner.saturating_sub(half + 1),
-                    gutter_w,
-                    theme,
-                ));
-                lines.push(Line::from(spans));
+                let left_rows = render_side(left, path, half, gutter_w, theme);
+                let right_rows = render_side(right, path, right_w, gutter_w, theme);
+                // The shorter half is padded with blank washed rows so the
+                // divider stays aligned across the wrapped height.
+                let height = left_rows.len().max(right_rows.len()).max(1);
+                let blank_left =
+                    render_side(&blank_side(left), path, half, gutter_w, theme)
+                        .into_iter()
+                        .next()
+                        .unwrap_or_default();
+                let blank_right =
+                    render_side(&blank_side(right), path, right_w, gutter_w, theme)
+                        .into_iter()
+                        .next()
+                        .unwrap_or_default();
+                for i in 0..height {
+                    if lines.len() >= inner_h {
+                        break 'rows;
+                    }
+                    let mut spans = left_rows
+                        .get(i)
+                        .cloned()
+                        .unwrap_or_else(|| blank_left.clone());
+                    spans.push(Span::styled("│", divider_style));
+                    spans.extend(
+                        right_rows
+                            .get(i)
+                            .cloned()
+                            .unwrap_or_else(|| blank_right.clone()),
+                    );
+                    lines.push(Line::from(spans));
+                }
             }
         }
     }
@@ -1212,7 +1354,7 @@ fn footer_hints(app: &App, theme: Theme, multi: bool) -> Paragraph<'static> {
         Mode::FindFile => "type to filter · ↑/↓ move · ←/→ edit · enter open · esc cancel",
         Mode::LlmSettings => "tab/↑↓ switch field · ←/→ edit · enter save · esc cancel",
         Mode::OpenProject => {
-            "type to filter · ↑/↓ move · enter open · → descend · ← up · tab jump to path · esc clear/close"
+            "type to filter · ↑/↓ move · enter open/descend · → descend · ← up · tab jump to path · esc clear/close"
         }
         Mode::ConfirmInit => "enter git init here · esc back · any other key picks another folder",
         Mode::Normal => {
@@ -2193,19 +2335,20 @@ mod tests {
             }],
             kind: SideKind::Context,
         };
-        let spans = render_side(&side, "main.rs", 40, 4, Theme::tokyo_night());
-        let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        let rows = render_side(&side, "main.rs", 40, 4, Theme::tokyo_night());
+        assert_eq!(rows.len(), 1, "short line must stay on one row");
+        let text: String = rows[0].iter().map(|s| s.content.as_ref()).collect();
         assert!(!text.contains('\t'), "raw tab leaks into rendering: {text:?}");
         // Gutter is "   1 " (5 cells); the tab jumps to stop 8: 3 spaces.
         assert!(
             text.starts_with("   1    fn main() {}"),
             "tab must expand to the next stop, got: {text:?}"
         );
-        assert_eq!(spans.iter().map(Span::width).sum::<usize>(), 40);
+        assert_eq!(rows[0].iter().map(Span::width).sum::<usize>(), 40);
     }
 
     #[test]
-    fn long_tabbed_lines_clip_to_exact_width() {
+    fn long_tabbed_lines_wrap_to_two_exact_width_rows() {
         let side = Side {
             no: Some(1),
             segs: vec![WordSeg {
@@ -2215,15 +2358,25 @@ mod tests {
             kind: SideKind::Context,
         };
         for width in [10, 20, 40] {
-            let spans = render_side(&side, "main.rs", width, 4, Theme::tokyo_night());
-            let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
-            assert!(!text.contains('\t'), "raw tab leaks into rendering: {text:?}");
-            assert_eq!(spans.iter().map(Span::width).sum::<usize>(), width);
+            let rows = render_side(&side, "main.rs", width, 4, Theme::tokyo_night());
+            assert_eq!(rows.len(), 2, "overlong line must wrap, width {width}");
+            for (i, spans) in rows.iter().enumerate() {
+                let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
+                assert!(!text.contains('\t'), "raw tab leaks into rendering: {text:?}");
+                assert_eq!(
+                    spans.iter().map(Span::width).sum::<usize>(),
+                    width,
+                    "row {i} must fill the pane, width {width}"
+                );
+            }
+            // Still more content past two rows: the tail is cut with `…`.
+            let tail: String = rows[1].iter().map(|s| s.content.as_ref()).collect();
+            assert!(tail.ends_with('…'), "overflow must be marked, got: {tail:?}");
         }
     }
 
     #[test]
-    fn split_sides_clip_long_unicode_lines_to_their_width() {
+    fn split_sides_wrap_long_unicode_lines_to_their_width() {
         let side = Side {
             no: Some(1),
             segs: vec![WordSeg {
@@ -2233,9 +2386,55 @@ mod tests {
             kind: SideKind::Del,
         };
         for width in [0, 2, 6, 20, 31] {
-            let spans = render_side(&side, "a.rs", width, 4, Theme::tokyo_night());
-            assert_eq!(spans.iter().map(Span::width).sum::<usize>(), width);
+            let rows = render_side(&side, "a.rs", width, 4, Theme::tokyo_night());
+            assert!(rows.len() <= 2, "at most two visual rows, width {width}");
+            for (i, spans) in rows.iter().enumerate() {
+                assert_eq!(
+                    spans.iter().map(Span::width).sum::<usize>(),
+                    width,
+                    "row {i} must fill the pane, width {width}"
+                );
+            }
         }
+    }
+
+    #[test]
+    fn wrapped_continuation_row_keeps_blank_gutter() {
+        let side = Side {
+            no: Some(42),
+            segs: vec![WordSeg {
+                text: "x".repeat(100),
+                changed: false,
+            }],
+            kind: SideKind::Context,
+        };
+        let rows = render_side(&side, "a.txt", 40, 4, Theme::tokyo_night());
+        assert_eq!(rows.len(), 2);
+        let first: String = rows[0].iter().map(|s| s.content.as_ref()).collect();
+        let second: String = rows[1].iter().map(|s| s.content.as_ref()).collect();
+        // Line number only on the first row: gutter is 4 + 1 cells.
+        assert!(first.starts_with("  42 "), "number missing: {first:?}");
+        assert!(
+            second.starts_with("     "),
+            "continuation gutter must be blank: {second:?}"
+        );
+        assert!(!second.contains("42"), "number must not repeat: {second:?}");
+    }
+
+    #[test]
+    fn short_lines_stay_on_a_single_row_without_ellipsis() {
+        let side = Side {
+            no: Some(7),
+            segs: vec![WordSeg {
+                text: "hello".into(),
+                changed: false,
+            }],
+            kind: SideKind::Context,
+        };
+        let rows = render_side(&side, "a.txt", 40, 4, Theme::tokyo_night());
+        assert_eq!(rows.len(), 1);
+        let text: String = rows[0].iter().map(|s| s.content.as_ref()).collect();
+        assert!(!text.contains('…'), "short line must not be marked: {text:?}");
     }
 
     #[test]
@@ -2250,8 +2449,9 @@ mod tests {
                     }],
                     kind,
                 };
-                let spans = render_side(&side, "main.rs", 40, 4, theme);
-                let keyword = spans.iter().find(|s| s.content == "fn").unwrap();
+                let rows = render_side(&side, "main.rs", 40, 4, theme);
+                assert_eq!(rows.len(), 1, "short line must stay on one row");
+                let keyword = rows[0].iter().find(|s| s.content == "fn").unwrap();
                 let Color::Rgb(r, g, b) = keyword.style.bg.unwrap() else {
                     panic!("RGB wash required")
                 };
@@ -2453,6 +2653,56 @@ mod tests {
         assert!(s.contains("unstaged"), "staged label missing:\n{s}");
     }
 
+    /// A diff with one very long changed line: the marker sits past the
+    /// old clipping point but within the two-row wrap budget.
+    /// `pad` is the marker's cell offset into the line.
+    fn long_line_diff(pad: usize) -> git_tui_core::diff::FileDiff {
+        use git_tui_core::diff::{DiffLine, Hunk, LineKind};
+        git_tui_core::diff::FileDiff {
+            path: "a.txt".into(),
+            hunks: vec![Hunk {
+                header: "@@ -1,1 +1,1 @@".into(),
+                old_start: 1,
+                new_start: 1,
+                lines: vec![
+                    DiffLine {
+                        kind: LineKind::Del,
+                        text: format!("{}VISIBLE{}", "x".repeat(pad), "y".repeat(100)),
+                    },
+                    DiffLine {
+                        kind: LineKind::Add,
+                        text: format!("{}VISIBLE{}", "x".repeat(pad), "z".repeat(100)),
+                    },
+                ],
+            }],
+        }
+    }
+
+    #[test]
+    fn fullscreen_long_line_wraps_instead_of_clipping() {
+        use crossterm::event::KeyCode;
+        let (_dir, mut app) = with_files(&[("a.txt", FileState::Unstaged)]);
+        app.set_diff_for_test(long_line_diff(30), false);
+        app.on_key(KeyCode::Enter);
+        assert_eq!(app.mode(), Mode::FullDiff);
+        let s = screen(&app, 70, 14);
+        // Each half-pane fits ~28 content cells; "VISIBLE" starts at cell
+        // 30, so clipping would hide it while wrapping shows it.
+        assert!(s.contains("VISIBLE"), "wrapped tail missing:\n{s}");
+        assert!(s.contains("│"), "divider missing:\n{s}");
+    }
+
+    #[test]
+    fn preview_long_line_wraps_instead_of_clipping() {
+        let (_dir, mut app) = with_files(&[("a.txt", FileState::Unstaged)]);
+        app.set_diff_for_test(long_line_diff(65), false);
+        let s = screen(&app, 100, 32);
+        // The inline preview fits ~61 content cells per row; "VISIBLE"
+        // starts at cell 65, so clipping would hide it while the wrapped
+        // continuation row shows it.
+        assert!(s.contains("VISIBLE"), "wrapped tail missing:\n{s}");
+    }
+
     #[test]
     fn diff_rows_pair_old_and_new_numbers() {
         use git_tui_core::diff::{DiffLine, FileDiff, Hunk, LineKind};
@@ -2524,11 +2774,12 @@ mod tests {
     #[test]
     fn hunk_start_row_counts_header_and_paired_rows() {
         let diff = sample_diff();
-        assert_eq!(hunk_start_row(&diff, 0), 0);
+        let rows = diff_rows(&diff);
+        assert_eq!(rows_hunk_start(&rows, 0), 0);
         // Hunk 0 = header + context row + one paired del/add row.
-        assert_eq!(hunk_start_row(&diff, 1), 3);
+        assert_eq!(rows_hunk_start(&rows, 1), 3);
         // Unknown hunk falls back to the top.
-        assert_eq!(hunk_start_row(&diff, 9), 0);
+        assert_eq!(rows_hunk_start(&rows, 9), 0);
     }
 
     #[test]
