@@ -587,6 +587,26 @@ pub(crate) fn file_rows(files: &[StatusEntry]) -> Vec<FileRow<'_>> {
     rows
 }
 
+/// The rows the files panel shows: the tree minus everything folded under
+/// a collapsed dir (the collapsed header itself stays, drawn as `▶`).
+/// `App` navigation walks this same list, so the cursor and the
+/// highlight always agree.
+pub(crate) fn visible_file_rows(
+    files: &[StatusEntry],
+    is_collapsed: impl Fn(&str) -> bool,
+) -> Vec<FileRow<'_>> {
+    file_rows(files)
+        .into_iter()
+        .filter(|row| {
+            let path: &str = match row {
+                FileRow::Dir { path, .. } => path,
+                FileRow::File { index, .. } => files[*index].path.as_str(),
+            };
+            !ancestors(path).iter().any(|a| is_collapsed(a))
+        })
+        .collect()
+}
+
 fn render_files_panel(frame: &mut Frame, area: Rect, app: &App) {
     if area.is_empty() {
         return;
@@ -615,39 +635,29 @@ fn render_files_panel(frame: &mut Frame, area: Rect, app: &App) {
         );
         return;
     }
-    let rows = file_rows(files);
-    // Fold collapsed subtrees: drop every row hiding under a collapsed
-    // dir, but keep the collapsed header itself (rendered as `▶`).
-    let rows: Vec<&FileRow> = rows
-        .iter()
-        .filter(|row| {
-            let r: &FileRow = row;
-            let path: &str = match r {
-                FileRow::Dir { path, .. } => path,
-                FileRow::File { index, .. } => files[*index].path.as_str(),
-            };
-            !ancestors(path).iter().any(|a| app.is_collapsed(a))
-        })
-        .collect();
+    let rows = visible_file_rows(files, |d| app.is_collapsed(d));
     let sel = app.selected().min(files.len() - 1);
-    // The selected file's own row, or — when it is hidden inside a
-    // collapsed dir — its shallowest collapsed ancestor header, which
-    // is always visible (its own ancestors are all expanded).
-    let sel_row = rows
-        .iter()
-        .position(|row| {
-            let r: &FileRow = row;
-            matches!(r, FileRow::File { index, .. } if *index == sel)
+    // The open folder header the cursor sits on; else the selected file's
+    // own row, or — when it is hidden inside a collapsed dir — its
+    // shallowest collapsed ancestor header, which is always visible (its
+    // own ancestors are all expanded).
+    let sel_row = app
+        .cursor_dir()
+        .and_then(|dir| {
+            rows.iter()
+                .position(|r| matches!(r, FileRow::Dir { path, .. } if *path == dir))
+        })
+        .or_else(|| {
+            rows.iter()
+                .position(|r| matches!(r, FileRow::File { index, .. } if *index == sel))
         })
         .or_else(|| {
             ancestors(files[sel].path.as_str())
                 .into_iter()
                 .find(|a| app.is_collapsed(a))
                 .and_then(|header| {
-                    rows.iter().position(|row| {
-                        let r: &FileRow = row;
-                        matches!(r, FileRow::Dir { path, .. } if *path == header)
-                    })
+                    rows.iter()
+                        .position(|r| matches!(r, FileRow::Dir { path, .. } if *path == header))
                 })
         })
         .unwrap_or(0);
@@ -855,6 +865,30 @@ fn cursor_side_is_right(_left: &Side, right: &Side) -> bool {
     matches!(right.kind, SideKind::Add | SideKind::Context)
 }
 
+/// Body for a diff with no hunks. Binary files get an explicit notice
+/// (their bytes are never drawn); anything else has nothing to show.
+fn empty_diff_text(diff: &FileDiff) -> &'static str {
+    if diff.binary {
+        "Binary file — content not shown"
+    } else {
+        "(no changes)"
+    }
+}
+
+/// Visible stand-in for a control character (C0, DEL, C1). Printed raw,
+/// these bytes are terminal commands (cursor moves, clears, colors) that
+/// corrupt the screen long after the line scrolls away, so they are drawn
+/// as their Unicode "control picture" (`␛`, `␀`, …) one cell wide.
+/// Tabs and carriage returns are handled by the callers first.
+fn control_picture(ch: char) -> Option<char> {
+    match ch as u32 {
+        c @ 0x00..=0x1f => char::from_u32(0x2400 + c),
+        0x7f => Some('␡'),
+        0x80..=0x9f => Some('�'),
+        _ => None,
+    }
+}
+
 /// Map a logical char index into screen cells, expanding tabs exactly
 /// like [`side_content_cells`] (stops every 8 past the gutter) and
 /// counting wide chars double, so the block cursor lands on the cell the
@@ -876,6 +910,7 @@ fn expanded_col(text: &str, col: usize, gutter_w: usize) -> usize {
             used += spaces;
             cells += spaces;
         } else {
+            let ch = control_picture(ch).unwrap_or(ch);
             let w = ch.width().unwrap_or(0);
             used += w;
             cells += w;
@@ -972,6 +1007,7 @@ fn side_content_cells(
             col += spaces;
             continue;
         }
+        let ch = control_picture(ch).unwrap_or(ch);
         expanded.push((ch, style, changed));
         col += ch.width().unwrap_or(0);
     }
@@ -1514,7 +1550,7 @@ fn render_diff_preview_panel(frame: &mut Frame, area: Rect, app: &App) {
     };
     if diff.hunks.is_empty() {
         frame.render_widget(
-            Paragraph::new("(no changes)").block(panel_block(focused, theme, title)),
+            Paragraph::new(empty_diff_text(diff)).block(panel_block(focused, theme, title)),
             area,
         );
         return;
@@ -1616,7 +1652,7 @@ fn render_diff_pane(frame: &mut Frame, area: Rect, app: &App) {
     };
     if diff.hunks.is_empty() {
         frame.render_widget(
-            Paragraph::new("(no changes)").block(panel_block(true, theme, title)),
+            Paragraph::new(empty_diff_text(diff)).block(panel_block(true, theme, title)),
             area,
         );
         return;
@@ -1916,7 +1952,7 @@ fn footer_hints(app: &App, theme: Theme, multi: bool) -> Paragraph<'static> {
         }
         Mode::ConfirmInit => "enter git init here · esc back · any other key picks another folder",
         Mode::Normal => {
-            "space stage · ▶ dir all · c commit · A llm · m preview · p pull · P push · / find · enter diff · Shift+→/5 file · o open · r refresh · q close · Q quit"
+            "space stage file/dir · c commit · A llm · m preview · p pull · P push · / find · enter diff · Shift+→/5 file · o open · r refresh · q close · Q quit"
         }
     };
     let switch = if multi && app.mode() == Mode::Normal {
@@ -2860,6 +2896,27 @@ mod tests {
     }
 
     #[test]
+    fn open_folder_header_takes_the_highlight() {
+        use crossterm::event::KeyCode;
+        let (_dir, mut app) = with_files(&[
+            ("src/a.rs", FileState::Unstaged),
+            ("src/nested/b.rs", FileState::Unstaged),
+        ]);
+        app.on_key(KeyCode::Down);
+        assert_eq!(app.cursor_dir(), Some("src/nested"));
+        let s = screen(&app, 100, 32);
+        let row = |needle: &str| s.lines().find(|l| l.contains(needle)).unwrap().to_string();
+        assert!(
+            row("▼ nested/").contains('>'),
+            "header not highlighted:\n{s}"
+        );
+        assert!(
+            !row("b.rs").contains('>'),
+            "file row must not be highlighted:\n{s}"
+        );
+    }
+
+    #[test]
     fn collapsed_dir_hides_its_children_and_shows_folded_marker() {
         let (_dir, mut app) = with_files(&[
             ("src/a.rs", FileState::Unstaged),
@@ -3330,6 +3387,7 @@ mod tests {
         use git_tui_core::diff::{DiffLine, Hunk, LineKind};
         git_tui_core::diff::FileDiff {
             path: "a.txt".into(),
+            binary: false,
             hunks: vec![
                 Hunk {
                     header: "@@ -1,3 +1,3 @@".into(),
@@ -3375,6 +3433,7 @@ mod tests {
         use git_tui_core::diff::{DiffLine, Hunk, LineKind};
         git_tui_core::diff::FileDiff {
             path: "a.txt".into(),
+            binary: false,
             hunks: vec![Hunk {
                 header: "@@ -1,2 +1,2 @@".into(),
                 old_start: 1,
@@ -3415,6 +3474,7 @@ mod tests {
         use git_tui_core::diff::{DiffLine, Hunk, LineKind};
         git_tui_core::diff::FileDiff {
             path: "a.txt".into(),
+            binary: false,
             hunks: vec![Hunk {
                 header: "@@ -1,1 +1,1 @@".into(),
                 old_start: 1,
@@ -3463,6 +3523,7 @@ mod tests {
         use git_tui_core::diff::{DiffLine, FileDiff, Hunk, LineKind};
         let diff = FileDiff {
             path: "a.txt".into(),
+            binary: false,
             hunks: vec![Hunk {
                 header: "@@ -10,3 +20,3 @@".into(),
                 old_start: 10,
@@ -3826,6 +3887,7 @@ mod tests {
         use git_tui_core::diff::{DiffLine, FileDiff, Hunk, LineKind};
         let diff = FileDiff {
             path: "a.txt".into(),
+            binary: false,
             hunks: vec![
                 Hunk {
                     header: "@@ -1,1 +1,1 @@".into(),
@@ -3969,6 +4031,71 @@ mod tests {
         let s = screen(&app, 100, 32);
         assert!(s.contains("Full file"), "whole-file title missing:\n{s}");
         assert!(s.contains("a.txt"), "filename missing:\n{s}");
+    }
+
+    #[test]
+    fn control_bytes_in_diff_text_never_reach_the_terminal() {
+        use crossterm::event::KeyCode;
+        use git_tui_core::diff::{DiffLine, FileDiff, Hunk, LineKind};
+        let (_dir, mut app) = with_files(&[("a.txt", FileState::Unstaged)]);
+        let line = |kind, text: &str| DiffLine {
+            kind,
+            text: text.into(),
+        };
+        app.set_diff_for_test(
+            FileDiff {
+                path: "a.txt".into(),
+                binary: false,
+                hunks: vec![Hunk {
+                    header: "@@ -1,1 +1,1 @@".into(),
+                    old_start: 1,
+                    new_start: 1,
+                    lines: vec![
+                        line(LineKind::Del, "plain"),
+                        line(LineKind::Add, "x\u{1b}[2Jy\u{0}z\u{7f}w\u{9b}"),
+                    ],
+                }],
+            },
+            false,
+        );
+        let check = |app: &App, view: &str| {
+            let buf = render_buf(app, 100, 32);
+            let mut all = String::new();
+            for cell in buf.content() {
+                all.push_str(cell.symbol());
+            }
+            assert!(
+                !all.chars().any(|c| c.is_control()),
+                "{view}: control char reached the buffer"
+            );
+            for pic in ['␛', '␀', '␡'] {
+                assert!(all.contains(pic), "{view}: missing {pic}");
+            }
+        };
+        check(&app, "inline");
+        app.on_key(KeyCode::Enter);
+        assert_eq!(app.mode(), Mode::FullDiff);
+        check(&app, "fullscreen");
+    }
+
+    #[test]
+    fn binary_diff_shows_notice_not_bytes() {
+        use git_tui_core::diff::FileDiff;
+        let (_dir, mut app) = with_files(&[("a.txt", FileState::Unstaged)]);
+        app.set_diff_for_test(
+            FileDiff {
+                path: "a.txt".into(),
+                hunks: Vec::new(),
+                binary: true,
+            },
+            false,
+        );
+        let s = screen(&app, 100, 32);
+        assert!(s.contains("Binary file"), "notice missing:\n{s}");
+        assert!(
+            !s.contains("(no changes)"),
+            "binary is not 'no changes':\n{s}"
+        );
     }
 
     #[test]
@@ -4139,6 +4266,7 @@ mod tests {
         use git_tui_core::diff::{DiffLine, Hunk, LineKind};
         git_tui_core::diff::FileDiff {
             path: "main.rs".into(),
+            binary: false,
             hunks: vec![Hunk {
                 header: "@@ -1,3 +1,3 @@".into(),
                 old_start: 1,

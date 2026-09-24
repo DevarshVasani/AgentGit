@@ -129,9 +129,14 @@ pub fn staged_context(repo: &git2::Repository) -> Result<Vec<StagedFile>, GitErr
         let diff = diff::staged_diff(repo, &entry.path).unwrap_or(FileDiff {
             path: entry.path.clone(),
             hunks: Vec::new(),
+            binary: false,
         });
         let (added, removed) = count_lines(&diff);
-        let mut unified = render_unified(&diff);
+        let mut unified = if diff.binary {
+            "(binary file; content not shown)".to_string()
+        } else {
+            render_unified(&diff)
+        };
         if unified.len() > MAX_FILE_CHARS {
             unified.truncate(MAX_FILE_CHARS);
             unified.push_str("\n…(truncated)");

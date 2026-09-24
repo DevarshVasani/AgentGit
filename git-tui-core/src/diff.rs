@@ -9,6 +9,23 @@ use std::path::Path;
 pub struct FileDiff {
     pub path: String,
     pub hunks: Vec<Hunk>,
+    /// Binary content: `hunks` is empty and the UI shows a placeholder
+    /// instead of the raw bytes (which would corrupt the terminal).
+    pub binary: bool,
+}
+
+/// Git's heuristic: a NUL byte in the first 8000 bytes means binary.
+fn is_binary(bytes: &[u8]) -> bool {
+    bytes.iter().take(8000).any(|&b| b == 0)
+}
+
+/// Placeholder diff for a binary file: no hunks, `binary` set.
+fn binary_diff(path: &str) -> FileDiff {
+    FileDiff {
+        path: path.to_string(),
+        hunks: Vec::new(),
+        binary: true,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -40,8 +57,8 @@ pub enum LineKind {
 /// Whole file content as a single all-context hunk, for viewing files
 /// with no changes (clean files have empty staged/unstaged diffs).
 /// Reads the workdir file; a clean file is identical to HEAD by definition.
-/// Non-UTF-8 bytes are shown lossily so binary files render instead of
-/// erroring.
+/// Binary files come back as [`binary_diff`]; other non-UTF-8 bytes are
+/// shown lossily.
 pub fn whole_file_diff(repo: &git2::Repository, path: &str) -> Result<FileDiff, GitError> {
     let full = repo
         .workdir()
@@ -49,6 +66,9 @@ pub fn whole_file_diff(repo: &git2::Repository, path: &str) -> Result<FileDiff, 
         .join(Path::new(path));
     let bytes = std::fs::read(&full)
         .map_err(|e| GitError::HunkStaging(format!("cannot read {path}: {e}")))?;
+    if is_binary(&bytes) {
+        return Ok(binary_diff(path));
+    }
     let contents = String::from_utf8_lossy(&bytes);
     let lines = contents
         .lines()
@@ -66,6 +86,7 @@ pub fn whole_file_diff(repo: &git2::Repository, path: &str) -> Result<FileDiff, 
             new_start: 1,
             lines,
         }],
+        binary: false,
     })
 }
 
@@ -144,6 +165,9 @@ fn untracked_file_diff(repo: &git2::Repository, path: &str) -> Result<FileDiff, 
         .join(Path::new(path));
     let bytes = std::fs::read(&full)
         .map_err(|e| GitError::HunkStaging(format!("cannot read untracked file {path}: {e}")))?;
+    if is_binary(&bytes) {
+        return Ok(binary_diff(path));
+    }
     let contents = String::from_utf8_lossy(&bytes);
     let lines = contents
         .lines()
@@ -160,6 +184,7 @@ fn untracked_file_diff(repo: &git2::Repository, path: &str) -> Result<FileDiff, 
             new_start: 1,
             lines,
         }],
+        binary: false,
     })
 }
 
@@ -176,9 +201,18 @@ fn from_diff(diff: &git2::Diff, path: &str) -> Result<FileDiff, GitError> {
     )?;
     // Real collection pass: hunk_cb gives us the header bytes.
     let err: RefCell<Option<git2::Error>> = RefCell::new(None);
+    let binary = std::cell::Cell::new(false);
     let res = diff.foreach(
-        &mut |_, _| true,
-        None,
+        &mut |delta, _| {
+            if delta.flags().is_binary() {
+                binary.set(true);
+            }
+            true
+        },
+        Some(&mut |_, _| {
+            binary.set(true);
+            true
+        }),
         Some(&mut |_, hunk| {
             let header = String::from_utf8_lossy(hunk.header()).into_owned();
             hunks.borrow_mut().push(Hunk {
@@ -216,9 +250,13 @@ fn from_diff(diff: &git2::Diff, path: &str) -> Result<FileDiff, GitError> {
         }),
     );
     res?;
+    if binary.get() {
+        return Ok(binary_diff(path));
+    }
     Ok(FileDiff {
         path: path.to_string(),
         hunks: hunks.into_inner(),
+        binary: false,
     })
 }
 
@@ -400,5 +438,57 @@ mod tests {
         assert!(d.hunks[0].lines.iter().all(|l| l.kind == LineKind::Context));
         assert_eq!(d.hunks[0].lines.len(), 1);
         assert!(d.hunks[0].lines[0].text.contains('a'));
+    }
+
+    /// PNG-like bytes: header, a NUL, and an ESC that would drive the
+    /// terminal if it were ever printed.
+    const PNG_BYTES: &[u8] = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR\x1b[2J";
+
+    #[test]
+    fn untracked_binary_file_is_flagged_not_rendered() {
+        let (_dir, repo) = testutil::init_repo();
+        testutil::commit_file(&repo, "a.txt", "a\n", "init");
+        fs::write(repo.workdir().unwrap().join("img.png"), PNG_BYTES).unwrap();
+        let d = unstaged_diff(&repo, "img.png").unwrap();
+        assert!(d.binary);
+        assert!(d.hunks.is_empty());
+    }
+
+    #[test]
+    fn staged_and_modified_binary_files_are_flagged() {
+        let (_dir, repo) = testutil::init_repo();
+        testutil::commit_file(&repo, "a.txt", "a\n", "init");
+        let path = repo.workdir().unwrap().join("img.png");
+        fs::write(&path, PNG_BYTES).unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new("img.png")).unwrap();
+        index.write().unwrap();
+        let staged = staged_diff(&repo, "img.png").unwrap();
+        assert!(staged.binary, "staged new binary must be flagged");
+        assert!(staged.hunks.is_empty());
+        // Change it again in the workdir: index-vs-workdir is binary too.
+        fs::write(&path, [PNG_BYTES, b"more\0"].concat()).unwrap();
+        let unstaged = unstaged_diff(&repo, "img.png").unwrap();
+        assert!(unstaged.binary, "modified binary must be flagged");
+        assert!(unstaged.hunks.is_empty());
+    }
+
+    #[test]
+    fn whole_file_view_of_binary_is_flagged() {
+        let (_dir, repo) = testutil::init_repo();
+        testutil::commit_file(&repo, "a.txt", "a\n", "init");
+        fs::write(repo.workdir().unwrap().join("img.png"), PNG_BYTES).unwrap();
+        let d = whole_file_diff(&repo, "img.png").unwrap();
+        assert!(d.binary);
+        assert!(d.hunks.is_empty());
+    }
+
+    #[test]
+    fn text_diffs_are_not_flagged_binary() {
+        let (_dir, repo) = testutil::init_repo();
+        testutil::commit_file(&repo, "a.txt", "a\n", "init");
+        testutil::dirty_file(&repo, "a.txt", "b\n");
+        assert!(!unstaged_diff(&repo, "a.txt").unwrap().binary);
+        assert!(!whole_file_diff(&repo, "a.txt").unwrap().binary);
     }
 }

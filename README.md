@@ -66,7 +66,7 @@ credential helpers keep working unchanged.
 
 |                            |                                                                                                            |
 | -------------------------- | ---------------------------------------------------------------------------------------------------------- |
-| **Status & staging**       | Staged / unstaged / untracked / conflicted states; stage files, directories, or **single hunks**           |
+| **Status & staging**       | Staged / unstaged / untracked / conflicted states; stage files, whole folders, or **single hunks**         |
 | **Diff viewing**           | Inline preview + fullscreen side-by-side, nvim-style line cursor, visual select (`v` / `V`) and yank (`y`) |
 | **Commit**                 | Wrapping commit box with full cursor editing; **AI Conventional Commits** (`Shift+A`)                      |
 | **Branches / log / stash** | Create, delete, checkout; full log; stash push / pop / drop                                                |
@@ -119,7 +119,8 @@ file for one run. With no paths, the last session's projects are reopened
 | --------------- | ------------------------------------------------------ |
 | `j` / `k`       | Move in the file tree (diff previews inline)           |
 | `enter`         | Open fullscreen side-by-side diff (`esc` closes)       |
-| `space` / `s`   | Stage file / hunk under cursor                         |
+| `space` / `s`   | Stage file / hunk; on a folder, every file in it       |
+| `←` / `→`       | Collapse / expand the folder under the cursor          |
 | `c`             | Commit (`↑`/`↓` move between lines, `enter` commits)   |
 | `Shift+A`       | Generate AI commit message (in commit box)             |
 | `A`             | LLM setup form (in file list)                          |

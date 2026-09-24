@@ -17,7 +17,7 @@ use std::cell::Cell;
 
 use crate::config::{Config, KeyBindings, Theme};
 use crate::fuzzy;
-use crate::ui::{cursor_line_text, diff_rows, wrap_draft, DiffRow};
+use crate::ui::{cursor_line_text, diff_rows, visible_file_rows, wrap_draft, DiffRow, FileRow};
 
 /// Labels for the LLM setup form rows: provider, model, API key, base URL.
 pub const LLM_FIELD_LABELS: [&str; 4] = [
@@ -169,6 +169,10 @@ pub struct App {
     draft_wrap_width: Cell<usize>,
     /// Collapsed directory prefixes in the files tree (no trailing slash).
     collapsed: std::collections::HashSet<String>,
+    /// Open (expanded) folder header the files cursor sits on, if any.
+    /// `selected` then holds the folder's first file (its diff previews).
+    /// Collapsed headers don't use this: their hidden anchor file does.
+    dir_cursor: Option<String>,
     /// Directory picker for opening projects (`Mode::OpenProject`).
     open_browser: Option<OpenBrowser>,
     /// Rendered Markdown preview toggle (`m` for `.md` files).
@@ -467,6 +471,7 @@ impl App {
             // borders) until the renderer records the real one.
             draft_wrap_width: Cell::new(58),
             collapsed: Default::default(),
+            dir_cursor: None,
             open_browser: None,
             markdown_preview: false,
             md_for: None,
@@ -711,6 +716,21 @@ impl App {
 
     pub(crate) fn is_collapsed(&self, dir: &str) -> bool {
         self.collapsed.contains(dir)
+    }
+
+    /// Open folder header under the files cursor. `None` on a file or a
+    /// collapsed header, and when the stored folder went stale (collapsed,
+    /// folded away, or emptied by a refresh).
+    fn cursor_dir_is(&self, dir: &str) -> bool {
+        let prefix = format!("{dir}/");
+        !self.collapsed.contains(dir)
+            && !self.is_hidden_path(dir)
+            && self.file_list.iter().any(|f| f.path.starts_with(&prefix))
+    }
+
+    pub(crate) fn cursor_dir(&self) -> Option<&str> {
+        let dir = self.dir_cursor.as_deref()?;
+        self.cursor_dir_is(dir).then_some(dir)
     }
 
     pub(crate) fn set_collapsed(&mut self, dir: &str, value: bool) {
@@ -1549,23 +1569,7 @@ impl App {
 
     fn move_down(&mut self) {
         match self.focus {
-            Focus::Status => {
-                // Tree navigation: one step at a time so a collapsed
-                // header (`▶`) is a real cursor stop. Stepping onto a
-                // hidden file lands on its header (the UI highlights the
-                // header, never the hidden file rows); stepping out of a
-                // hidden anchor jumps to the next visible file. Hidden
-                // files are therefore never shown while navigating, yet
-                // every folder stays reachable for expand/stage.
-                if self.is_hidden_index(self.selected) {
-                    if let Some(n) = self.nearest_visible_after(self.selected) {
-                        self.selected = n;
-                    }
-                } else {
-                    self.selected = (self.selected + 1).min(self.file_count().saturating_sub(1));
-                }
-                self.maybe_load_diff();
-            }
+            Focus::Status => self.step_tree(true),
             Focus::Branches => {
                 self.branch_selected = self
                     .branch_selected
@@ -1592,19 +1596,7 @@ impl App {
 
     fn move_up(&mut self) {
         match self.focus {
-            Focus::Status => {
-                // Mirror of move_down: single step onto a hidden anchor
-                // (its header takes the highlight), escape jump when
-                // already on one; clamps at the top.
-                if self.is_hidden_index(self.selected) {
-                    if let Some(n) = self.nearest_visible_before(self.selected) {
-                        self.selected = n;
-                    }
-                } else {
-                    self.selected = self.selected.saturating_sub(1);
-                }
-                self.maybe_load_diff();
-            }
+            Focus::Status => self.step_tree(false),
             Focus::Branches => {
                 self.branch_selected = self.branch_selected.saturating_sub(1);
             }
@@ -1634,22 +1626,119 @@ impl App {
             .is_some_and(|f| self.is_hidden_path(&f.path))
     }
 
-    /// First visible file index strictly after `from` (None when there is
-    /// none: end of list or everything after is folded).
-    fn nearest_visible_after(&self, from: usize) -> Option<usize> {
-        (from + 1..self.file_count()).find(|&i| !self.is_hidden_index(i))
+    /// Tree navigation: one row at a time through exactly the rows the
+    /// files panel shows (`visible_file_rows`), so every folder header,
+    /// open (`▼`) or collapsed (`▶`), is a cursor stop for Space (stage
+    /// the whole folder) and Left/Right (fold). Clamps at both ends.
+    ///
+    /// - File row: select it.
+    /// - Open header: `dir_cursor` marks it; `selected` becomes the
+    ///   folder's first file, so the preview shows something useful.
+    /// - Collapsed header: `selected` becomes a hidden anchor inside it
+    ///   (the first file going down, the last going up) and the header
+    ///   takes the highlight.
+    fn step_tree(&mut self, down: bool) {
+        enum Target {
+            File(usize),
+            Dir(String),
+        }
+        let target = {
+            let rows = visible_file_rows(&self.file_list, |d| self.collapsed.contains(d));
+            let Some(pos) = self.tree_cursor_row(&rows) else {
+                return;
+            };
+            let next = if down {
+                pos.checked_add(1)
+            } else {
+                pos.checked_sub(1)
+            };
+            match next.and_then(|i| rows.get(i)) {
+                Some(FileRow::File { index, .. }) => Target::File(*index),
+                Some(FileRow::Dir { path, .. }) => Target::Dir(path.to_string()),
+                None => return,
+            }
+        };
+        match target {
+            Target::File(index) => {
+                self.selected = index;
+                self.dir_cursor = None;
+            }
+            Target::Dir(dir) if self.collapsed.contains(&dir) => {
+                if let Some(anchor) = self.folder_anchor(&dir, down) {
+                    self.selected = anchor;
+                }
+                self.dir_cursor = None;
+            }
+            Target::Dir(dir) => {
+                // An open header previews the folder's first file.
+                let prefix = format!("{dir}/");
+                if let Some(first) = self
+                    .file_list
+                    .iter()
+                    .position(|f| f.path.starts_with(&prefix))
+                {
+                    self.selected = first;
+                }
+                self.dir_cursor = Some(dir);
+            }
+        }
+        self.maybe_load_diff();
     }
 
-    /// First visible file index strictly before `from` (None at the top or
-    /// when everything above is folded).
-    fn nearest_visible_before(&self, from: usize) -> Option<usize> {
-        (0..from).rev().find(|&i| !self.is_hidden_index(i))
+    /// Index in `rows` of the cursor: the open header it sits on, the
+    /// collapsed header hiding the selected file, or the file's own row.
+    fn tree_cursor_row(&self, rows: &[FileRow]) -> Option<usize> {
+        let dir_row = |dir: &str| {
+            rows.iter()
+                .position(|r| matches!(r, FileRow::Dir { path, .. } if *path == dir))
+        };
+        if let Some(dir) = self.cursor_dir() {
+            return dir_row(dir);
+        }
+        let file = self.file_list.get(self.selected)?;
+        if let Some(header) = self.collapsed_dir_for(&file.path) {
+            return dir_row(&header);
+        }
+        rows.iter()
+            .position(|r| matches!(r, FileRow::File { index, .. } if *index == self.selected))
+    }
+
+    /// File to select for folder `dir`. Going down (`first`): the first
+    /// file under it after the cursor, else its first file. Going up: the
+    /// last file under it before the cursor, else its last file.
+    fn folder_anchor(&self, dir: &str, first: bool) -> Option<usize> {
+        let prefix = format!("{dir}/");
+        let under: Vec<usize> = (0..self.file_list.len())
+            .filter(|&i| self.file_list[i].path.starts_with(&prefix))
+            .collect();
+        if first {
+            under
+                .iter()
+                .copied()
+                .find(|&i| i > self.selected)
+                .or_else(|| under.first().copied())
+        } else {
+            under
+                .iter()
+                .copied()
+                .rev()
+                .find(|&i| i < self.selected)
+                .or_else(|| under.last().copied())
+        }
     }
 
     /// Toggle collapse on the deepest collapsed-capable ancestor of the
     /// selected file (or expand when that ancestor is collapsed). Only
     /// the deepest directory flips so sibling subtrees stay visible.
     fn toggle_folder(&mut self) {
+        // On an open header: fold that folder. The cursor stays on its
+        // (now `▶`) header via the hidden anchor, like any collapse.
+        if let Some(dir) = self.dir_cursor.take() {
+            if self.cursor_dir_is(&dir) {
+                self.set_collapsed(&dir, true);
+                return;
+            }
+        }
         let Some(file) = self.selected_file() else {
             return;
         };
@@ -1690,6 +1779,10 @@ impl App {
     ///   after Up/Down skipped away from a `▶` header, since the highlight
     ///   never rests on hidden files while navigating.
     fn expand_at_cursor(&mut self) {
+        if self.cursor_dir().is_some() {
+            // Already open; don't unfold a neighbouring folder instead.
+            return;
+        }
         let Some(file) = self.selected_file().cloned() else {
             return;
         };
@@ -2026,10 +2119,15 @@ impl App {
     }
 
     /// Space: stage unless already fully staged (then unstage). When the
-    /// highlight sits on a collapsed directory header (the selected file
-    /// is hidden inside it), the whole directory is staged/unstaged so
-    /// its files are ready to commit together.
+    /// highlight sits on a directory header, open (`▼`, `dir_cursor`) or
+    /// collapsed (the selected file is hidden inside it), the whole
+    /// directory is staged/unstaged so its files are ready to commit
+    /// together.
     fn toggle_stage(&mut self) {
+        if let Some(dir) = self.cursor_dir().map(str::to_string) {
+            self.toggle_stage_dir(&dir);
+            return;
+        }
         let Some(file) = self.selected_file().cloned() else {
             return;
         };
@@ -2076,7 +2174,7 @@ impl App {
         }
     }
 
-    /// Space on a collapsed directory header: stage every stageable file
+    /// Space on a directory header: stage every stageable file
     /// beneath it, or unstage them all when every one is already staged.
     /// Conflicted files abort the whole directory like the single-file
     /// case; clean files are skipped silently.
@@ -2413,6 +2511,7 @@ impl App {
             return;
         };
         self.selected = index;
+        self.dir_cursor = None;
         self.expand_selected();
         self.focus = Focus::Status;
         self.mode = self.finder_return;
@@ -2587,9 +2686,11 @@ impl App {
                 // Drop overtaken loads: only the latest target counts
                 // (jobs run FIFO, so a newer LoadDiff may follow).
                 if self.diff_for.as_ref().is_some_and(|(p, _)| *p == d.path) {
-                    if d.hunks.is_empty() && !self.diff_whole_file {
+                    if d.hunks.is_empty() && !d.binary && !self.diff_whole_file {
                         // Listed but no content diff (e.g. mode-only
                         // change): show the whole file automatically.
+                        // Binary files skip this: their bytes are never
+                        // drawn, the diff pane shows a notice instead.
                         self.fallback_whole_file = true;
                         self.set_diff(None);
                         self.hunk = 0;
@@ -2994,6 +3095,84 @@ mod tests {
     }
 
     #[test]
+    fn cursor_stops_on_open_folder_headers_both_ways() {
+        // Rows: ▼ src/, a.rs, ▼ nested/, b.rs, c.rs, z.txt
+        let mut fx = harness(&["src/a.rs", "src/nested/b.rs", "src/nested/c.rs", "z.txt"]);
+        assert_eq!(fx.app.selected_file().unwrap().path, "src/a.rs");
+        assert_eq!(fx.app.cursor_dir(), None);
+        // Down from a.rs stops on the open `nested/` header, previewing
+        // its first file.
+        fx.app.on_key(KeyCode::Down);
+        assert_eq!(fx.app.cursor_dir(), Some("src/nested"));
+        assert_eq!(fx.app.selected_file().unwrap().path, "src/nested/b.rs");
+        // Down again enters the folder.
+        fx.app.on_key(KeyCode::Down);
+        assert_eq!(fx.app.cursor_dir(), None);
+        assert_eq!(fx.app.selected_file().unwrap().path, "src/nested/b.rs");
+        // Up goes back onto the header, then a.rs, then the top `src/`.
+        fx.app.on_key(KeyCode::Up);
+        assert_eq!(fx.app.cursor_dir(), Some("src/nested"));
+        fx.app.on_key(KeyCode::Up);
+        assert_eq!(fx.app.cursor_dir(), None);
+        assert_eq!(fx.app.selected_file().unwrap().path, "src/a.rs");
+        fx.app.on_key(KeyCode::Up);
+        assert_eq!(fx.app.cursor_dir(), Some("src"));
+        assert_eq!(fx.app.selected_file().unwrap().path, "src/a.rs");
+        // Clamps at the top.
+        fx.app.on_key(KeyCode::Up);
+        assert_eq!(fx.app.cursor_dir(), Some("src"));
+    }
+
+    #[test]
+    fn space_on_open_folder_header_stages_only_that_folder() {
+        let mut fx = harness(&["src/a.rs", "src/nested/b.rs", "src/nested/c.rs", "z.txt"]);
+        fx.app.on_key(KeyCode::Down);
+        assert_eq!(fx.app.cursor_dir(), Some("src/nested"));
+        fx.app.on_key(KeyCode::Char(' '));
+        let st = wait_for(&mut fx.app, |st| {
+            st.files
+                .iter()
+                .filter(|e| e.path.starts_with("src/nested/"))
+                .all(|e| e.state == FileState::Staged)
+        });
+        for outside in ["src/a.rs", "z.txt"] {
+            let e = st.files.iter().find(|e| e.path == outside).unwrap();
+            assert_eq!(e.state, FileState::Unstaged, "{outside} must be left alone");
+        }
+        // The folder stays open and the cursor stays on its header, so a
+        // second Space unstages it again.
+        assert!(!fx.app.is_collapsed("src/nested"));
+        assert_eq!(fx.app.cursor_dir(), Some("src/nested"));
+        fx.app.on_key(KeyCode::Char(' '));
+        wait_for(&mut fx.app, |st| {
+            st.files
+                .iter()
+                .filter(|e| e.path.starts_with("src/nested/"))
+                .all(|e| e.state == FileState::Unstaged)
+        });
+    }
+
+    #[test]
+    fn left_on_open_header_folds_it_and_right_leaves_it_open() {
+        let mut fx = harness(&["src/a.rs", "src/nested/b.rs", "z.txt"]);
+        fx.app.on_key(KeyCode::Up);
+        assert_eq!(fx.app.cursor_dir(), Some("src"));
+        // Right on an already-open header changes nothing.
+        fx.app.on_key(KeyCode::Right);
+        assert!(!fx.app.is_collapsed("src") && !fx.app.is_collapsed("src/nested"));
+        assert_eq!(fx.app.cursor_dir(), Some("src"));
+        // Left folds exactly that folder (not the file's deepest parent);
+        // the cursor stays on the now-collapsed header.
+        fx.app.on_key(KeyCode::Left);
+        assert!(fx.app.is_collapsed("src"));
+        assert!(!fx.app.is_collapsed("src/nested"));
+        assert!(fx.app.is_hidden_index(fx.app.selected()));
+        // Right re-opens it.
+        fx.app.on_key(KeyCode::Right);
+        assert!(!fx.app.is_collapsed("src"));
+    }
+
+    #[test]
     fn space_on_collapsed_dir_unstages_when_everything_staged() {
         let mut fx = harness(&["src/a.rs", "src/nested/b.rs"]);
         fx.app.on_key(KeyCode::Left);
@@ -3385,6 +3564,33 @@ mod tests {
         assert_eq!(list[0].state, FileState::Unstaged);
         assert_eq!(list[1].path, "b.txt");
         assert_eq!(list[1].state, FileState::Clean);
+    }
+
+    #[test]
+    fn binary_file_gets_notice_instead_of_whole_file_bytes() {
+        let dir = tempfile::TempDir::new().unwrap();
+        git2::Repository::init(dir.path()).unwrap();
+        std::fs::write(dir.path().join("img.png"), b"\x89PNG\r\n\x1a\n\0\0\x1b[2J").unwrap();
+        let mut app = App::new(JobQueue::spawn(dir.path()).unwrap());
+        wait_for(&mut app, |st| st.files.iter().any(|e| e.path == "img.png"));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !app.diff().is_some_and(|d| d.path == "img.png") {
+            assert!(Instant::now() < deadline, "timed out waiting for diff");
+            app.poll();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // Let any (wrong) whole-file fallback job run and land.
+        for _ in 0..30 {
+            app.poll();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let d = app.diff().expect("diff stays loaded");
+        assert!(d.binary, "binary flag lost: {d:?}");
+        assert!(d.hunks.is_empty(), "binary bytes leaked into hunks");
+        assert!(
+            !app.diff_whole_file(),
+            "binary must not fall back to whole-file view"
+        );
     }
 
     #[test]
@@ -3958,6 +4164,7 @@ mod tests {
         fx.app.set_diff_for_test(
             FileDiff {
                 path: "a.txt".into(),
+                binary: false,
                 hunks: vec![Hunk {
                     header: "@@ -1,1 +1,1 @@".into(),
                     old_start: 1,
@@ -4352,6 +4559,7 @@ mod tests {
         fx.app.set_diff_for_test(
             FileDiff {
                 path: "a.txt".into(),
+                binary: false,
                 hunks: vec![Hunk {
                     header: "@@ -1,2 +1,2 @@".into(),
                     old_start: 1,
@@ -4383,6 +4591,7 @@ mod tests {
         let mut fx = harness(&["a.txt"]);
         let diff = FileDiff {
             path: "a.txt".into(),
+            binary: false,
             hunks: vec![Hunk {
                 header: "@@ -1,2 +1,2 @@".into(),
                 old_start: 1,
