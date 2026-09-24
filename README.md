@@ -1,118 +1,135 @@
+<div align="center">
+
 # git-tui
 
-A fast, keyboard-driven git TUI for Linux, focused on the commit workflow:
-status → diff → stage (whole files or single hunks) → commit.
+**A fast, keyboard-driven git TUI for Linux**
 
-Local git operations use libgit2 (`git2`) directly; push/pull shell out to
-the `git` CLI (lazygit-style) so your ssh keys, agent, and credential
-helpers work unchanged.
+Status → diff → stage → commit, without leaving the terminal.
+
+[![CI](https://github.com/DevarshVasani/AgentGit/actions/workflows/ci.yml/badge.svg)](https://github.com/DevarshVasani/AgentGit/actions/workflows/ci.yml)
+[![Rust](https://img.shields.io/badge/rust-1.75%2B-orange?logo=rust)](https://www.rust-lang.org)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](Cargo.toml)
+[![ratatui](https://img.shields.io/badge/UI-ratatui%200.29-28a0f0?logo=rust)](https://github.com/ratatui/ratatui)
+
+</div>
+
+---
+
+![git-tui screenshot](docs/screenshot.png)
+
+---
+
+## Why git-tui?
+
+A commit-workflow TUI that stays out of your way: inspect status, review
+side-by-side diffs, stage whole files **or single hunks**, and commit —
+all with vim-style keys. Local git operations go through **libgit2
+(`git2`)**; push/pull shell out to the **`git` CLI** (lazygit-style) so
+your ssh keys, agent, and credential helpers keep working unchanged.
 
 ## Features
 
-- Status tree with staged / unstaged / untracked / conflicted states
-- Inline unified diff preview + fullscreen side-by-side diff with syntax
-  highlighting (code + Markdown: headings, emphasis, code spans, links)
-  and word-level change highlighting
-- Stage whole files, directories, or single hunks; unstage files
-- Commit box that wraps and grows as you type
-- Branches (create / delete / checkout), log, stash (push / pop / drop)
-- Push / pull / publish upstream (`p` / `P`), with upstream tracking in
-  the status panel
-- Multiple projects (tabs) in one viewer, with directory browser to open more
-- Fuzzy file finder (`/`, fullscreen `enter` to jump)
-- AI commit messages from staged diffs (`Shift+A` in commit box, `A` for setup)
-- Themes (`default`, `tokyo-night`, `catppuccin`, `legacy`) + fully rebindable keys via TOML config
+| | |
+|---|---|
+| **Status & staging** | Staged / unstaged / untracked / conflicted states; stage files, directories, or **single hunks** |
+| **Diff viewing** | Inline preview + **fullscreen side-by-side** with syntax highlighting and **word-level** change marks |
+| **Commit** | Wrapping commit box; **AI Conventional-Commits** messages from staged diffs (`Shift+A`) |
+| **Branches / log / stash** | Create, delete, checkout; full log; stash push / pop / drop |
+| **Sync** | Lazygit-style `p` pull / `P` push / publish-to-origin, with upstream tracking in the status panel |
+| **Multi-project** | Several repos as tabs in one viewer; session restored on next launch |
+| **Markdown** | Source highlight + rendered preview (`m`) for `.md` files |
+| **Fuzzy finder** | `/` from anywhere, including fullscreen diff |
+| **Themes & keys** | `default` (Catppuccin Mocha), `tokyo-night`, `catppuccin`, `legacy` — fully rebindable via TOML |
+| **AI providers** | `openai`, `openrouter`, `ollama`, `anthropic`, `gemini`, or any OpenAI-compatible `custom` endpoint |
 
-## Build & run
-
-```sh
-cargo build --release   # produces target/release/git-tui
-cargo test --workspace  # core + TUI tests
-```
+## Quick start
 
 ```sh
-git-tui                         # open repo in current directory
-git-tui ~/projects/api          # open one repo
+# Build & test
+cargo build --release          # → target/release/git-tui
+cargo test --workspace
+
+# Run
+git-tui                        # repo in current directory
 git-tui ~/projects/api ~/projects/web
-git-tui --repo ~/projects/api --repo ~/projects/web
-git-tui --theme tokyo-night
+git-tui --repo ~/projects/api --theme tokyo-night
 ```
+
+```text
+usage: git-tui [--theme <default|tokyo-night|catppuccin|legacy>]
+               [--repo <path>]... [<path>...] [-- <path>...]
+```
+
+`--` treats everything after it as paths; `--theme` overrides the config
+file for one run.
 
 ## Keyboard flow
 
-`j`/`k` move in the file tree (the selected file's unified diff previews
-inline), `/` fuzzy-finds a file (`enter` jumps to it), `enter` opens it
-fullscreen side-by-side (`esc` closes) — files with no changes show the whole
-file automatically, changed files show the diff — `space` stages, `c` commits
-(`Shift+A` inside the commit box generates the message from staged files, `A`
-in the file list opens the LLM setup), `p` pulls, `P` pushes, `1`–`5` switch
-panels (`tab` cycles the left rail only and never lands on the preview;
-`Shift+→` or `5` from `[2]-Files` focuses the right-side file/diff for
-`j`/`k`/`↑`/`↓` scrolling, `←`/`1`/`tab` jumps back). The commit box wraps
-and grows vertically as you type (`↑`/`↓` move between lines, `Enter`
-commits); other text boxes (new branch, stash message, jump-to-path, file
-finder) are fully editable: `←`/`→` move the cursor, `Home`/`End` jump,
-`backspace`/`Del` delete, and long lines scroll horizontally so the cursor is
-always visible.
+| Key | Action |
+|-----|--------|
+| `j` / `k` | Move in the file tree (diff previews inline) |
+| `enter` | Open fullscreen side-by-side diff (`esc` closes) |
+| `space` / `s` | Stage file / hunk under cursor |
+| `c` | Commit (`↑`/`↓` edit lines, `Enter` commits) |
+| `Shift+A` | Generate AI commit message (in commit box) |
+| `A` | LLM setup form (in file list) |
+| `/` | Fuzzy-find a file (`enter` jumps to it) |
+| `1`–`5` | Focus Status / Files / Branches / Commits / Stash |
+| `tab` | Cycle left-rail panels only |
+| `Shift+→` / `←` | Move between left rail and diff preview |
+| `p` / `P` | `git pull` / `git push` (publish prompts for remote) |
+| `[` / `]` | Previous / next project tab |
+| `q` / `Q` | Close project / quit app |
+| `o` | Open directory browser |
+| `m` | Toggle rendered Markdown preview |
+| `r` | Refresh |
+
+Text boxes (commit, new branch, stash, finder, path prompt) support full
+cursor editing: `←`/`→`, `Home`/`End`, `backspace`/`Del`, and horizontal
+scroll for long lines. In the commit box, `↑`/`↓` move between
+soft-wrapped rows.
 
 ## Multiple projects
-
-Pass several repositories and switch between them without leaving the viewer
-(herder-style):
 
 ```sh
 git-tui ~/projects/api ~/projects/web
 git-tui --repo ~/projects/api --repo ~/projects/web
 ```
 
-Each project keeps its own status, diff, selection, and staging state.
-`[` / `]` cycle projects (rebindable via `project_prev` / `project_next`);
-`q` (`project_close`) closes the current project (last one quits the app),
-`Q` (`quit`) quits the whole application;
-`o` (`project_open`) opens a directory browser without leaving the viewer.
-It starts at the current project; just start typing to filter the current
-folder's list (no prefix key), `enter` opens a repo (`.` opens the shown
-folder itself) and descends into plain folders so you can keep browsing,
-`↑`/`↓` move, `→` descends, `←` goes up
-(`backspace` edits the query, or goes up when it is empty), `tab` jumps
-to a typed path, and `esc` clears the query first, then closes. Repo roots
-show a `[repo]` badge, open tabs `[open]`.
-Edge cases stay in the browser as errors (missing path, bare repos, files);
-`enter` on `.` inside a plain directory offers to `git init` it first, and an
-already-open repo just switches to its tab. Empty repos (no commits yet)
-open fine.
-the project bar on top shows every repo with its dirty-file count and
-stays visible even in fullscreen diff.
+Each tab keeps its own status, diff, selection, and staging state.
+The project bar on top shows dirty-file counts and stays visible even
+in fullscreen diff.
+
+- `[` / `]` cycle projects · `q` closes current (last one quits) · `Q` quits all
+- `o` opens the directory browser: type to filter, `enter` opens a repo
+  (or offers `git init` in a plain folder), `[repo]` / `[open]` badges,
+  `tab` jumps to a typed path
+- Open projects and the active tab persist in `session.toml` and are
+  restored on next launch (dead paths are dropped)
 
 ## Sync: push, pull, publish
 
-Lazygit-style remote workflow (`p` / `P`, rebindable via `sync_pull` /
-`sync_push`); works from the file list and from fullscreen diff:
+| Key | Behavior |
+|-----|----------|
+| `p` | `git pull` (honors your `pull.rebase` / `pull.ff`) |
+| `P` | Push to upstream, or prompt for remote (`git push -u …`) |
+| `P` (no remote) | Prompt for `origin` URL → `git remote add` + `push -u` |
 
-- `p` pulls the current branch (`git pull`, so your `pull.rebase` /
-  `pull.ff` config decides merge vs rebase).
-- `P` pushes: straight to the upstream when one exists; otherwise it
-  prompts for the remote (`git push -u <remote> <branch>`).
-- Fresh `git init` with no remote at all: `P` prompts for the `origin`
-  URL instead — create the empty repo on GitHub, paste its URL, and the
-  branch is published (`git remote add origin <url>` + `push -u`).
+The status panel tracks upstream (`main → origin/main ↑2↓1`) and shows
+`pushing…` / `pulling…` while a job runs. Sync runs are non-interactive
+(`GIT_TERMINAL_PROMPT=0`, ssh batch mode) so missing credentials fail
+fast instead of hanging. Push/pull also refresh status, diff, branches,
+log, and stash.
 
-The status panel tracks the upstream (`main → origin/main ↑2↓1`) and
-shows `pushing…` / `pulling…` while a sync job runs; failures land on
-the error line with the remote's message. Prompts are disabled for sync
-commands, so missing credentials fail fast instead of hanging. Push,
-pull, and publish also refresh status, diff, branches, log, and stash
-when they complete.
+## Configuration
 
-## Config
-
-`~/.config/git-tui/config.toml` (or `$XDG_CONFIG_HOME/git-tui/config.toml`
-when set). No file means defaults. Unknown actions, key names, or sections
-fail fast with the offending value instead of being silently ignored.
+Path: `~/.config/git-tui/config.toml` (or `$XDG_CONFIG_HOME/git-tui/config.toml`).
+Missing file → defaults. Unknown actions, keys, or sections fail fast
+with the offending value.
 
 ```toml
 [theme]
-name = "tokyo-night"  # default | tokyo-night | catppuccin | legacy
+name = "catppuccin"        # default | tokyo-night | catppuccin | legacy
 
 [keys]
 stage = "s"
@@ -120,41 +137,72 @@ quit = "Q"
 project_close = "q"
 sync_pull = "p"
 sync_push = "P"
+toggle_markdown_preview = "m"
 
 [llm]
-provider = "openai"  # openai | openrouter | ollama | anthropic | gemini | custom
+provider = "openai"        # openai | openrouter | ollama | anthropic | gemini | custom
 model = "gpt-4o-mini"
-api_key = "sk-..."  # or leave empty and export $OPENAI_API_KEY ($ANTHROPIC_API_KEY,
-                    # $GEMINI_API_KEY, $OPENROUTER_API_KEY, or generic $LLM_API_KEY)
-# base_url = "http://localhost:11434/v1"  # only for provider = "custom" (or to override)
+api_key = ""               # or set $OPENAI_API_KEY / $ANTHROPIC_API_KEY /
+                           # $GEMINI_API_KEY / $OPENROUTER_API_KEY / $LLM_API_KEY
+# base_url = "http://localhost:11434/v1"   # provider = "custom" (or override)
 ```
 
-AI commit messages: stage with `space`, press `c` for the commit box,
-then `Shift+A` generates a Conventional-Commits message from the staged
-(index vs HEAD) diffs — every staged file is referenced in the prompt.
-Connect the LLM either through the TUI (press `A` in the file list for
-the setup form: provider, model, API key) or via the file below;
-`ollama` needs no key.
+**AI commits:** stage with `space`, open the commit box with `c`, then
+`Shift+A` builds a Conventional-Commits message from the index-vs-HEAD
+diff. Connect the LLM via the TUI (`A` in the file list) or the config
+file — `ollama` needs no API key.
 
-The theme can also be forced for one run (overrides the file):
+**Key names:** single characters, plus `space`, `tab`, `enter`, `esc`,
+`backspace`, `delete`, `insert`, `up`, `down`, `left`, `right`,
+`pageup`, `pagedown`, `home`, `end`.
 
-```sh
-git-tui --theme tokyo-night
+**Actions** (from `git-tui/src/config.rs` · `ACTIONS`):
+
+```text
+nav_down  nav_up  stage  commit  refresh  quit  focus_next
+focus_status  focus_branches  focus_log  focus_stash  focus_diff
+scroll_up  scroll_down  branch_new  branch_delete  checkout
+stash_pop  stash_push  stash_drop  find_files
+project_next  project_prev  project_open  project_close
+sync_pull  sync_push  llm_settings  toggle_markdown_preview
 ```
 
-Key names: single characters, plus `space`, `tab`, `enter`, `esc`,
-`backspace`, `delete`, `insert`, `up`, `down`, `left`, `right`, `pageup`,
-`pagedown`, `home`, `end`. Action names are listed in
-`git-tui/src/config.rs` (`ACTIONS`): `nav_down`, `nav_up`, `stage`, `commit`,
-`refresh`, `quit`, `focus_next`, `focus_status`, `focus_branches`,
-`focus_log`, `focus_stash`, `focus_diff`, `scroll_up`, `scroll_down`, `branch_new`,
-`branch_delete`, `checkout`, `stash_pop`, `stash_push`, `stash_drop`,
- `find_files`, `project_next`, `project_prev`, `project_open`, `project_close`,
- `sync_pull`, `sync_push`, `llm_settings`.
+### Environment variables
+
+| Variable | Purpose |
+|----------|---------|
+| `XDG_CONFIG_HOME` | Config + session directory override |
+| `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` / `GEMINI_API_KEY` / `OPENROUTER_API_KEY` / `LLM_API_KEY` | LLM credentials (config `api_key` wins) |
+| `GIT_SSH_COMMAND` | Preserved when set; otherwise ssh batch mode for sync |
+| `GIT_TERMINAL_PROMPT` | Forced to `0` during push/pull |
 
 ## Layout
 
-- `git-tui-core` — all git operations and the async job engine (no TUI deps).
-  Core owns all git state; only owned data (Strings, vecs) crosses the async
-  job channel. Errors are typed `GitError` in core, `anyhow` in the TUI.
-- `git-tui` — ratatui frontend.
+| Crate | Role |
+|-------|------|
+| **`git-tui-core`** | All git operations + single-writer async job engine (no TUI deps). Owns git state; only owned data crosses the job channel. Typed `GitError`. |
+| **`git-tui`** | ratatui frontend: panels, side-by-side diff, modals, theming. `anyhow` at the edge. |
+
+No tokio/async-std — a background worker thread owns the `Repo` and
+communicates over a `crossbeam-channel`, so the UI never blocks on git.
+
+```text
+git-tui/
+├── git-tui-core/   # lib: repo · status · diff · stage · commit · branch · log · stash · sync · llm · jobqueue · error
+└── git-tui/        # bin: main · app · ui · workspace · config · syntax · markdown · session · fuzzy · words
+```
+
+## Development
+
+```sh
+cargo fmt --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+```
+
+CI runs all three on every push and pull request
+(`.github/workflows/ci.yml`).
+
+## License
+
+MIT (`workspace.package.license` in [`Cargo.toml`](Cargo.toml)).
