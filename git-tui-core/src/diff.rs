@@ -69,6 +69,28 @@ pub fn whole_file_diff(repo: &git2::Repository, path: &str) -> Result<FileDiff, 
     })
 }
 
+/// Full new-version text for Markdown preview: workdir file when
+/// `staged` is false, index blob when true (staged view). Lossy UTF-8
+/// so binary renders instead of erroring.
+pub fn new_content(repo: &git2::Repository, path: &str, staged: bool) -> Result<String, GitError> {
+    if !staged {
+        let full = repo
+            .workdir()
+            .ok_or_else(|| GitError::HunkStaging("bare repo".into()))?
+            .join(Path::new(path));
+        let bytes = std::fs::read(&full)
+            .map_err(|e| GitError::HunkStaging(format!("cannot read {path}: {e}")))?;
+        return Ok(String::from_utf8_lossy(&bytes).into_owned());
+    }
+    let index = repo.index()?;
+    if let Some(entry) = index.get_path(Path::new(path), 0) {
+        let blob = repo.find_blob(entry.id)?;
+        return Ok(String::from_utf8_lossy(blob.content()).into_owned());
+    }
+    // Staged deletion or missing index entry: no new content.
+    Ok(String::new())
+}
+
 /// Workdir vs index for `path`.
 pub fn unstaged_diff(repo: &git2::Repository, path: &str) -> Result<FileDiff, GitError> {
     // Untracked files are not in any diff by default: synthesize all-adds.

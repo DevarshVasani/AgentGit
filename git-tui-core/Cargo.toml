@@ -4,7 +4,8 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-description = "Git operations and async job engine for git-tui (no TUI concerns)"
+repository.workspace = true
+description = "Git operations and async job engine for agentgit (no TUI concerns)"
 
 [dependencies]
 git2 = { version = "0.19", features = ["vendored-libgit2", "vendored-openssl"] }

@@ -28,6 +28,11 @@ pub enum AsyncJob {
     LoadFile {
         path: String,
     },
+    /// Full new-version text for Markdown preview.
+    LoadMarkdown {
+        path: String,
+        staged: bool,
+    },
     StageHunk {
         path: String,
         hunk_index: usize,
@@ -95,6 +100,11 @@ pub enum AsyncJob {
 pub enum AsyncResult {
     Status(RepoStatus),
     Diff(FileDiff),
+    Markdown {
+        path: String,
+        staged: bool,
+        text: String,
+    },
     Branches(Vec<BranchInfo>),
     Log(Vec<CommitInfo>),
     Stash(Vec<StashEntry>),
@@ -183,6 +193,10 @@ fn execute(repo: &mut Repo, job: AsyncJob) -> AsyncResult {
         }
         AsyncJob::LoadFile { path } => match repo.whole_file(&path) {
             Ok(d) => AsyncResult::Diff(d),
+            Err(e) => AsyncResult::Error(e),
+        },
+        AsyncJob::LoadMarkdown { path, staged } => match repo.new_content(&path, staged) {
+            Ok(text) => AsyncResult::Markdown { path, staged, text },
             Err(e) => AsyncResult::Error(e),
         },
         AsyncJob::StageFile { path } => match repo.stage_file(&path) {
@@ -610,10 +624,7 @@ mod tests {
         }
         match result {
             AsyncResult::Error(crate::error::GitError::Llm(msg)) => {
-                assert!(
-                    msg.contains("API key"),
-                    "got: {msg}"
-                );
+                assert!(msg.contains("API key"), "got: {msg}");
             }
             other => panic!("expected missing-key Llm error, got {other:?}"),
         }

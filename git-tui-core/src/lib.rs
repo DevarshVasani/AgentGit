@@ -1,4 +1,4 @@
-//! git-tui-core: git operations and the async job engine.
+//! git-tui-core: git operations and the async job engine behind agentgit.
 //!
 //! No TUI dependencies in this crate.
 

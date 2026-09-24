@@ -1,6 +1,6 @@
 //! Phase 5: TOML config — keybinding overrides and theme selection.
 //!
-//! `~/.config/git-tui/config.toml`. Missing file means defaults; anything
+//! `~/.config/agentgit/config.toml`. Missing file means defaults; anything
 //! present overrides just that piece. Invalid names fail fast with the file
 //! path and the offending value.
 
@@ -42,6 +42,7 @@ pub const ACTIONS: &[&str] = &[
     "sync_pull",
     "sync_push",
     "llm_settings",
+    "toggle_markdown_preview",
 ];
 
 /// Key names accepted in `[keys]` besides single characters.
@@ -99,6 +100,8 @@ pub struct KeyBindings {
     pub sync_push: Vec<KeyCode>,
     /// Opens the in-TUI LLM setup form (`A` by default in the file list).
     pub llm_settings: Vec<KeyCode>,
+    /// Toggles rendered Markdown preview for `.md` files (`m`).
+    pub toggle_markdown_preview: Vec<KeyCode>,
 }
 
 impl Default for KeyBindings {
@@ -134,6 +137,7 @@ impl Default for KeyBindings {
             sync_push: vec![Char('P')],
             // Shift+A in the file list (Shift+a normalizes to `A`).
             llm_settings: vec![Char('A')],
+            toggle_markdown_preview: vec![Char('m')],
         }
     }
 }
@@ -264,32 +268,32 @@ impl Theme {
     pub fn catppuccin() -> Self {
         let rgb = Color::Rgb;
         Self {
-            border_focused: rgb(137, 180, 250),    // blue #89b4fa
-            border_unfocused: rgb(69, 71, 90),     // surface1 #45475a
-            hint: rgb(108, 112, 134),              // overlay0 #6c7086
-            error: rgb(243, 139, 168),             // red #f38ba8
-            staged: rgb(166, 227, 161),            // green #a6e3a1
-            unstaged: rgb(249, 226, 175),          // yellow #f9e2af
-            untracked: rgb(108, 112, 134),         // overlay0 #6c7086
-            conflicted: rgb(243, 139, 168),        // red #f38ba8
-            both_staged: rgb(203, 166, 247),       // mauve #cba6f7
-            hunk_header: rgb(137, 220, 235),       // sky #89dceb
-            commit_id: rgb(250, 179, 135),         // peach #fab387
-            branch_current: rgb(166, 227, 161),    // green #a6e3a1
-            context: rgb(108, 112, 134),           // overlay0 #6c7086
+            border_focused: rgb(137, 180, 250), // blue #89b4fa
+            border_unfocused: rgb(69, 71, 90),  // surface1 #45475a
+            hint: rgb(108, 112, 134),           // overlay0 #6c7086
+            error: rgb(243, 139, 168),          // red #f38ba8
+            staged: rgb(166, 227, 161),         // green #a6e3a1
+            unstaged: rgb(249, 226, 175),       // yellow #f9e2af
+            untracked: rgb(108, 112, 134),      // overlay0 #6c7086
+            conflicted: rgb(243, 139, 168),     // red #f38ba8
+            both_staged: rgb(203, 166, 247),    // mauve #cba6f7
+            hunk_header: rgb(137, 220, 235),    // sky #89dceb
+            commit_id: rgb(250, 179, 135),      // peach #fab387
+            branch_current: rgb(166, 227, 161), // green #a6e3a1
+            context: rgb(108, 112, 134),        // overlay0 #6c7086
             diff_del_bg: rgb(58, 36, 48),
             diff_add_bg: rgb(30, 49, 42),
             diff_del_word_bg: rgb(79, 42, 56),
-            bg: rgb(30, 30, 46),                   // base #1e1e2e
-            fg: rgb(205, 214, 244),                // text #cdd6f4
-            line_nr: rgb(69, 71, 90),              // surface1 #45475a
-            selection_bg: rgb(49, 50, 68),         // surface0 #313244
-            syntax_comment: rgb(108, 112, 134),    // overlay0 #6c7086
-            syntax_string: rgb(166, 227, 161),     // green #a6e3a1
-            syntax_keyword: rgb(203, 166, 247),    // mauve #cba6f7
-            syntax_function: rgb(137, 180, 250),   // blue #89b4fa
-            syntax_type: rgb(137, 220, 235),       // sky #89dceb
-            syntax_number: rgb(250, 179, 135),     // peach #fab387
+            bg: rgb(30, 30, 46),                 // base #1e1e2e
+            fg: rgb(205, 214, 244),              // text #cdd6f4
+            line_nr: rgb(69, 71, 90),            // surface1 #45475a
+            selection_bg: rgb(49, 50, 68),       // surface0 #313244
+            syntax_comment: rgb(108, 112, 134),  // overlay0 #6c7086
+            syntax_string: rgb(166, 227, 161),   // green #a6e3a1
+            syntax_keyword: rgb(203, 166, 247),  // mauve #cba6f7
+            syntax_function: rgb(137, 180, 250), // blue #89b4fa
+            syntax_type: rgb(137, 220, 235),     // sky #89dceb
+            syntax_number: rgb(250, 179, 135),   // peach #fab387
         }
     }
 
@@ -312,10 +316,37 @@ pub struct Config {
     pub keys: KeyBindings,
     pub theme: Theme,
     /// LLM provider for Shift+A commit generation in the commit box.
-    /// `~/.config/git-tui/config.toml` `[llm]` section; empty key falls
+    /// `~/.config/agentgit/config.toml` `[llm]` section; empty key falls
     /// back to `$OPENAI_API_KEY` / `$ANTHROPIC_API_KEY` / `$GEMINI_API_KEY`
     /// / `$OPENROUTER_API_KEY` / `$LLM_API_KEY` at generation time.
     pub llm: LlmConfig,
+}
+
+/// App directory name under the XDG config home.
+pub const APP_DIR: &str = "agentgit";
+/// Pre-rename directory; still used when it exists and `agentgit/` doesn't,
+/// so config and session survive the rename without moving any files.
+const LEGACY_APP_DIR: &str = "git-tui";
+
+/// `$XDG_CONFIG_HOME/agentgit` (or `~/.config/agentgit`); holds
+/// `config.toml` and `session.toml`. `None` when neither env var is set.
+pub fn config_dir() -> Option<PathBuf> {
+    let base = match std::env::var("XDG_CONFIG_HOME") {
+        Ok(xdg) if !xdg.is_empty() => PathBuf::from(xdg),
+        _ => PathBuf::from(std::env::var("HOME").ok()?).join(".config"),
+    };
+    Some(pick_app_dir(&base))
+}
+
+/// `base/agentgit`, unless only the legacy `base/git-tui` exists.
+fn pick_app_dir(base: &Path) -> PathBuf {
+    let dir = base.join(APP_DIR);
+    let legacy = base.join(LEGACY_APP_DIR);
+    if !dir.exists() && legacy.is_dir() {
+        legacy
+    } else {
+        dir
+    }
 }
 
 impl Default for Config {
@@ -339,8 +370,8 @@ impl Config {
         Self::from_toml(&text).with_context(|| format!("bad config {}", path.display()))
     }
 
-    /// Load from `$XDG_CONFIG_HOME/git-tui/config.toml`, falling back to
-    /// `~/.config/git-tui/config.toml`. Missing file means defaults.
+    /// Load from `$XDG_CONFIG_HOME/agentgit/config.toml`, falling back to
+    /// `~/.config/agentgit/config.toml`. Missing file means defaults.
     pub fn load() -> Result<Self> {
         match Self::default_path() {
             Some(path) => Self::load_from_path(&path),
@@ -349,17 +380,7 @@ impl Config {
     }
 
     pub fn default_path() -> Option<PathBuf> {
-        if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
-            if !xdg.is_empty() {
-                return Some(PathBuf::from(xdg).join("git-tui").join("config.toml"));
-            }
-        }
-        std::env::var("HOME").ok().map(|home| {
-            PathBuf::from(home)
-                .join(".config")
-                .join("git-tui")
-                .join("config.toml")
-        })
+        config_dir().map(|d| d.join("config.toml"))
     }
 
     /// Persist just the `[llm]` section to `path`, preserving every other
@@ -378,27 +399,20 @@ impl Config {
             "provider".to_string(),
             toml::Value::String(llm.provider.clone()),
         );
-        table.insert(
-            "model".to_string(),
-            toml::Value::String(llm.model.clone()),
-        );
+        table.insert("model".to_string(), toml::Value::String(llm.model.clone()));
         table.insert(
             "api_key".to_string(),
             toml::Value::String(llm.api_key.clone()),
         );
         if let Some(url) = llm.base_url.as_deref().filter(|u| !u.trim().is_empty()) {
-            table.insert(
-                "base_url".to_string(),
-                toml::Value::String(url.to_string()),
-            );
+            table.insert("base_url".to_string(), toml::Value::String(url.to_string()));
         }
         doc.insert("llm".to_string(), toml::Value::Table(table));
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("cannot create {}", parent.display()))?;
         }
-        let text =
-            toml::to_string_pretty(&doc).context("cannot serialize config")?;
+        let text = toml::to_string_pretty(&doc).context("cannot serialize config")?;
         std::fs::write(path, text)
             .with_context(|| format!("cannot write config {}", path.display()))?;
         Ok(())
@@ -487,6 +501,7 @@ impl Config {
                 "sync_pull" => k.sync_pull = keys,
                 "sync_push" => k.sync_push = keys,
                 "llm_settings" => k.llm_settings = keys,
+                "toggle_markdown_preview" => k.toggle_markdown_preview = keys,
                 _ => anyhow::bail!(
                     "unknown action [{action}] (expected one of: {})",
                     ACTIONS.join(", ")
@@ -754,9 +769,22 @@ mod tests {
     }
 
     #[test]
+    fn app_dir_is_agentgit_unless_only_legacy_exists() {
+        let base = tempfile::TempDir::new().unwrap();
+        // Fresh install: new name.
+        assert_eq!(pick_app_dir(base.path()), base.path().join("agentgit"));
+        // Only the pre-rename dir: keep using it (config + session intact).
+        std::fs::create_dir_all(base.path().join("git-tui")).unwrap();
+        assert_eq!(pick_app_dir(base.path()), base.path().join("git-tui"));
+        // Both present: the new dir wins.
+        std::fs::create_dir_all(base.path().join("agentgit")).unwrap();
+        assert_eq!(pick_app_dir(base.path()), base.path().join("agentgit"));
+    }
+
+    #[test]
     fn save_llm_preserves_other_sections_and_roundtrips() {
         let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("git-tui").join("config.toml");
+        let path = dir.path().join("agentgit").join("config.toml");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(
             &path,

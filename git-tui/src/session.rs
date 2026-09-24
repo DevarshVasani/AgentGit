@@ -1,7 +1,7 @@
 //! Session persistence: which projects were open.
 //!
-//! Stored at `$XDG_CONFIG_HOME/git-tui/session.toml` (or
-//! `~/.config/git-tui/session.toml`). When the app starts with no explicit
+//! Stored at `$XDG_CONFIG_HOME/agentgit/session.toml` (or
+//! `~/.config/agentgit/session.toml`). When the app starts with no explicit
 //! paths, these projects are re-opened; explicit CLI paths override the
 //! session and replace it.
 
@@ -39,17 +39,7 @@ impl Session {
     /// Where the session file lives. `None` when `$HOME` is unset and no
     /// `$XDG_CONFIG_HOME` override exists (then persistence is disabled).
     pub fn default_path() -> Option<PathBuf> {
-        if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
-            if !xdg.is_empty() {
-                return Some(PathBuf::from(xdg).join("git-tui").join("session.toml"));
-            }
-        }
-        std::env::var("HOME").ok().map(|home| {
-            PathBuf::from(home)
-                .join(".config")
-                .join("git-tui")
-                .join("session.toml")
-        })
+        crate::config::config_dir().map(|d| d.join("session.toml"))
     }
 
     /// Load from the default path. Missing file (or no known path) means an
@@ -147,10 +137,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("session.toml");
         let s = Session::new(
-            vec![
-                PathBuf::from("/tmp/api"),
-                PathBuf::from("/tmp/web"),
-            ],
+            vec![PathBuf::from("/tmp/api"), PathBuf::from("/tmp/web")],
             1,
         );
         s.save_to_path(&path).unwrap();

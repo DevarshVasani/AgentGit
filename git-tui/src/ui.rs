@@ -1,7 +1,8 @@
 //! Phase 4: status + diff panels (ratatui).
 
-use crate::app::{App, Focus, Mode, LLM_FIELD_LABELS};
+use crate::app::{App, Focus, Mode, VisualSel, LLM_FIELD_LABELS};
 use crate::config::Theme;
+use crate::markdown::render_markdown;
 use crate::syntax::{highlight_line, HiToken};
 use crate::words::{word_diff, WordSeg};
 use crate::workspace::Workspace;
@@ -65,6 +66,193 @@ fn selection_style(theme: Theme) -> Style {
         .fg(theme.fg)
         .bg(theme.selection_bg)
         .add_modifier(Modifier::BOLD)
+}
+
+/// Paint a rendered line with the line-cursor wash: the
+/// Telescope-style selection background over the whole row (gutter
+/// included) so the cursor line reads as selected. Text colors survive;
+/// only the background is swapped.
+fn cursor_highlight(line: &mut Line<'static>, theme: Theme) {
+    for span in &mut line.spans {
+        span.style = span.style.bg(theme.selection_bg);
+    }
+}
+
+/// Wash one rendered line's absolute screen cells `[start, end)` with
+/// the selection background, splitting boundary spans. Charwise visual
+/// selection edges: only the covered cells change; everything else
+/// (syntax fg, the block cursor's reverse) survives.
+fn wash_cell_range(line: &mut Line<'static>, start: usize, end: usize, theme: Theme) {
+    use unicode_width::UnicodeWidthChar;
+    if start >= end {
+        return;
+    }
+    let mut used = 0usize;
+    let mut si = 0;
+    while si < line.spans.len() {
+        let width: usize = line.spans[si]
+            .content
+            .chars()
+            .map(|c| c.width().unwrap_or(0))
+            .sum();
+        let (s0, s1) = (used, used + width);
+        if s1 <= start || s0 >= end {
+            used = s1;
+            si += 1;
+            continue;
+        }
+        // Overlap: rebuild this span as plain/covered/plain runs.
+        let content = line.spans[si].content.clone();
+        let style = line.spans[si].style;
+        let mut runs: Vec<(String, bool)> = vec![(String::new(), false)];
+        let mut cu = s0;
+        for ch in content.chars() {
+            let w = ch.width().unwrap_or(0);
+            let covered = cu + w > start && cu < end;
+            if covered != runs.last().map(|r| r.1).unwrap_or(false) {
+                runs.push((String::new(), covered));
+            }
+            runs.last_mut().expect("wash always has a run").0.push(ch);
+            cu += w;
+        }
+        let mut new = Vec::with_capacity(runs.len());
+        for (text, covered) in runs {
+            if text.is_empty() {
+                continue;
+            }
+            let style = if covered {
+                style.bg(theme.selection_bg)
+            } else {
+                style
+            };
+            new.push(Span::styled(text, style));
+        }
+        if new.is_empty() {
+            // Only when the span held no chars; drop it, re-examine here.
+            line.spans.remove(si);
+            continue;
+        }
+        used = s1;
+        line.spans.splice(si..si + 1, new.clone());
+        si += new.len();
+    }
+}
+
+/// Wash plan for one diff row under an active visual selection: whole
+/// rows (`Full`) or an exact display-column range (`Partial`, end
+/// exclusive) on the row's cursor side. Del/add pairs wash whole — the
+/// two sides hold different text, so a char range cannot mean the same
+/// thing on both. Partial ranges apply to the first visual row only
+/// (soft-wrapped continuations stay plain); headers are single-line, so
+/// they are always exact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RowWash {
+    None,
+    Full,
+    Partial { start: usize, end: usize },
+}
+
+/// Wash plan for `rows[idx]` under `sel = ((r1, c1), (r2, c2),
+/// linewise)`. `gutter_w` feeds the tab expansion; text comes from the
+/// same [`cursor_line_text`] the yank uses, so the wash and the yanked
+/// text never disagree.
+fn visual_row_wash(
+    diff: &FileDiff,
+    rows: &[DiffRow],
+    idx: usize,
+    sel: VisualSel,
+    gutter_w: usize,
+) -> RowWash {
+    let ((r1, c1), (r2, c2), linewise) = sel;
+    if idx < r1 || idx > r2 {
+        return RowWash::None;
+    }
+    if linewise || (idx > r1 && idx < r2) {
+        return RowWash::Full;
+    }
+    // Charwise boundary row.
+    let row = &rows[idx];
+    if let DiffRow::Split { left, right } = row {
+        if left.kind == SideKind::Del && right.kind == SideKind::Add {
+            return RowWash::Full;
+        }
+    }
+    let text = cursor_line_text(diff, row);
+    if text.is_empty() {
+        return RowWash::None;
+    }
+    // Tab stops count from the text's screen origin: after the gutter
+    // for code, after the 2-cell marker for headers.
+    let origin_gutter = if matches!(row, DiffRow::Header { .. }) {
+        1
+    } else {
+        gutter_w
+    };
+    let (start, end) = if r1 == r2 {
+        (c1, c2.saturating_add(1))
+    } else if idx == r1 {
+        (c1, usize::MAX)
+    } else {
+        (0, c2.saturating_add(1))
+    };
+    let start = expanded_col(&text, start.min(text.chars().count()), origin_gutter);
+    let end = if end == usize::MAX {
+        usize::MAX
+    } else {
+        expanded_col(&text, end.min(text.chars().count() + 1), origin_gutter)
+    };
+    if start >= end {
+        return RowWash::None;
+    }
+    RowWash::Partial { start, end }
+}
+
+/// Block-cursor display cell for hunk-header text: char `col` expanded
+/// from the 2-cell marker start (`gutter_w = 1` reproduces that origin),
+/// clamped onto the last cell like `$`. `None` for empty headers.
+fn header_block_cell(header: &str, col: usize) -> Option<usize> {
+    let tlen = header.chars().count();
+    if tlen == 0 {
+        return None;
+    }
+    let d = expanded_col(header, col.min(tlen - 1), 1);
+    let total = expanded_col(header, tlen, 1);
+    Some(2 + d.min(total.saturating_sub(1)))
+}
+
+/// Nvim block cursor on a hunk-header line: split the span holding
+/// display column `want` (header text starts after the 2-cell `> `/`  `
+/// marker) so exactly that cell stands alone, then reverse it.
+/// Callers clamp `want` inside the line, so a target always exists.
+fn header_block_cursor(line: &mut Line<'static>, want: usize) {
+    use unicode_width::UnicodeWidthChar;
+    let mut used = 0usize;
+    for si in 0..line.spans.len() {
+        let content = line.spans[si].content.clone();
+        let mut byte = 0usize;
+        for ch in content.chars() {
+            let w = ch.width().unwrap_or(0);
+            if want < used + w {
+                let blen = ch.len_utf8();
+                let before = content[..byte].to_string();
+                let target = content[byte..byte + blen].to_string();
+                let after = content[byte + blen..].to_string();
+                let style = line.spans[si].style;
+                let mut new = Vec::with_capacity(3);
+                if !before.is_empty() {
+                    new.push(Span::styled(before, style));
+                }
+                new.push(Span::styled(target, style.add_modifier(Modifier::REVERSED)));
+                if !after.is_empty() {
+                    new.push(Span::styled(after, style));
+                }
+                line.spans.splice(si..si + 1, new);
+                return;
+            }
+            byte += ch.len_utf8();
+            used += w;
+        }
+    }
 }
 
 /// Render the whole screen: a full-width vertical stack (status, files
@@ -158,21 +346,22 @@ pub fn render_workspace(frame: &mut Frame, ws: &Workspace) {
     render_footer(frame, layout.footer, app, true);
 
     match app.mode() {
-        Mode::Committing => render_commit_modal(frame, area, app),
-        Mode::NewBranch => render_input_modal(frame, area, app, " New branch name "),
-        Mode::StashPush => render_input_modal(frame, area, app, " Stash message "),
-        Mode::SetUpstream => render_input_modal(frame, area, app, " Push - set upstream (remote) "),
+        // Center under the project bar in multi-project mode (`body`).
+        Mode::Committing => render_commit_modal(frame, body, app),
+        Mode::NewBranch => render_input_modal(frame, body, app, " New branch name "),
+        Mode::StashPush => render_input_modal(frame, body, app, " Stash message "),
+        Mode::SetUpstream => render_input_modal(frame, body, app, " Push - set upstream (remote) "),
         Mode::SetRemote => {
-            render_input_modal(frame, area, app, " Remote URL for origin (publish) ")
+            render_input_modal(frame, body, app, " Remote URL for origin (publish) ")
         }
-        Mode::OpenProject => render_open_browser_modal(frame, area, app, ws.project_roots()),
-        Mode::ConfirmInit => render_confirm_init_modal(frame, area, app),
-        Mode::LlmSettings => render_llm_modal(frame, area, app),
+        Mode::OpenProject => render_open_browser_modal(frame, body, app, ws.project_roots()),
+        Mode::ConfirmInit => render_confirm_init_modal(frame, body, app),
+        Mode::LlmSettings => render_llm_modal(frame, body, app),
         Mode::FindFile => {
             if app.finder_return() == Mode::FullDiff {
                 render_fullscreen_diff(frame, body, app);
             }
-            render_finder_modal(frame, area, app);
+            render_finder_modal(frame, body, app);
         }
         // The project bar stays on screen; only the body goes fullscreen.
         Mode::FullDiff => render_fullscreen_diff(frame, body, app),
@@ -406,7 +595,7 @@ fn render_files_panel(frame: &mut Frame, area: Rect, app: &App) {
     let focused = app.focus() == Focus::Status;
     let Some(_st) = app.status() else {
         frame.render_widget(
-            Paragraph::new("loading…").block(panel_block(focused, theme, "[2]-Files".to_string())),
+            Paragraph::new("loading…").block(panel_block(focused, theme, "[1]-Files".to_string())),
             area,
         );
         return;
@@ -420,7 +609,7 @@ fn render_files_panel(frame: &mut Frame, area: Rect, app: &App) {
             Paragraph::new("(clean working tree)").block(panel_block(
                 focused,
                 theme,
-                "[2]-Files (0)".to_string(),
+                "[1]-Files (0)".to_string(),
             )),
             area,
         );
@@ -496,7 +685,7 @@ fn render_files_panel(frame: &mut Frame, area: Rect, app: &App) {
         .block(panel_block(
             focused,
             theme,
-            format!("[2]-Files ({} of {})", sel + 1, files.len()),
+            format!("[1]-Files ({} of {})", sel + 1, files.len()),
         ))
         .highlight_style(selection_style(theme))
         .highlight_symbol("> ");
@@ -627,11 +816,72 @@ pub(crate) fn rows_unified_len(rows: &[DiffRow]) -> usize {
 /// the view to the selected hunk. Used against the rows cached in `App`
 /// so no word diffs rerun.
 pub(crate) fn rows_hunk_start(rows: &[DiffRow], index: usize) -> u16 {
-    rows
-        .iter()
+    rows.iter()
         .position(|r| matches!(r, DiffRow::Header { index: i } if *i == index))
         .unwrap_or(0)
         .min(u16::MAX as usize) as u16
+}
+
+/// Logical text under the nvim-style block cursor: the hunk header for
+/// header rows, else the row's new side when it has content
+/// (added/context lines), else its old side (deleted-only lines). Blank
+/// sides carry no text, so the block hides there while the row wash
+/// still marks the cursor row.
+pub(crate) fn cursor_line_text(diff: &FileDiff, row: &DiffRow) -> String {
+    match row {
+        DiffRow::Header { index } => diff
+            .hunks
+            .get(*index)
+            .map(|h| h.header.clone())
+            .unwrap_or_default(),
+        DiffRow::Split { left, right } => {
+            let side = if cursor_side_is_right(left, right) {
+                right
+            } else {
+                left
+            };
+            match side.kind {
+                SideKind::Blank => String::new(),
+                _ => side.segs.iter().map(|s| s.text.as_str()).collect(),
+            }
+        }
+    }
+}
+
+/// Whether the block cursor rides the right side of a split row: the new
+/// side whenever it has content, else the old side. Mirrors
+/// [`cursor_line_text`] so the wash and the block never disagree.
+fn cursor_side_is_right(_left: &Side, right: &Side) -> bool {
+    matches!(right.kind, SideKind::Add | SideKind::Context)
+}
+
+/// Map a logical char index into screen cells, expanding tabs exactly
+/// like [`side_content_cells`] (stops every 8 past the gutter) and
+/// counting wide chars double, so the block cursor lands on the cell the
+/// renderer painted for that char.
+fn expanded_col(text: &str, col: usize, gutter_w: usize) -> usize {
+    use unicode_width::UnicodeWidthChar;
+    const TAB_STOP: usize = 8;
+    let mut used = 0usize;
+    let mut cells = gutter_w + 1;
+    for (i, ch) in text.chars().enumerate() {
+        if i >= col {
+            break;
+        }
+        if ch == '\r' {
+            continue;
+        }
+        if ch == '\t' {
+            let spaces = TAB_STOP - (cells % TAB_STOP);
+            used += spaces;
+            cells += spaces;
+        } else {
+            let w = ch.width().unwrap_or(0);
+            used += w;
+            cells += w;
+        }
+    }
+    used
 }
 
 /// Gutter width: right-aligned numbers, at least 4 digits wide.
@@ -731,9 +981,7 @@ fn side_content_cells(
         let (fg, modifier) = expanded[idx].1;
         let changed_flag = expanded[idx].2;
         let mut j = idx + 1;
-        while j < expanded.len()
-            && expanded[j].1 == (fg, modifier)
-            && expanded[j].2 == changed_flag
+        while j < expanded.len() && expanded[j].1 == (fg, modifier) && expanded[j].2 == changed_flag
         {
             j += 1;
         }
@@ -750,9 +998,7 @@ fn side_content_cells(
         if matches!(side.kind, SideKind::Del | SideKind::Add) {
             style = style.add_modifier(Modifier::BOLD);
         }
-        for k in idx..j {
-            cells.push((expanded[k].0, style));
-        }
+        cells.extend(expanded[idx..j].iter().map(|e| (e.0, style)));
         idx = j;
     }
     (cells, bg)
@@ -761,10 +1007,7 @@ fn side_content_cells(
 /// Split styled cells into at most `WRAP_MAX_LINES` chunks of at most
 /// `content_w` cells each (wide chars never split across rows). Returns the
 /// chunks plus whether content remains past the last chunk.
-fn wrap_cells(
-    cells: &[(char, Style)],
-    content_w: usize,
-) -> (Vec<Vec<(char, Style)>>, bool) {
+fn wrap_cells(cells: &[(char, Style)], content_w: usize) -> (Vec<Vec<(char, Style)>>, bool) {
     use unicode_width::UnicodeWidthChar;
     let mut chunks: Vec<Vec<(char, Style)>> = vec![Vec::new()];
     let mut used = 0;
@@ -782,7 +1025,10 @@ fn wrap_cells(
                 return (chunks, true);
             }
         }
-        chunks.last_mut().expect("wrap always has a chunk").push((ch, style));
+        chunks
+            .last_mut()
+            .expect("wrap always has a chunk")
+            .push((ch, style));
         used += w;
     }
     (chunks, false)
@@ -814,6 +1060,12 @@ fn spans_for_chunk(chunk: &[(char, Style)]) -> Vec<Span<'static>> {
 /// stronger wash. Whole-file views are all-`Context` with no wash, so they
 /// read like a LazyVim buffer: line numbers + full syntax colors.
 ///
+/// `cursor_col` (display column inside the content, post-gutter) paints
+/// the nvim-style block cursor: exactly the cell holding that column gets
+/// reverse video, clamping onto the last cell past the end (like `$`).
+/// An empty line with a cursor shows the block on its first padding cell.
+/// `None` renders no block (other rows, blank padding sides, headers).
+///
 /// The line number shows only on the first row; continuation rows carry a
 /// blank gutter so wrapped text never masquerades as new numbered lines.
 fn render_side(
@@ -822,6 +1074,7 @@ fn render_side(
     width: usize,
     gutter_w: usize,
     theme: Theme,
+    cursor_col: Option<usize>,
 ) -> Vec<Vec<Span<'static>>> {
     use unicode_width::UnicodeWidthChar;
     let gutter_style = Style::default().fg(theme.line_nr).bg(theme.bg);
@@ -845,6 +1098,25 @@ fn render_side(
         return vec![vec![Span::styled(text, gutter_style)]];
     }
     let (cells, bg) = side_content_cells(side, path, gutter_w, theme);
+    let mut cells = cells;
+    if let Some(want) = cursor_col {
+        // Nvim block cursor: reverse exactly the cell holding display
+        // column `want`. Tabs are already expanded above, so columns are
+        // screen cells; past the end clamps onto the last cell (like `$`).
+        let mut used = 0usize;
+        let mut target: Option<usize> = None;
+        for (idx, (ch, _)) in cells.iter().enumerate() {
+            let w = ch.width().unwrap_or(0);
+            if want < used + w {
+                target = Some(idx);
+                break;
+            }
+            used += w;
+        }
+        if let Some(ti) = target.or_else(|| cells.len().checked_sub(1)) {
+            cells[ti].1 = cells[ti].1.add_modifier(Modifier::REVERSED);
+        }
+    }
     let content_w = width - (gutter_w + 1);
     let (mut chunks, truncated) = wrap_cells(&cells, content_w);
     if truncated {
@@ -884,7 +1156,20 @@ fn render_side(
             // Context/blank rows paint the opaque editor background.
             let used: usize = chunk.iter().map(|(ch, _)| ch.width().unwrap_or(0)).sum();
             let pad = content_w.saturating_sub(used);
-            if pad > 0 {
+            if cells.is_empty() && cursor_col.is_some() {
+                // Block cursor on an empty line: reverse the first padding
+                // cell (nvim shows the block even with no text); the rest
+                // pads normally. Blank padding sides pass `None`, so only
+                // a real cursor line ever takes this branch.
+                let mut style = Style::default();
+                if let Some(bg) = bg {
+                    style = style.bg(bg);
+                }
+                spans.push(Span::styled(" ", style.add_modifier(Modifier::REVERSED)));
+                if pad > 1 {
+                    spans.push(Span::styled(" ".repeat(pad - 1), style));
+                }
+            } else if pad > 0 {
                 let mut style = Style::default();
                 if let Some(bg) = bg {
                     style = style.bg(bg);
@@ -922,6 +1207,9 @@ fn expand_changed(segs: &[WordSeg]) -> Vec<bool> {
 /// A unified preview line: single text column with a `-`/`+` marker.
 /// Overlong lines wrap onto a continuation row (blank marker + blank
 /// gutter) so the whole line stays visible instead of being clipped.
+/// `cursor_col` paints the nvim block cursor on this side (see
+/// `render_side`); callers pass it only for the cursor row's cursor side.
+#[allow(clippy::too_many_arguments)]
 fn unified_lines(
     marker: &'static str,
     marker_style: Style,
@@ -930,23 +1218,32 @@ fn unified_lines(
     gutter_w: usize,
     width: usize,
     theme: Theme,
+    cursor_col: Option<usize>,
 ) -> Vec<Line<'static>> {
-    render_side(side, path, width.saturating_sub(2), gutter_w, theme)
-        .into_iter()
-        .enumerate()
-        .map(|(i, spans)| {
-            let mut out = vec![Span::styled(
-                if i == 0 { marker } else { "  " },
-                marker_style,
-            )];
-            out.extend(spans);
-            Line::from(out)
-        })
-        .collect()
+    render_side(
+        side,
+        path,
+        width.saturating_sub(2),
+        gutter_w,
+        theme,
+        cursor_col,
+    )
+    .into_iter()
+    .enumerate()
+    .map(|(i, spans)| {
+        let mut out = vec![Span::styled(
+            if i == 0 { marker } else { "  " },
+            marker_style,
+        )];
+        out.extend(spans);
+        Line::from(out)
+    })
+    .collect()
 }
 
 /// How many unified lines a row expands to (headers count as one).
-fn unified_row_count(row: &DiffRow) -> usize {
+/// Needed by the viewport-follow math in `App`, same module family.
+pub(crate) fn unified_row_count(row: &DiffRow) -> usize {
     match row {
         DiffRow::Header { .. } => 1,
         DiffRow::Split { left, right } => match (&left.kind, &right.kind) {
@@ -963,20 +1260,39 @@ fn unified_row_count(row: &DiffRow) -> usize {
 /// rows (syntax-highlighted). The outer vec is per logical line (headers
 /// count as one); the inner vec holds that line's visual rows after
 /// soft-wrapping. Scroll offsets count logical lines; the viewport fills
-/// with visual rows.
+/// with visual rows. `cursor` is `(block display col, block char col)`
+/// for the cursor row (`None` elsewhere): the display col lands on the
+/// row's cursor side (new side when it has content, else the old side),
+/// the char col on hunk-header text (which has no gutter).
 fn render_unified_row(
     diff: &FileDiff,
     row: &DiffRow,
     gutter_w: usize,
     width: usize,
     theme: Theme,
+    cursor: Option<(Option<usize>, usize)>,
 ) -> Vec<Vec<Line<'static>>> {
     let path = diff.path.as_str();
+    let cursor_col = cursor.and_then(|(d, _)| d);
     match row {
-        DiffRow::Header { index } => vec![vec![Line::from(vec![Span::styled(
-            format!("  {}", diff.hunks[*index].header),
-            Style::default().fg(theme.hint),
-        )])]],
+        DiffRow::Header { index } => {
+            let mut line = Line::from(vec![Span::styled(
+                format!(
+                    "  {}",
+                    diff.hunks
+                        .get(*index)
+                        .map(|h| h.header.as_str())
+                        .unwrap_or("")
+                ),
+                Style::default().fg(theme.hint),
+            )]);
+            if let (Some(h), Some((_, ccol))) = (diff.hunks.get(*index), cursor) {
+                if let Some(cell) = header_block_cell(&h.header, ccol) {
+                    header_block_cursor(&mut line, cell);
+                }
+            }
+            vec![vec![line]]
+        }
         DiffRow::Split { left, right } => match (&left.kind, &right.kind) {
             (SideKind::Context, _) => vec![unified_lines(
                 "  ",
@@ -986,6 +1302,7 @@ fn render_unified_row(
                 gutter_w,
                 width,
                 theme,
+                cursor_col,
             )],
             (SideKind::Del, SideKind::Add) => vec![
                 unified_lines(
@@ -998,6 +1315,7 @@ fn render_unified_row(
                     gutter_w,
                     width,
                     theme,
+                    None,
                 ),
                 unified_lines(
                     "+ ",
@@ -1009,6 +1327,7 @@ fn render_unified_row(
                     gutter_w,
                     width,
                     theme,
+                    cursor_col,
                 ),
             ],
             (SideKind::Del, _) => vec![unified_lines(
@@ -1021,6 +1340,7 @@ fn render_unified_row(
                 gutter_w,
                 width,
                 theme,
+                cursor_col,
             )],
             (_, SideKind::Add) => vec![unified_lines(
                 "+ ",
@@ -1032,6 +1352,7 @@ fn render_unified_row(
                 gutter_w,
                 width,
                 theme,
+                cursor_col,
             )],
             _ => vec![],
         },
@@ -1044,7 +1365,13 @@ fn render_unified_row(
 /// fills with visual rows so wrapped lines stay fully visible.
 /// Takes precomputed `rows` (cached in `App`) so no word diffs rerun;
 /// only the visible window (`skip`, `take`) is syntax-highlighted so
-/// opening a large file stays fast.
+/// opening a large file stays fast. `cursor` is `(row, col)` for the
+/// nvim-style block: the cursor row's logical lines get the selection
+/// wash and its cursor side gets the reversed block cell — unless
+/// `visual` is active, in which case the selection treatment wins
+/// (nvim-like) and the block alone marks the cursor. `visual` is
+/// `((r1, c1), (r2, c2), linewise)`; see `visual_row_wash`.
+#[allow(clippy::too_many_arguments)]
 fn render_unified_lines(
     diff: &FileDiff,
     rows: &[DiffRow],
@@ -1052,21 +1379,77 @@ fn render_unified_lines(
     width: usize,
     skip: usize,
     take: usize,
+    cursor: Option<(usize, usize)>,
+    visual: Option<VisualSel>,
 ) -> (Vec<Line<'static>>, usize) {
     let gutter_w = gutter_width(rows);
     let total: usize = rows_unified_len(rows);
+    let (crow, ccol, c_start, c_end) = cursor
+        .filter(|_| !rows.is_empty())
+        .map(|(r, c)| {
+            let r = r.min(rows.len().saturating_sub(1));
+            let start = rows_unified_len(&rows[..r]);
+            (r, c, start, start + unified_row_count(&rows[r]))
+        })
+        .unwrap_or((usize::MAX, 0, usize::MAX, usize::MAX));
+    // Block column in screen cells for the cursor row (tabs expanded).
+    let dcol = if crow < rows.len() {
+        let text = cursor_line_text(diff, &rows[crow]);
+        if text.is_empty() {
+            None
+        } else {
+            Some(expanded_col(&text, ccol, gutter_w))
+        }
+    } else {
+        None
+    };
     let mut out = Vec::new();
     let mut logical = 0;
-    'rows: for row in rows {
-        for visual in render_unified_row(diff, row, gutter_w, width, theme) {
+    'rows: for (idx, row) in rows.iter().enumerate() {
+        // (block display col for this row, if it is the cursor row; the
+        // char column rides along for hunk-header rows, whose text has no
+        // gutter).
+        let ccol = if idx == crow {
+            Some((dcol, ccol))
+        } else {
+            None
+        };
+        let rwash = visual
+            .map(|s| visual_row_wash(diff, rows, idx, s, gutter_w))
+            .unwrap_or(RowWash::None);
+        for visual_group in render_unified_row(diff, row, gutter_w, width, theme, ccol) {
             if logical < skip {
                 logical += 1;
                 continue;
             }
+            let cursor_hl = logical >= c_start && logical < c_end;
+            let hl = (cursor_hl && visual.is_none()) || rwash == RowWash::Full;
             logical += 1;
-            for vline in visual {
+            // Selection edges wash the first visual row only; wrapped
+            // continuations stay plain. Content starts after the 2-cell
+            // marker and the gutter — headers have no gutter, so their
+            // base is just the marker.
+            let base = if matches!(row, DiffRow::Header { .. }) {
+                2
+            } else {
+                2 + gutter_w + 1
+            };
+            let edge = match rwash {
+                RowWash::Partial { start, end } => Some((base + start, end.saturating_add(base))),
+                _ => None,
+            };
+            for (vi, vline) in visual_group.into_iter().enumerate() {
                 if out.len() >= take {
                     break 'rows;
+                }
+                let mut vline = vline;
+                if hl {
+                    cursor_highlight(&mut vline, theme);
+                }
+                if vi == 0 {
+                    if let Some((s, e)) = edge {
+                        wash_cell_range(&mut vline, s, e, theme);
+                    }
                 }
                 out.push(vline);
             }
@@ -1076,12 +1459,14 @@ fn render_unified_lines(
 }
 
 /// Inline single-column diff preview of the selected file on the right.
-/// Focusable (`tab` / `5`): j/k/Up/Down scroll line by line, PgUp/PgDn
-/// page, Enter opens the fullscreen side-by-side view.
+/// Focusable (`tab` / `5`): j/k/Up/Down move the line cursor, PgUp/PgDn
+/// page it, Enter opens the fullscreen side-by-side view.
 fn render_diff_preview_panel(frame: &mut Frame, area: Rect, app: &App) {
     if area.is_empty() {
         return;
     }
+    // Recorded for the cursor-follow math in `App` (see fullscreen).
+    app.set_prev_view_h(area.height.saturating_sub(2) as usize);
     let theme = app.theme();
     let focused = app.focus() == Focus::Diff;
     let Some(diff) = app.diff() else {
@@ -1096,6 +1481,30 @@ fn render_diff_preview_panel(frame: &mut Frame, area: Rect, app: &App) {
         );
         return;
     };
+    if app.show_markdown_preview() {
+        let title = format!(" [5]-Preview: {} (m=raw) ", diff.path);
+        let inner_w = area.width.saturating_sub(2) as usize;
+        let inner_h = area.height.saturating_sub(2) as usize;
+        let Some(text) = app.markdown_text() else {
+            frame.render_widget(
+                Paragraph::new("rendering markdown…").block(panel_block(focused, theme, title)),
+                area,
+            );
+            return;
+        };
+        let rendered = render_markdown(text, theme, inner_w);
+        let off = (app.diff_scroll() as usize).min(rendered.len());
+        let shown: Vec<Line<'static>> = rendered
+            .into_iter()
+            .skip(off)
+            .take(inner_h.max(1))
+            .collect();
+        frame.render_widget(
+            Paragraph::new(shown).block(panel_block(focused, theme, title)),
+            area,
+        );
+        return;
+    }
     let title = if app.diff_whole_file() {
         format!(" [5]-File: {} ", diff.path)
     } else if app.diff_viewing_staged() == Some(true) {
@@ -1122,7 +1531,16 @@ fn render_diff_preview_panel(frame: &mut Frame, area: Rect, app: &App) {
     } else {
         inner_h
     };
-    let (mut shown, _) = render_unified_lines(diff, rows, theme, inner_w, off, take.max(1));
+    let (mut shown, _) = render_unified_lines(
+        diff,
+        rows,
+        theme,
+        inner_w,
+        off,
+        take.max(1),
+        Some((app.cursor_row(), app.cursor_col())),
+        app.visual_selection(),
+    );
     let remaining = total.saturating_sub(off + shown.len());
     if remaining > 0 && !shown.is_empty() {
         shown.push(Line::from(vec![Span::styled(
@@ -1164,6 +1582,30 @@ fn render_diff_pane(frame: &mut Frame, area: Rect, app: &App) {
         );
         return;
     };
+    if app.show_markdown_preview() {
+        let title = format!(" Full preview: {} (m=raw) ", diff.path);
+        let inner_w = area.width.saturating_sub(2) as usize;
+        let inner_h = area.height.saturating_sub(2) as usize;
+        let Some(text) = app.markdown_text() else {
+            frame.render_widget(
+                Paragraph::new("rendering markdown…").block(panel_block(true, theme, title)),
+                area,
+            );
+            return;
+        };
+        let rendered = render_markdown(text, theme, inner_w);
+        let off = (app.diff_scroll() as usize).min(rendered.len());
+        let shown: Vec<Line<'static>> = rendered
+            .into_iter()
+            .skip(off)
+            .take(inner_h.max(1))
+            .collect();
+        frame.render_widget(
+            Paragraph::new(shown).block(panel_block(true, theme, title)),
+            area,
+        );
+        return;
+    }
     // LazyVim buffer header: file icon + path + mode, like `LazyVim ● file`.
     let title = if app.diff_whole_file() {
         format!(" Full file: {} ", diff.path)
@@ -1196,10 +1638,30 @@ fn render_diff_pane(frame: &mut Frame, area: Rect, app: &App) {
     let path = diff.path.as_str();
     let divider_style = Style::default().fg(theme.line_nr).bg(theme.bg);
     let mut lines: Vec<Line<'static>> = Vec::with_capacity(inner_h);
-    'rows: for row in rows.iter().skip(off) {
+    let cursor = app.cursor_row();
+    // No cursor/selection wash over the Markdown preview (plain scrolling
+    // there). The renderer also records the viewport height for the
+    // cursor-follow math in `App`.
+    let show_cursor = !app.show_markdown_preview();
+    app.set_full_view_h(inner_h);
+    // Active visual selection, if any: ((r1,c1), (r2,c2), linewise).
+    let vis = if show_cursor {
+        app.visual_selection()
+    } else {
+        None
+    };
+    'rows: for (ri, row) in rows.iter().skip(off).enumerate() {
         if lines.len() >= inner_h {
             break;
         }
+        let idx = off + ri;
+        let at_cursor = show_cursor && idx == cursor;
+        // Selection plan for this row. While visual mode is on, the
+        // cursor row shows only its selection treatment (nvim-like).
+        let row_wash = vis
+            .map(|s| visual_row_wash(diff, rows, idx, s, gutter_w))
+            .unwrap_or(RowWash::None);
+        let full_wash = (at_cursor && vis.is_none()) || row_wash == RowWash::Full;
         match row {
             DiffRow::Header { index } => {
                 let selected = *index == app.hunk();
@@ -1210,53 +1672,131 @@ fn render_diff_pane(frame: &mut Frame, area: Rect, app: &App) {
                 } else {
                     Style::default().fg(theme.hint)
                 };
-                lines.push(Line::from(vec![Span::styled(
+                let mut line = Line::from(vec![Span::styled(
                     format!(
                         "{} {}",
                         if selected { ">" } else { " " },
-                        diff.hunks[*index].header
+                        diff.hunks
+                            .get(*index)
+                            .map(|h| h.header.as_str())
+                            .unwrap_or("")
                     ),
                     header_style,
-                )]));
+                )]);
+                if full_wash {
+                    cursor_highlight(&mut line, theme);
+                }
+                // Header text starts after the 2-cell marker.
+                if let RowWash::Partial { start, end } = row_wash {
+                    let end = end.saturating_add(2);
+                    wash_cell_range(&mut line, 2 + start, end, theme);
+                }
+                if at_cursor {
+                    if let Some(h) = diff.hunks.get(*index) {
+                        if let Some(cell) = header_block_cell(&h.header, app.cursor_col()) {
+                            header_block_cursor(&mut line, cell);
+                        }
+                    }
+                }
+                lines.push(line);
             }
             DiffRow::Split { left, right } => {
+                // Block cursor rides the new side when it has content,
+                // else the old side (mirrors `cursor_line_text`).
+                let on_right = cursor_side_is_right(left, right);
+                // Context rows mirror the same text on both sides: a
+                // partial selection edge washes both panes.
+                let both = left.kind == SideKind::Context && right.kind == SideKind::Context;
+                let dcol = if at_cursor {
+                    let text = cursor_line_text(diff, row);
+                    if text.is_empty() {
+                        None
+                    } else {
+                        Some(expanded_col(&text, app.cursor_col(), gutter_w))
+                    }
+                } else {
+                    None
+                };
+                let dcol_left = if on_right { None } else { dcol };
+                let dcol_right = if on_right { dcol } else { None };
+                // Selection edge ranges, absolute screen cells. Left
+                // content starts after its gutter; right content after
+                // the left pane, the divider, and its gutter.
+                let edge = |base: usize| match row_wash {
+                    RowWash::Partial { start, end } => {
+                        Some((base + start, end.saturating_add(base)))
+                    }
+                    _ => None,
+                };
+                let edge_left = edge(gutter_w + 1);
+                let edge_right = edge(half + 1 + gutter_w + 1);
                 // Whole-file opens are one LazyVim buffer: each code line is
                 // painted once, full width — never mirrored into both halves.
                 if app.diff_whole_file() {
                     if left.kind == SideKind::Context {
-                        for spans in render_side(left, path, inner, gutter_w, theme) {
+                        for (i, spans) in render_side(left, path, inner, gutter_w, theme, dcol)
+                            .into_iter()
+                            .enumerate()
+                        {
                             if lines.len() >= inner_h {
                                 break 'rows;
                             }
-                            lines.push(Line::from(spans));
+                            let mut line = Line::from(spans);
+                            if full_wash {
+                                cursor_highlight(&mut line, theme);
+                            }
+                            // First visual row only; wrapped continuations
+                            // stay plain (documented limitation).
+                            if i == 0 {
+                                if let Some((s, e)) = edge_left {
+                                    wash_cell_range(&mut line, s, e, theme);
+                                }
+                            }
+                            lines.push(line);
                         }
                     } else {
                         // Defensive (production whole-file diffs are all
                         // context): stack old/new full-width so no side is
                         // silently dropped.
                         for side in [left, right] {
-                            for spans in render_side(side, path, inner, gutter_w, theme) {
+                            let (d, e) = if std::ptr::eq(side, left) {
+                                (dcol_left, edge_left)
+                            } else {
+                                (dcol_right, edge_right)
+                            };
+                            for (i, spans) in render_side(side, path, inner, gutter_w, theme, d)
+                                .into_iter()
+                                .enumerate()
+                            {
                                 if lines.len() >= inner_h {
                                     break 'rows;
                                 }
-                                lines.push(Line::from(spans));
+                                let mut line = Line::from(spans);
+                                if full_wash {
+                                    cursor_highlight(&mut line, theme);
+                                }
+                                if i == 0 {
+                                    if let Some((s, e)) = e {
+                                        wash_cell_range(&mut line, s, e, theme);
+                                    }
+                                }
+                                lines.push(line);
                             }
                         }
                     }
                     continue;
                 }
-                let left_rows = render_side(left, path, half, gutter_w, theme);
-                let right_rows = render_side(right, path, right_w, gutter_w, theme);
+                let left_rows = render_side(left, path, half, gutter_w, theme, dcol_left);
+                let right_rows = render_side(right, path, right_w, gutter_w, theme, dcol_right);
                 // The shorter half is padded with blank washed rows so the
                 // divider stays aligned across the wrapped height.
                 let height = left_rows.len().max(right_rows.len()).max(1);
-                let blank_left =
-                    render_side(&blank_side(left), path, half, gutter_w, theme)
-                        .into_iter()
-                        .next()
-                        .unwrap_or_default();
+                let blank_left = render_side(&blank_side(left), path, half, gutter_w, theme, None)
+                    .into_iter()
+                    .next()
+                    .unwrap_or_default();
                 let blank_right =
-                    render_side(&blank_side(right), path, right_w, gutter_w, theme)
+                    render_side(&blank_side(right), path, right_w, gutter_w, theme, None)
                         .into_iter()
                         .next()
                         .unwrap_or_default();
@@ -1275,7 +1815,25 @@ fn render_diff_pane(frame: &mut Frame, area: Rect, app: &App) {
                             .cloned()
                             .unwrap_or_else(|| blank_right.clone()),
                     );
-                    lines.push(Line::from(spans));
+                    let mut line = Line::from(spans);
+                    if full_wash {
+                        cursor_highlight(&mut line, theme);
+                    }
+                    // Selection edges wash the first visual row only;
+                    // wrapped continuations stay plain.
+                    if i == 0 {
+                        if !on_right || both {
+                            if let Some((s, e)) = edge_left {
+                                wash_cell_range(&mut line, s, e, theme);
+                            }
+                        }
+                        if on_right || both {
+                            if let Some((s, e)) = edge_right {
+                                wash_cell_range(&mut line, s, e, theme);
+                            }
+                        }
+                    }
+                    lines.push(line);
                 }
             }
         }
@@ -1339,7 +1897,7 @@ fn footer_hints(app: &App, theme: Theme, multi: bool) -> Paragraph<'static> {
         Mode::SetUpstream => "←/→ move · Home/End jump · Del deletes · Enter push -u · Esc cancel",
         Mode::SetRemote => "←/→ move · Home/End jump · Del deletes · Enter add origin + push · Esc cancel",
         Mode::FullDiff => {
-            "j/k hunk · ↑/↓ scroll · space stage hunk · PgUp/PgDn page · / find · p pull · P push · esc close · q close · Q quit"
+            "j/k/↑/↓ line · h/l/←/→ col · J/K hunk · 0/Home/End · v/V select · y yank · space stage hunk · PgUp/PgDn page · m preview · / find · p pull · P push · esc leave/close · q close · Q quit"
         }
         Mode::Normal if app.focus() == Focus::Branches => {
             "enter checkout · a new branch · D delete · tab commits · q close · Q quit"
@@ -1349,7 +1907,7 @@ fn footer_hints(app: &App, theme: Theme, multi: bool) -> Paragraph<'static> {
             "enter pop · a stash · D drop · tab files · q close · Q quit"
         }
         Mode::Normal if app.focus() == Focus::Diff => {
-            "j/k/↑/↓ scroll file · PgUp/PgDn page · enter full screen · ←/1 files · tab files · q close · Q quit"
+            "j/k/↑/↓ line · h/l col · v/V select · y yank · PgUp/PgDn page · enter full screen · ←/1 files · tab files · q close · Q quit"
         }
         Mode::FindFile => "type to filter · ↑/↓ move · ←/→ edit · enter open · esc cancel",
         Mode::LlmSettings => "tab/↑↓ switch field · ←/→ edit · enter save · esc cancel",
@@ -1358,7 +1916,7 @@ fn footer_hints(app: &App, theme: Theme, multi: bool) -> Paragraph<'static> {
         }
         Mode::ConfirmInit => "enter git init here · esc back · any other key picks another folder",
         Mode::Normal => {
-            "space stage · ▶ dir all · c commit · A llm · p pull · P push · / find · enter diff · Shift+→/5 file · o open · r refresh · q close · Q quit"
+            "space stage · ▶ dir all · c commit · A llm · m preview · p pull · P push · / find · enter diff · Shift+→/5 file · o open · r refresh · q close · Q quit"
         }
     };
     let switch = if multi && app.mode() == Mode::Normal {
@@ -1366,8 +1924,14 @@ fn footer_hints(app: &App, theme: Theme, multi: bool) -> Paragraph<'static> {
     } else {
         ""
     };
+    // Nvim-style mode readout while selecting.
+    let vis = match app.visual() {
+        Some(v) if v.mode == crate::app::VisualMode::Linewise => "-- VISUAL LINE -- · ",
+        Some(_) => "-- VISUAL -- · ",
+        None => "",
+    };
     Paragraph::new(Line::styled(
-        format!("{base}{switch}"),
+        format!("{vis}{base}{switch}"),
         Style::default().fg(theme.hint),
     ))
 }
@@ -1437,7 +2001,8 @@ fn render_finder_modal(frame: &mut Frame, area: Rect, app: &App) {
     let inner_h = popup.height.saturating_sub(2) as usize;
     let mut lines: Vec<Line<'static>> = Vec::with_capacity(inner_h);
     // Query line (scrolls when longer than the box).
-    let (query, query_cursor) = input_window(app.draft(), app.draft_cursor(), inner_w.saturating_sub(2));
+    let (query, query_cursor) =
+        input_window(app.draft(), app.draft_cursor(), inner_w.saturating_sub(2));
     lines.push(Line::from(vec![
         Span::styled(
             "> ",
@@ -1497,12 +2062,13 @@ fn render_finder_modal(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 /// Commit modal title: shows the generating state while the LLM call is
-/// in flight so Shift+A has visible feedback.
+/// in flight so Shift+A has visible feedback. The Shift+A hint lives in
+/// the footer (and the empty-state placeholder), not the title.
 fn commit_title(app: &App) -> &'static str {
     if app.is_generating() {
-        " Commit message (generating…) "
+        " Commit message · generating… "
     } else {
-        " Commit message (Shift+A generates) "
+        " Commit message "
     }
 }
 
@@ -1513,10 +2079,7 @@ fn render_llm_modal(frame: &mut Frame, area: Rect, app: &App) {
     let theme = app.theme();
     let popup = centered_rect(area, 76, 8);
     frame.render_widget(Clear, popup);
-    frame.render_widget(
-        Block::default().style(Style::default().bg(theme.bg)),
-        popup,
-    );
+    frame.render_widget(Block::default().style(Style::default().bg(theme.bg)), popup);
     let block = panel_block(
         true,
         theme,
@@ -1563,92 +2126,176 @@ fn render_llm_modal(frame: &mut Frame, area: Rect, app: &App) {
     }
 }
 
-/// Wrap a (possibly multi-line) draft into display rows of `width` cells,
-/// plus the cursor's (row, col) inside them. Hard newlines (e.g. from a
-/// generated message) break rows; long rows soft-wrap so the commit box
-/// grows vertically instead of scrolling horizontally.
-fn wrap_draft_lines(text: &str, cursor: usize, width: usize) -> (Vec<String>, usize, usize) {
+/// Soft-wrap result for the commit draft: display rows, the char range of
+/// each row, and the cursor's (row, col) in display cells.
+pub(crate) struct DraftWrap {
+    pub rows: Vec<String>,
+    /// `(start, end)` char-index range for each row (`end` exclusive).
+    /// Ranges are contiguous within a hard line; a skipped `\n` gaps them.
+    pub bounds: Vec<(usize, usize)>,
+    pub cursor_row: usize,
+    pub cursor_col: usize,
+}
+
+/// Wrap a (possibly multi-line) draft into display rows of `width` cells.
+/// Hard newlines break rows; long rows soft-wrap on word boundaries when
+/// possible (char fallback for overlong words) so the commit box grows
+/// vertically instead of scrolling horizontally. All chars are kept in
+/// order across rows so the cursor maps exactly.
+pub(crate) fn wrap_draft(text: &str, cursor: usize, width: usize) -> DraftWrap {
     use unicode_width::UnicodeWidthChar;
     let width = width.max(1);
     let chars: Vec<char> = text.chars().collect();
     let cursor = cursor.min(chars.len());
-    let mut rows: Vec<String> = Vec::new();
-    let mut cur = String::new();
-    let mut col = 0usize;
-    let (mut crow, mut ccol) = (0usize, 0usize);
+
+    // Hard lines as char-index ranges (`\n` excluded).
+    let mut hard: Vec<(usize, usize)> = Vec::new();
+    let mut hs = 0;
     for (i, ch) in chars.iter().enumerate() {
-        if i == cursor {
-            crow = rows.len();
-            ccol = col;
-        }
         if *ch == '\n' {
-            rows.push(std::mem::take(&mut cur));
-            col = 0;
+            hard.push((hs, i));
+            hs = i + 1;
+        }
+    }
+    hard.push((hs, chars.len()));
+
+    let mut rows: Vec<String> = Vec::new();
+    let mut bounds: Vec<(usize, usize)> = Vec::new();
+    for (line_start, line_end) in hard {
+        if line_start >= line_end {
+            rows.push(String::new());
+            bounds.push((line_start, line_end));
             continue;
         }
-        let w = ch.width().unwrap_or(0);
-        if w > 0 && col + w > width {
-            rows.push(std::mem::take(&mut cur));
-            col = 0;
+        let mut i = line_start;
+        while i < line_end {
+            let mut j = i;
+            let mut col = 0usize;
+            while j < line_end {
+                let w = chars[j].width().unwrap_or(0);
+                if w > 0 && col + w > width {
+                    break;
+                }
+                col += w;
+                j += 1;
+            }
+            if j == i {
+                // Zero-width / overwide single char: force progress.
+                j = (i + 1).min(line_end);
+            }
+            if j >= line_end {
+                rows.push(chars[i..line_end].iter().collect());
+                bounds.push((i, line_end));
+                i = line_end;
+                continue;
+            }
+            // Prefer the last word boundary strictly after `i` inside the
+            // fitting span; otherwise hard-break at `j`.
+            let mut break_at = j;
+            for p in (i + 1..j).rev() {
+                if chars[p].is_whitespace() {
+                    break_at = p + 1;
+                    break;
+                }
+            }
+            rows.push(chars[i..break_at].iter().collect());
+            bounds.push((i, break_at));
+            i = break_at;
         }
-        cur.push(*ch);
-        col += w;
     }
-    if cursor == chars.len() {
-        crow = rows.len();
-        ccol = col;
+
+    // Cursor: earliest row whose end covers it (end-of-row wins over the
+    // next row's start, matching the pre-word-wrap convention).
+    let mut cursor_row = 0;
+    let mut cursor_col = 0;
+    for (idx, &(rs, re)) in bounds.iter().enumerate() {
+        if cursor <= re {
+            cursor_row = idx;
+            cursor_col = chars[rs..cursor]
+                .iter()
+                .map(|c| c.width().unwrap_or(0))
+                .sum();
+            break;
+        }
     }
-    rows.push(cur);
-    (rows, crow, ccol)
+
+    DraftWrap {
+        rows,
+        bounds,
+        cursor_row,
+        cursor_col,
+    }
+}
+
+/// Thin wrapper over [`wrap_draft`] for renderers and tests that only need
+/// the display rows and cursor cell.
+fn wrap_draft_lines(text: &str, cursor: usize, width: usize) -> (Vec<String>, usize, usize) {
+    let w = wrap_draft(text, cursor, width);
+    (w.rows, w.cursor_row, w.cursor_col)
 }
 
 /// Commit message box: wraps and grows vertically with the message.
-/// Single-line subjects stay one row; long lines soft-wrap and generated
-/// multi-line messages keep their hard breaks. Enter still commits,
-/// Up/Down move between lines, Esc cancels.
+/// Single-line subjects stay one row; long lines soft-wrap on word
+/// boundaries and generated multi-line messages keep their hard breaks.
+/// Enter commits, ↑/↓ move by visual row, Esc cancels.
 fn render_commit_modal(frame: &mut Frame, area: Rect, app: &App) {
-    // While the LLM call is in flight and the draft is still empty, show a
-    // placeholder so the modal doesn't look stuck on a blank line.
-    let text = if app.is_generating() && app.draft().is_empty() {
-        "generating…"
+    let theme = app.theme();
+    // Width is fixed; height follows the wrapped content with a floor so
+    // the empty box still reads as a text area (centered_rect clamps both
+    // to the screen).
+    let popup_w = 60u16.min(area.width.saturating_sub(2)).max(3);
+    let inner_w = popup_w.saturating_sub(2).max(1) as usize;
+    // Record the content width so ↑/↓ navigate the same soft-wrapped rows.
+    app.set_draft_wrap_width(inner_w);
+
+    let draft_empty = app.draft().is_empty();
+    let (rows, crow, ccol) = if draft_empty {
+        // Placeholders are display-only: they never feed wrap/cursor math.
+        (Vec::new(), 0usize, 0usize)
     } else {
-        app.draft()
+        wrap_draft_lines(app.draft(), app.draft_cursor(), inner_w)
     };
-    // Width is fixed; height follows the wrapped content (centered_rect
-    // clamps both to the screen).
-    let inner_w = 60u16.min(area.width.saturating_sub(2)).max(1).saturating_sub(2).max(1) as usize;
-    let (rows, crow, ccol) = wrap_draft_lines(text, app.draft_cursor(), inner_w);
+    let content_rows = if draft_empty { 1 } else { rows.len() };
     let popup = centered_rect(
         area,
-        60,
-        rows.len().saturating_add(2).min(u16::MAX as usize) as u16,
+        popup_w,
+        (content_rows as u16).saturating_add(2).max(5),
     );
     frame.render_widget(Clear, popup);
+    // Clear wipes to the terminal default; repaint the opaque base first.
+    frame.render_widget(Block::default().style(Style::default().bg(theme.bg)), popup);
     let inner_h = popup.height.saturating_sub(2) as usize;
     // Scroll vertically only when the message outgrows the screen: keep
     // the cursor row visible.
-    let start = if inner_h == 0 {
+    let start = if draft_empty || inner_h == 0 {
         0
     } else {
         crow.saturating_sub(inner_h.saturating_sub(1))
             .min(rows.len().saturating_sub(inner_h))
     };
-    let lines: Vec<Line<'static>> = rows
-        .iter()
-        .skip(start)
-        .take(inner_h.max(1))
-        .map(|r| Line::raw(r.clone()))
-        .collect();
+    let lines: Vec<Line<'static>> = if draft_empty {
+        let placeholder = if app.is_generating() {
+            "generating…"
+        } else {
+            "Type a message… · Shift+A for AI"
+        };
+        vec![Line::styled(
+            placeholder.to_string(),
+            Style::default().fg(theme.hint),
+        )]
+    } else {
+        rows.iter()
+            .skip(start)
+            .take(inner_h.max(1))
+            .map(|r| Line::raw(r.clone()))
+            .collect()
+    };
     frame.render_widget(
-        Paragraph::new(lines).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .title(commit_title(app)),
-        ),
+        Paragraph::new(lines).block(panel_block(true, theme, commit_title(app).to_string())),
         popup,
     );
-    // Cursor tracks the true edit position, even when wrapped/scrolled.
+    // Cursor tracks the true edit position (start of the box when showing
+    // a placeholder), even when wrapped/scrolled.
     let cursor_x = popup.x + 1 + ccol as u16;
     let cursor_y = popup.y + 1 + crow.saturating_sub(start) as u16;
     if cursor_x < popup.x + popup.width.saturating_sub(1)
@@ -1702,10 +2349,7 @@ fn render_open_browser_modal(
     };
     let popup = centered_rect(area, 76, 18);
     frame.render_widget(Clear, popup);
-    frame.render_widget(
-        Block::default().style(Style::default().bg(theme.bg)),
-        popup,
-    );
+    frame.render_widget(Block::default().style(Style::default().bg(theme.bg)), popup);
     let block = panel_block(true, theme, " Open project ".to_string());
     let inner_w = popup.width.saturating_sub(2) as usize;
     let inner_h = popup.height.saturating_sub(2) as usize;
@@ -1725,9 +2369,7 @@ fn render_open_browser_modal(
         ),
         Span::styled(
             cwd,
-            Style::default()
-                .fg(theme.fg)
-                .add_modifier(Modifier::BOLD),
+            Style::default().fg(theme.fg).add_modifier(Modifier::BOLD),
         ),
     ]));
     if browser.editing_path {
@@ -1754,7 +2396,9 @@ fn render_open_browser_modal(
         }
         lines.push(Line::from(vec![Span::styled(
             text,
-            Style::default().fg(theme.error).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme.error)
+                .add_modifier(Modifier::BOLD),
         )]));
     }
 
@@ -1762,9 +2406,7 @@ fn render_open_browser_modal(
     let total = browser.row_count();
     let cursor = browser.selected.min(total.saturating_sub(1));
     let rows = inner_h.saturating_sub(lines.len());
-    let start = cursor
-        .saturating_sub(rows.saturating_sub(1))
-        .min(total);
+    let start = cursor.saturating_sub(rows.saturating_sub(1)).min(total);
     for (row, index) in (start..total).take(rows).enumerate() {
         let selected = start + row == cursor;
         let style = if selected {
@@ -1781,7 +2423,9 @@ fn render_open_browser_modal(
                 spans.push(Span::styled(".".to_string(), style));
                 spans.push(Span::styled(
                     "  (open this folder)".to_string(),
-                    Style::default().fg(theme.hint).bg(style.bg.unwrap_or(theme.bg)),
+                    Style::default()
+                        .fg(theme.hint)
+                        .bg(style.bg.unwrap_or(theme.bg)),
                 ));
             }
             BrowserRow::Parent => {
@@ -1816,11 +2460,11 @@ fn render_open_browser_modal(
                 }
             }
         }
-        let used: usize = spans
-            .iter()
-            .map(|s| s.content.width())
-            .sum();
-        spans.push(Span::styled(" ".repeat(inner_w.saturating_sub(used)), style));
+        let used: usize = spans.iter().map(|s| s.content.width()).sum();
+        spans.push(Span::styled(
+            " ".repeat(inner_w.saturating_sub(used)),
+            style,
+        ));
         lines.push(Line::from(spans));
     }
     frame.render_widget(Paragraph::new(lines).block(block), popup);
@@ -2123,7 +2767,7 @@ mod tests {
         assert!(s.contains("main"), "branch missing:\n{s}");
         assert!(s.contains("a.txt"), "file missing:\n{s}");
         assert!(s.contains("b.txt"), "file missing:\n{s}");
-        assert!(s.contains("[2]-Files"), "panel number missing:\n{s}");
+        assert!(s.contains("[1]-Files"), "panel number missing:\n{s}");
     }
 
     #[test]
@@ -2254,7 +2898,7 @@ mod tests {
             ("README.md", FileState::Untracked),
         ]);
         let s = screen(&app, 100, 32);
-        assert!(s.contains("[2]-Files"), "panel number missing:\n{s}");
+        assert!(s.contains("[1]-Files"), "panel number missing:\n{s}");
         assert!(s.contains("src/"), "dir header missing:\n{s}");
         assert!(s.contains("main.rs"), "basename missing:\n{s}");
         assert!(s.contains("1 of 3"), "counter missing:\n{s}");
@@ -2335,10 +2979,13 @@ mod tests {
             }],
             kind: SideKind::Context,
         };
-        let rows = render_side(&side, "main.rs", 40, 4, Theme::tokyo_night());
+        let rows = render_side(&side, "main.rs", 40, 4, Theme::tokyo_night(), None);
         assert_eq!(rows.len(), 1, "short line must stay on one row");
         let text: String = rows[0].iter().map(|s| s.content.as_ref()).collect();
-        assert!(!text.contains('\t'), "raw tab leaks into rendering: {text:?}");
+        assert!(
+            !text.contains('\t'),
+            "raw tab leaks into rendering: {text:?}"
+        );
         // Gutter is "   1 " (5 cells); the tab jumps to stop 8: 3 spaces.
         assert!(
             text.starts_with("   1    fn main() {}"),
@@ -2358,11 +3005,14 @@ mod tests {
             kind: SideKind::Context,
         };
         for width in [10, 20, 40] {
-            let rows = render_side(&side, "main.rs", width, 4, Theme::tokyo_night());
+            let rows = render_side(&side, "main.rs", width, 4, Theme::tokyo_night(), None);
             assert_eq!(rows.len(), 2, "overlong line must wrap, width {width}");
             for (i, spans) in rows.iter().enumerate() {
                 let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
-                assert!(!text.contains('\t'), "raw tab leaks into rendering: {text:?}");
+                assert!(
+                    !text.contains('\t'),
+                    "raw tab leaks into rendering: {text:?}"
+                );
                 assert_eq!(
                     spans.iter().map(Span::width).sum::<usize>(),
                     width,
@@ -2371,7 +3021,10 @@ mod tests {
             }
             // Still more content past two rows: the tail is cut with `…`.
             let tail: String = rows[1].iter().map(|s| s.content.as_ref()).collect();
-            assert!(tail.ends_with('…'), "overflow must be marked, got: {tail:?}");
+            assert!(
+                tail.ends_with('…'),
+                "overflow must be marked, got: {tail:?}"
+            );
         }
     }
 
@@ -2386,7 +3039,7 @@ mod tests {
             kind: SideKind::Del,
         };
         for width in [0, 2, 6, 20, 31] {
-            let rows = render_side(&side, "a.rs", width, 4, Theme::tokyo_night());
+            let rows = render_side(&side, "a.rs", width, 4, Theme::tokyo_night(), None);
             assert!(rows.len() <= 2, "at most two visual rows, width {width}");
             for (i, spans) in rows.iter().enumerate() {
                 assert_eq!(
@@ -2408,7 +3061,7 @@ mod tests {
             }],
             kind: SideKind::Context,
         };
-        let rows = render_side(&side, "a.txt", 40, 4, Theme::tokyo_night());
+        let rows = render_side(&side, "a.txt", 40, 4, Theme::tokyo_night(), None);
         assert_eq!(rows.len(), 2);
         let first: String = rows[0].iter().map(|s| s.content.as_ref()).collect();
         let second: String = rows[1].iter().map(|s| s.content.as_ref()).collect();
@@ -2431,10 +3084,13 @@ mod tests {
             }],
             kind: SideKind::Context,
         };
-        let rows = render_side(&side, "a.txt", 40, 4, Theme::tokyo_night());
+        let rows = render_side(&side, "a.txt", 40, 4, Theme::tokyo_night(), None);
         assert_eq!(rows.len(), 1);
         let text: String = rows[0].iter().map(|s| s.content.as_ref()).collect();
-        assert!(!text.contains('…'), "short line must not be marked: {text:?}");
+        assert!(
+            !text.contains('…'),
+            "short line must not be marked: {text:?}"
+        );
     }
 
     #[test]
@@ -2449,7 +3105,7 @@ mod tests {
                     }],
                     kind,
                 };
-                let rows = render_side(&side, "main.rs", 40, 4, theme);
+                let rows = render_side(&side, "main.rs", 40, 4, theme, None);
                 assert_eq!(rows.len(), 1, "short line must stay on one row");
                 let keyword = rows[0].iter().find(|s| s.content == "fn").unwrap();
                 let Color::Rgb(r, g, b) = keyword.style.bg.unwrap() else {
@@ -2525,6 +3181,95 @@ mod tests {
     }
 
     #[test]
+    fn wrap_draft_lines_prefers_word_boundaries() {
+        // "hello world foo" at width 11: break after the last space that
+        // fits, so "world foo" stays together on the next row.
+        let (rows, _, _) = wrap_draft_lines("hello world foo", 0, 11);
+        assert_eq!(rows, vec!["hello ", "world foo"]);
+        // Overlong words fall back to a hard char break.
+        let (rows, _, _) = wrap_draft_lines("abcdefghij", 0, 4);
+        assert_eq!(rows, vec!["abcd", "efgh", "ij"]);
+    }
+
+    /// Each buffer row as a String of first-chars (one per cell).
+    fn commit_rows(buf: &ratatui::buffer::Buffer) -> Vec<String> {
+        (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol().chars().next().unwrap_or(' '))
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// (x, y) of the commit modal's top-left `╭`: walk left from the
+    /// " Commit message" title on its border row. Char indices, not bytes.
+    fn commit_modal_origin(rows: &[String]) -> Option<(u16, u16)> {
+        for (y, row) in rows.iter().enumerate() {
+            let chars: Vec<char> = row.chars().collect();
+            let title: Vec<char> = " Commit message".chars().collect();
+            if chars.len() < title.len() {
+                continue;
+            }
+            for i in 0..=chars.len() - title.len() {
+                if chars[i..i + title.len()] == title[..] {
+                    let x = (0..i).rev().find(|&j| chars[j] == '╭')?;
+                    return Some((x as u16, y as u16));
+                }
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn commit_modal_has_themed_chrome_and_placeholder() {
+        use crossterm::event::KeyCode;
+        let (_dir, mut app) = with_files(&[("a.txt", FileState::Unstaged)]);
+        app.on_key(KeyCode::Char('c'));
+        let theme = app.theme();
+        let buf = render_buf(&app, 80, 24);
+        let rows = commit_rows(&buf);
+        let (tx, ty) = commit_modal_origin(&rows).expect("commit modal title/corner");
+        assert_eq!(buf[(tx, ty)].symbol(), "╭", "origin must be the corner");
+        assert_eq!(
+            buf[(tx, ty)].fg,
+            theme.border_focused,
+            "modal border must use the focused theme color"
+        );
+        // "╭ Commit message" → C is two cells right of the corner.
+        let title_x = tx + 2;
+        assert_eq!(buf[(title_x, ty)].symbol(), "C");
+        assert_eq!(buf[(title_x, ty)].fg, theme.border_focused);
+        let s = screen(&app, 80, 24);
+        assert!(
+            s.contains("Type a message"),
+            "empty-state placeholder missing:\n{s}"
+        );
+        assert!(
+            !s.contains("(Shift+A generates)"),
+            "title should not carry the permanent Shift+A hint:\n{s}"
+        );
+    }
+
+    #[test]
+    fn commit_modal_min_height_when_empty() {
+        use crossterm::event::KeyCode;
+        let (_dir, mut app) = with_files(&[("a.txt", FileState::Unstaged)]);
+        app.on_key(KeyCode::Char('c'));
+        let buf = render_buf(&app, 80, 24);
+        let rows = commit_rows(&buf);
+        let (tx, ty) = commit_modal_origin(&rows).expect("commit modal");
+        let by = (ty as usize + 1..rows.len())
+            .find(|&y| rows[y].chars().nth(tx as usize) == Some('╰'))
+            .expect("modal bottom-left");
+        let height = by - ty as usize + 1;
+        assert!(
+            height >= 5,
+            "empty commit box must keep min height 5, got {height}"
+        );
+    }
+
+    #[test]
     fn commit_modal_grows_vertically_with_long_message() {
         use crossterm::event::KeyCode;
         let (_dir, mut app) = with_files(&[("a.txt", FileState::Unstaged)]);
@@ -2557,9 +3302,19 @@ mod tests {
             app.on_key(KeyCode::Char(c));
         }
         let s = screen(&app, 80, 24);
-        let subject_row = s.lines().position(|l| l.contains("subject")).expect("subject row");
-        let body_row = s.lines().position(|l| l.contains("body line")).expect("body row");
-        assert_eq!(body_row, subject_row + 1, "hard break must start a new row:\n{s}");
+        let subject_row = s
+            .lines()
+            .position(|l| l.contains("subject"))
+            .expect("subject row");
+        let body_row = s
+            .lines()
+            .position(|l| l.contains("body line"))
+            .expect("body row");
+        assert_eq!(
+            body_row,
+            subject_row + 1,
+            "hard break must start a new row:\n{s}"
+        );
     }
 
     #[test]
@@ -2877,12 +3632,313 @@ mod tests {
         let (_dir, mut app) = with_files(&[("a.txt", FileState::Unstaged)]);
         app.set_diff_for_test(sample_diff(), false);
         app.on_key(KeyCode::Enter);
-        app.on_key(KeyCode::Char('j'));
+        app.on_key(KeyCode::Char('J'));
         let s = screen(&app, 70, 16);
         assert!(
             s.contains("> @@ -30,2 +30,2 @@"),
             "selected hunk not marked:\n{s}"
         );
+    }
+
+    #[test]
+    fn block_cursor_reverses_exactly_one_cell() {
+        use crossterm::event::KeyCode;
+        use ratatui::style::Modifier;
+        let (_dir, mut app) = with_files(&[("a.txt", FileState::Unstaged)]);
+        app.set_diff_for_test(mini_diff(), false);
+        app.on_key(KeyCode::Enter);
+        // Row 1 is the `same` context line; column 1 is its `a`.
+        app.on_key(KeyCode::Char('j'));
+        app.on_key(KeyCode::Char('l'));
+        let buf = render_buf(&app, 70, 20);
+        let mut reversed: Vec<(u16, u16)> = Vec::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                if buf[(x, y)].modifier.contains(Modifier::REVERSED) {
+                    reversed.push((x, y));
+                }
+            }
+        }
+        assert_eq!(reversed.len(), 1, "block cursor is one cell: {reversed:?}");
+        let (x, y) = reversed[0];
+        assert_eq!(buf[(x, y)].symbol(), "a");
+        // It sits inside a `same` run (the cursor line shows twice:
+        // left and right panes; the block is on the new side).
+        let line: String = (0..buf.area.width)
+            .map(|xx| buf[(xx, y)].symbol().to_string())
+            .collect();
+        assert!(line.contains("same"), "block must sit on `same`:\n{line}");
+    }
+
+    #[test]
+    fn block_cursor_sits_on_header_text_too() {
+        use crossterm::event::KeyCode;
+        use ratatui::style::Modifier;
+        let (_dir, mut app) = with_files(&[("a.txt", FileState::Unstaged)]);
+        app.set_diff_for_test(sample_diff(), false);
+        app.on_key(KeyCode::Enter);
+        // Cursor starts on header row 0; column 2 is inside `@@ -1,3 ...`.
+        assert_eq!(app.cursor_row(), 0);
+        app.on_key(KeyCode::Char('l'));
+        app.on_key(KeyCode::Char('l'));
+        assert_eq!(app.cursor_col(), 2);
+        let buf = render_buf(&app, 70, 20);
+        let mut reversed = 0;
+        for y in 0..buf.area.height {
+            let line: String = (0..buf.area.width)
+                .map(|x| buf[(x, y)].symbol().to_string())
+                .collect();
+            if line.contains("@@ -1,3 +1,3 @@") {
+                reversed += (0..buf.area.width)
+                    .filter(|&x| buf[(x, y)].modifier.contains(Modifier::REVERSED))
+                    .count();
+            }
+        }
+        assert_eq!(reversed, 1, "header line must carry one block cell");
+    }
+
+    #[test]
+    fn visual_linewise_washes_whole_rows() {
+        use crossterm::event::KeyCode;
+        let (_dir, mut app) = with_files(&[("a.txt", FileState::Unstaged)]);
+        app.set_diff_for_test(mini_diff(), false);
+        app.on_key(KeyCode::Enter);
+        // Anchor on the header, extend onto the `same` line, linewise.
+        app.on_key(KeyCode::Char('V'));
+        app.on_key(KeyCode::Char('j'));
+        let buf = render_buf(&app, 70, 20);
+        let theme = crate::config::Theme::default_theme();
+        let mut same_cells = 0;
+        let mut same_washed = 0;
+        let mut world_washed = 0;
+        for y in 0..buf.area.height {
+            let cells: Vec<String> = (0..buf.area.width)
+                .map(|x| buf[(x, y)].symbol().to_string())
+                .collect();
+            for x in 0..cells.len().saturating_sub(4) {
+                if cells[x..x + 4] == ["s", "a", "m", "e"] {
+                    same_cells += 1;
+                    if buf[(x as u16, y)].bg == theme.selection_bg {
+                        same_washed += 1;
+                    }
+                }
+                if x + 5 <= cells.len()
+                    && cells[x..x + 5] == ["W", "O", "R", "L", "D"]
+                    && buf[(x as u16, y)].bg == theme.selection_bg
+                {
+                    world_washed += 1;
+                }
+            }
+        }
+        assert!(same_cells > 0, "`same` not rendered");
+        assert_eq!(
+            same_washed, same_cells,
+            "every `same` cell must carry the selection wash"
+        );
+        assert_eq!(world_washed, 0, "row outside the selection must not wash");
+    }
+
+    #[test]
+    fn visual_charwise_washes_exact_columns() {
+        use crossterm::event::KeyCode;
+        let (_dir, mut app) = with_files(&[("a.txt", FileState::Unstaged)]);
+        app.set_diff_for_test(mini_diff(), false);
+        app.on_key(KeyCode::Enter);
+        // Anchor (1,1) on `same`, extend to column 2: selects `am`.
+        app.on_key(KeyCode::Char('j'));
+        app.on_key(KeyCode::Char('l'));
+        app.on_key(KeyCode::Char('v'));
+        app.on_key(KeyCode::Char('l'));
+        let buf = render_buf(&app, 70, 20);
+        let theme = crate::config::Theme::default_theme();
+        // Right (new-side) pane holds the cursor side: `a`+`m` washed,
+        // `s`+`e` plain. Left pane mirrors context text, washed the same.
+        let mut washed: Vec<String> = Vec::new();
+        let mut plain: Vec<String> = Vec::new();
+        for y in 0..buf.area.height {
+            let cells: Vec<String> = (0..buf.area.width)
+                .map(|x| buf[(x, y)].symbol().to_string())
+                .collect();
+            for x in 0..cells.len().saturating_sub(4) {
+                if cells[x..x + 4] == ["s", "a", "m", "e"] {
+                    for (i, ch) in ["s", "a", "m", "e"].iter().enumerate() {
+                        if buf[(x as u16 + i as u16, y)].bg == theme.selection_bg {
+                            washed.push(ch.to_string());
+                        } else {
+                            plain.push(ch.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            washed.contains(&"a".to_string()),
+            "no selected cells: {washed:?}"
+        );
+        assert!(
+            washed.contains(&"m".to_string()),
+            "no selected cells: {washed:?}"
+        );
+        assert!(
+            !washed.contains(&"s".to_string()),
+            "s must stay plain: {washed:?}"
+        );
+        assert!(
+            !washed.contains(&"e".to_string()),
+            "e must stay plain: {washed:?}"
+        );
+        assert!(plain.contains(&"s".to_string()));
+        assert!(plain.contains(&"e".to_string()));
+    }
+
+    #[test]
+    fn preview_visual_linewise_washes_rows() {
+        use crossterm::event::KeyCode;
+        let (_dir, mut app) = with_files(&[("a.txt", FileState::Unstaged)]);
+        app.set_diff_for_test(mini_diff(), false);
+        app.on_key(KeyCode::Char('5'));
+        // Anchor on the header, extend onto the `same` line, linewise.
+        app.on_key(KeyCode::Char('V'));
+        app.on_key(KeyCode::Char('j'));
+        let buf = render_buf(&app, 100, 32);
+        let theme = crate::config::Theme::default_theme();
+        let mut found = 0;
+        let mut washed = 0;
+        for y in 0..buf.area.height {
+            let cells: Vec<String> = (0..buf.area.width)
+                .map(|x| buf[(x, y)].symbol().to_string())
+                .collect();
+            for x in 0..cells.len().saturating_sub(4) {
+                if cells[x..x + 4] == ["s", "a", "m", "e"] {
+                    found += 1;
+                    if buf[(x as u16, y)].bg == theme.selection_bg {
+                        washed += 1;
+                    }
+                }
+            }
+        }
+        assert!(found > 0, "`same` not rendered in preview");
+        assert_eq!(washed, found, "preview selection must wash the row");
+    }
+
+    #[test]
+    fn cursor_line_text_prefers_new_side() {
+        use git_tui_core::diff::{DiffLine, FileDiff, Hunk, LineKind};
+        let diff = FileDiff {
+            path: "a.txt".into(),
+            hunks: vec![
+                Hunk {
+                    header: "@@ -1,1 +1,1 @@".into(),
+                    old_start: 1,
+                    new_start: 1,
+                    lines: vec![DiffLine {
+                        kind: LineKind::Context,
+                        text: "same".into(),
+                    }],
+                },
+                Hunk {
+                    header: "@@ -30,2 +30,2 @@".into(),
+                    old_start: 30,
+                    new_start: 30,
+                    lines: vec![DiffLine {
+                        kind: LineKind::Add,
+                        text: "brand new".into(),
+                    }],
+                },
+            ],
+        };
+        // Header rows carry the hunk header, so h/l never goes dead there.
+        assert_eq!(
+            cursor_line_text(&diff, &DiffRow::Header { index: 1 }),
+            "@@ -30,2 +30,2 @@"
+        );
+        // Modified pair: the cursor rides the added (new) line.
+        let pair = DiffRow::Split {
+            left: Side {
+                no: Some(1),
+                segs: vec![crate::words::WordSeg {
+                    text: "old".into(),
+                    changed: true,
+                }],
+                kind: SideKind::Del,
+            },
+            right: Side {
+                no: Some(1),
+                segs: vec![crate::words::WordSeg {
+                    text: "new".into(),
+                    changed: true,
+                }],
+                kind: SideKind::Add,
+            },
+        };
+        assert_eq!(cursor_line_text(&diff, &pair), "new");
+        // Deleted-only row: the cursor rides the deleted line.
+        let del = DiffRow::Split {
+            left: Side {
+                no: Some(2),
+                segs: vec![crate::words::WordSeg {
+                    text: "gone".into(),
+                    changed: false,
+                }],
+                kind: SideKind::Del,
+            },
+            right: Side {
+                no: None,
+                segs: Vec::new(),
+                kind: SideKind::Blank,
+            },
+        };
+        assert_eq!(cursor_line_text(&diff, &del), "gone");
+    }
+
+    #[test]
+    fn expanded_col_counts_tabs_like_the_renderer() {
+        // gutter 4: content starts at cell 5, tab stops every 8.
+        assert_eq!(expanded_col("a\tb", 0, 4), 0);
+        assert_eq!(expanded_col("a\tb", 1, 4), 1);
+        // `a` fills cell 0; the tab jumps cells 1-2; `b` sits at cell 3.
+        assert_eq!(expanded_col("a\tb", 2, 4), 3);
+        assert_eq!(expanded_col("abcd", 3, 4), 3);
+    }
+
+    #[test]
+    fn line_cursor_row_carries_selection_wash() {
+        use crossterm::event::KeyCode;
+        let (_dir, mut app) = with_files(&[("a.txt", FileState::Unstaged)]);
+        app.set_diff_for_test(mini_diff(), false);
+        app.on_key(KeyCode::Enter);
+        // Cursor row 1 is the `same` context line (header is row 0).
+        app.on_key(KeyCode::Char('j'));
+        assert_eq!(app.cursor_row(), 1);
+        let buf = render_buf(&app, 70, 20);
+        let theme = crate::config::Theme::default_theme();
+        let mut found_cursor = false;
+        let mut found_other = false;
+        for y in 0..buf.area.height {
+            let cells: Vec<String> = (0..buf.area.width)
+                .map(|x| buf[(x, y)].symbol().to_string())
+                .collect();
+            for x in 0..cells.len().saturating_sub(4) {
+                if cells[x..x + 4] == ["s", "a", "m", "e"] {
+                    found_cursor = true;
+                    assert_eq!(
+                        buf[(x as u16, y)].bg,
+                        theme.selection_bg,
+                        "cursor line must carry the selection wash"
+                    );
+                }
+                if cells[x..x + 5] == ["W", "O", "R", "L", "D"] {
+                    found_other = true;
+                    assert_ne!(
+                        buf[(x as u16, y)].bg,
+                        theme.selection_bg,
+                        "non-cursor lines must not carry the selection wash"
+                    );
+                }
+            }
+        }
+        assert!(found_cursor, "cursor line not rendered");
+        assert!(found_other, "other changed line not rendered");
     }
 
     #[test]
@@ -2899,7 +3955,7 @@ mod tests {
         assert_eq!(app.mode(), Mode::Normal);
         let s = screen(&app, 100, 32);
         assert!(!s.contains("Full diff"), "overlay should be gone:\n{s}");
-        assert!(s.contains("[2]-Files"), "rail should be back:\n{s}");
+        assert!(s.contains("[1]-Files"), "rail should be back:\n{s}");
     }
 
     #[test]
@@ -2921,17 +3977,20 @@ mod tests {
         use ratatui::layout::Rect;
         let (_dir, mut app) = with_files(&[("a.txt", FileState::Unstaged)]);
         let layout = compute_layout(Rect::new(0, 0, 100, 32), 1);
+        // Colors come from the active theme, not hard-coded legacy values.
+        let (bright, dim) = (app.theme().border_focused, app.theme().border_unfocused);
+        assert_ne!(bright, dim, "theme must distinguish focus");
         // Status focus drives the files list, so the files panel glows
         // while the status strip and diff preview stay dim.
         let buf = render_buf(&app, 100, 32);
-        assert_eq!(buf[(layout.files.x, layout.files.y)].fg, Color::White);
-        assert_eq!(buf[(layout.status.x, layout.status.y)].fg, Color::DarkGray);
-        assert_eq!(buf[(layout.diff.x, layout.diff.y)].fg, Color::DarkGray);
+        assert_eq!(buf[(layout.files.x, layout.files.y)].fg, bright);
+        assert_eq!(buf[(layout.status.x, layout.status.y)].fg, dim);
+        assert_eq!(buf[(layout.diff.x, layout.diff.y)].fg, dim);
         // Focus branches: branches corner goes bright, files goes dim.
         app.on_key(KeyCode::Tab);
         let buf = render_buf(&app, 100, 32);
-        assert_eq!(buf[(layout.branches.x, layout.branches.y)].fg, Color::White);
-        assert_eq!(buf[(layout.files.x, layout.files.y)].fg, Color::DarkGray);
+        assert_eq!(buf[(layout.branches.x, layout.branches.y)].fg, bright);
+        assert_eq!(buf[(layout.files.x, layout.files.y)].fg, dim);
     }
 
     /// End-to-end: a loaded theme (here tokyo-night) must reach the pixels,

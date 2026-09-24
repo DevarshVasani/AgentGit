@@ -18,6 +18,11 @@
 //!   emphasis, green inline code and fences, underlined cyan links, dimmed
 //!   `#`/`*`/`-`/`>`/`[]()` punctuation. The rules are prefixed with
 //!   `text.html.markdown` so code highlighting is never affected.
+//! - TOML has no grammar in syntect's default set (`.toml` fell back to
+//!   flat plain text), so `Cargo.toml` / `config.toml` / `Cargo.lock` get a
+//!   small hand-rolled highlighter: cyan tables, blue keys, green strings,
+//!   orange numbers/dates, magenta booleans, dimmed punctuation, italic
+//!   comments.
 
 use crate::config::Theme;
 use ratatui::style::{Color as RatColor, Modifier};
@@ -172,8 +177,7 @@ fn rule(
 /// scope selectors, so doing it per line per frame (~1ms) was the main
 /// source of UI lag — now it happens once per theme.
 fn syntect_theme_cached(theme: Theme) -> std::sync::Arc<SynTheme> {
-    static CACHE: OnceLock<Mutex<HashMap<Theme, std::sync::Arc<SynTheme>>>> =
-        OnceLock::new();
+    static CACHE: OnceLock<Mutex<HashMap<Theme, std::sync::Arc<SynTheme>>>> = OnceLock::new();
     let mut cache = CACHE
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
@@ -188,10 +192,10 @@ fn syntect_theme_cached(theme: Theme) -> std::sync::Arc<SynTheme> {
 /// lines are visible across frames, so repeat renders become HashMap hits
 /// instead of regex highlighting. Pure function — no invalidation needed.
 /// Bounded: cleared once it grows past the cap.
-fn line_cache(
-) -> &'static Mutex<HashMap<(String, String, Theme), Vec<HiToken>>> {
-    static CACHE: OnceLock<Mutex<HashMap<(String, String, Theme), Vec<HiToken>>>> =
-        OnceLock::new();
+type LineCache = Mutex<HashMap<(String, String, Theme), Vec<HiToken>>>;
+
+fn line_cache() -> &'static LineCache {
+    static CACHE: OnceLock<LineCache> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -206,8 +210,8 @@ const HIGHLIGHT_LEN_CAP: usize = 2000;
 fn syntect_theme(theme: Theme) -> SynTheme {
     let fg = rat_to_syn(theme.fg);
     SynTheme {
-        name: Some("git-tui-lazyvim".into()),
-        author: Some("git-tui".into()),
+        name: Some("agentgit-lazyvim".into()),
+        author: Some("agentgit".into()),
         settings: ThemeSettings {
             foreground: Some(fg),
             background: None,
@@ -298,6 +302,18 @@ fn find_syntax<'a>(ss: &'a SyntaxSet, path: &str) -> &'a syntect::parsing::Synta
     ss.find_syntax_plain_text()
 }
 
+/// syntect's default set ships no TOML grammar, so `.toml` files (and
+/// `Cargo.lock`, which is TOML without the extension) fell back to flat
+/// plain text. Detect them here and route to the hand-rolled highlighter.
+fn is_toml_path(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    if lower.ends_with(".toml") {
+        return true;
+    }
+    let base = lower.rsplit('/').next().unwrap_or(lower.as_str());
+    base == "cargo.lock"
+}
+
 /// One highlighted token: text + fg + modifier (italic/bold from tmTheme).
 #[derive(Debug, Clone)]
 pub struct HiToken {
@@ -354,9 +370,7 @@ pub fn highlight_line(path: &str, text: &str, theme: Theme) -> Vec<HiToken> {
         return hit.clone();
     }
     let out = highlight_line_uncached(path, text, theme);
-    let mut cache = line_cache()
-        .lock()
-        .expect("highlight cache poisoned");
+    let mut cache = line_cache().lock().expect("highlight cache poisoned");
     if cache.len() > LINE_CACHE_CAP {
         cache.clear();
     }
@@ -366,6 +380,9 @@ pub fn highlight_line(path: &str, text: &str, theme: Theme) -> Vec<HiToken> {
 
 /// Uncached single-line highlight (fresh parser state).
 fn highlight_line_uncached(path: &str, text: &str, theme: Theme) -> Vec<HiToken> {
+    if is_toml_path(path) {
+        return highlight_toml_line(text, theme);
+    }
     let ss = syntaxes();
     let syn = syntect_theme_cached(theme);
     let syntax = find_syntax(ss, path);
@@ -395,6 +412,18 @@ fn highlight_line_uncached(path: &str, text: &str, theme: Theme) -> Vec<HiToken>
 /// Highlight whole-file lines with shared parser state (correct multi-line
 /// comments/strings). Returns one token vec per input line.
 pub fn highlight_file_lines(path: &str, lines: &[&str], theme: Theme) -> Vec<Vec<HiToken>> {
+    if is_toml_path(path) {
+        return lines
+            .iter()
+            .map(|text| {
+                if text.is_empty() {
+                    Vec::new()
+                } else {
+                    highlight_toml_line(text, theme)
+                }
+            })
+            .collect();
+    }
     let ss = syntaxes();
     let syn = syntect_theme_cached(theme);
     let syntax = find_syntax(ss, path);
@@ -421,6 +450,457 @@ pub fn highlight_file_lines(path: &str, lines: &[&str], theme: Theme) -> Vec<Vec
             }],
         })
         .collect()
+}
+
+/// Push a TOML token, merging with the previous one when the style matches
+/// so one line stays a handful of spans instead of per-char fragments.
+fn push_toml(out: &mut Vec<HiToken>, text: &str, fg: RatColor, modifier: Modifier) {
+    if text.is_empty() {
+        return;
+    }
+    if let Some(last) = out.last_mut() {
+        if last.fg == fg && last.modifier == modifier {
+            last.text.push_str(text);
+            return;
+        }
+    }
+    out.push(HiToken {
+        text: text.to_string(),
+        fg,
+        modifier,
+    });
+}
+
+fn toml_char_len(s: &str, idx: usize) -> usize {
+    s[idx..].chars().next().map(|c| c.len_utf8()).unwrap_or(1)
+}
+
+/// Byte offset of the `#` starting a comment (outside any string), if any.
+fn find_toml_comment_start(line: &str) -> Option<usize> {
+    #[derive(PartialEq)]
+    enum S {
+        Basic,
+        Literal,
+        MlBasic,
+        MlLiteral,
+    }
+    let mut state: Option<S> = None;
+    let mut i = 0;
+    while i < line.len() {
+        match state {
+            None => {
+                if line[i..].starts_with("\"\"\"") {
+                    state = Some(S::MlBasic);
+                    i += 3;
+                } else if line[i..].starts_with("'''") {
+                    state = Some(S::MlLiteral);
+                    i += 3;
+                } else {
+                    let c = line.as_bytes()[i] as char;
+                    match c {
+                        '"' => {
+                            state = Some(S::Basic);
+                            i += 1;
+                        }
+                        '\'' => {
+                            state = Some(S::Literal);
+                            i += 1;
+                        }
+                        '#' => return Some(i),
+                        _ => i += toml_char_len(line, i),
+                    }
+                }
+            }
+            Some(S::Basic) => {
+                let c = line.as_bytes()[i] as char;
+                if c == '\\' {
+                    i += 1 + toml_char_len(line, i + 1).min(line.len() - i - 1);
+                } else if c == '"' {
+                    state = None;
+                    i += 1;
+                } else {
+                    i += toml_char_len(line, i);
+                }
+            }
+            Some(S::Literal) => {
+                if line.as_bytes()[i] as char == '\'' {
+                    state = None;
+                    i += 1;
+                } else {
+                    i += toml_char_len(line, i);
+                }
+            }
+            Some(S::MlBasic) => {
+                if line[i..].starts_with("\"\"\"") {
+                    state = None;
+                    i += 3;
+                } else if line.as_bytes()[i] as char == '\\' {
+                    i += 1 + toml_char_len(line, i + 1).min(line.len() - i - 1);
+                } else {
+                    i += toml_char_len(line, i);
+                }
+            }
+            Some(S::MlLiteral) => {
+                if line[i..].starts_with("'''") {
+                    state = None;
+                    i += 3;
+                } else {
+                    i += toml_char_len(line, i);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Byte offset of the first `=` outside any string, if any.
+fn find_toml_equals(code: &str) -> Option<usize> {
+    #[derive(PartialEq)]
+    enum S {
+        Basic,
+        Literal,
+        MlBasic,
+        MlLiteral,
+    }
+    let mut state: Option<S> = None;
+    let mut i = 0;
+    while i < code.len() {
+        match state {
+            None => {
+                if code[i..].starts_with("\"\"\"") {
+                    state = Some(S::MlBasic);
+                    i += 3;
+                } else if code[i..].starts_with("'''") {
+                    state = Some(S::MlLiteral);
+                    i += 3;
+                } else {
+                    let c = code.as_bytes()[i] as char;
+                    match c {
+                        '"' => {
+                            state = Some(S::Basic);
+                            i += 1;
+                        }
+                        '\'' => {
+                            state = Some(S::Literal);
+                            i += 1;
+                        }
+                        '=' => return Some(i),
+                        _ => i += toml_char_len(code, i),
+                    }
+                }
+            }
+            Some(S::Basic) => {
+                let c = code.as_bytes()[i] as char;
+                if c == '\\' {
+                    i += 1 + toml_char_len(code, i + 1).min(code.len() - i - 1);
+                } else if c == '"' {
+                    state = None;
+                    i += 1;
+                } else {
+                    i += toml_char_len(code, i);
+                }
+            }
+            Some(S::Literal) => {
+                if code.as_bytes()[i] as char == '\'' {
+                    state = None;
+                    i += 1;
+                } else {
+                    i += toml_char_len(code, i);
+                }
+            }
+            Some(S::MlBasic) => {
+                if code[i..].starts_with("\"\"\"") {
+                    state = None;
+                    i += 3;
+                } else if code.as_bytes()[i] as char == '\\' {
+                    i += 1 + toml_char_len(code, i + 1).min(code.len() - i - 1);
+                } else {
+                    i += toml_char_len(code, i);
+                }
+            }
+            Some(S::MlLiteral) => {
+                if code[i..].starts_with("'''") {
+                    state = None;
+                    i += 3;
+                } else {
+                    i += toml_char_len(code, i);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Highlight dotted key/table segments: `a."b.c".d` keeps quoted dots
+/// inside the segment; separator dots are dimmed.
+fn highlight_toml_dotted(
+    body: &str,
+    out: &mut Vec<HiToken>,
+    segment_fg: RatColor,
+    segment_mod: Modifier,
+    theme: Theme,
+) {
+    let mut seg_start = 0usize;
+    let mut quote: Option<char> = None;
+    let mut i = 0;
+    // Byte-wise scan is safe: the only interesting bytes (`"`, `'`, `.`)
+    // are single-byte and never appear inside multi-byte UTF-8 sequences.
+    while i < body.len() {
+        let c = body.as_bytes()[i] as char;
+        match quote {
+            None => match c {
+                '"' | '\'' => {
+                    quote = Some(c);
+                    i += 1;
+                }
+                '.' => {
+                    push_toml(out, &body[seg_start..i], segment_fg, segment_mod);
+                    push_toml(out, ".", theme.hint, Modifier::empty());
+                    i += 1;
+                    seg_start = i;
+                }
+                _ => i += toml_char_len(body, i),
+            },
+            Some(q) => {
+                if c == '\\' && q == '"' {
+                    i += 1 + toml_char_len(body, i + 1).min(body.len() - i - 1);
+                } else if c == q {
+                    quote = None;
+                    i += 1;
+                } else {
+                    i += toml_char_len(body, i);
+                }
+            }
+        }
+    }
+    push_toml(out, &body[seg_start..], segment_fg, segment_mod);
+}
+
+/// Highlight the value side of `key = <value>`: strings green, numbers and
+/// datetimes orange, booleans magenta italic, brackets/commas dimmed.
+fn highlight_toml_value(fragment: &str, theme: Theme, out: &mut Vec<HiToken>) {
+    let mut i = 0;
+    while i < fragment.len() {
+        let c = fragment.as_bytes()[i] as char;
+        if c.is_whitespace() {
+            let mut j = i;
+            while j < fragment.len() && (fragment.as_bytes()[j] as char).is_whitespace() {
+                j += toml_char_len(fragment, j);
+            }
+            push_toml(out, &fragment[i..j], theme.fg, Modifier::empty());
+            i = j;
+        } else if fragment[i..].starts_with("\"\"\"") || fragment[i..].starts_with("'''") {
+            let q = &fragment[i..i + 3];
+            let end = fragment[i + 3..]
+                .find(q)
+                .map(|k| i + 3 + k + 3)
+                .unwrap_or(fragment.len());
+            push_toml(
+                out,
+                &fragment[i..end],
+                theme.syntax_string,
+                Modifier::empty(),
+            );
+            i = end;
+        } else if c == '"' {
+            // Basic string with `\` escapes; unterminated runs to end of line.
+            let mut j = i + 1;
+            while j < fragment.len() {
+                let d = fragment.as_bytes()[j] as char;
+                if d == '\\' {
+                    j += 1 + toml_char_len(fragment, j + 1).min(fragment.len() - j - 1);
+                } else if d == '"' {
+                    j += 1;
+                    break;
+                } else {
+                    j += toml_char_len(fragment, j);
+                }
+            }
+            push_toml(out, &fragment[i..j], theme.syntax_string, Modifier::empty());
+            i = j;
+        } else if c == '\'' {
+            let end = fragment[i + 1..]
+                .find('\'')
+                .map(|k| i + 1 + k + 1)
+                .unwrap_or(fragment.len());
+            push_toml(
+                out,
+                &fragment[i..end],
+                theme.syntax_string,
+                Modifier::empty(),
+            );
+            i = end;
+        } else if matches!(c, ',' | '[' | ']' | '{' | '}' | '=') {
+            push_toml(out, &fragment[i..i + 1], theme.hint, Modifier::empty());
+            i += 1;
+        } else if c == '.' {
+            // A lone dot (dotted-key separator inside a flow value, or a
+            // malformed number fragment): keep it dimmed.
+            push_toml(out, ".", theme.hint, Modifier::empty());
+            i += 1;
+        } else {
+            // Bare word: booleans, numbers/datetimes, or plain text.
+            let mut j = i;
+            while j < fragment.len() {
+                let d = fragment.as_bytes()[j] as char;
+                if d.is_ascii_alphanumeric() || matches!(d, '_' | '+' | '-' | '.' | ':') {
+                    j += 1;
+                } else {
+                    break;
+                }
+            }
+            if j == i {
+                push_toml(
+                    out,
+                    &fragment[i..i + toml_char_len(fragment, i)],
+                    theme.fg,
+                    Modifier::empty(),
+                );
+                i += toml_char_len(fragment, i);
+                continue;
+            }
+            let word = &fragment[i..j];
+            if word == "true" || word == "false" {
+                push_toml(out, word, theme.syntax_keyword, Modifier::ITALIC);
+            } else if word == "inf"
+                || word == "nan"
+                || word == "+inf"
+                || word == "-inf"
+                || word == "+nan"
+                || word == "-nan"
+                || word
+                    .chars()
+                    .next()
+                    .is_some_and(|f| f.is_ascii_digit() || f == '+' || f == '-' || f == '.')
+            {
+                push_toml(out, word, theme.syntax_number, Modifier::empty());
+            } else {
+                push_toml(out, word, theme.fg, Modifier::empty());
+            }
+            i = j;
+        }
+    }
+}
+
+/// Hand-rolled single-line TOML highlight (syntect ships no TOML grammar):
+/// cyan tables, blue keys, green strings, orange numbers, magenta booleans,
+/// dimmed punctuation, italic comments.
+fn highlight_toml_line(text: &str, theme: Theme) -> Vec<HiToken> {
+    let mut out = Vec::new();
+    // Split off the trailing comment first so `#` inside strings survives.
+    let (code, comment) = match find_toml_comment_start(text) {
+        Some(idx) => (&text[..idx], Some(&text[idx..])),
+        None => (text, None),
+    };
+    if code.trim().is_empty() {
+        if code.is_empty() {
+            // Pure comment line.
+        } else {
+            push_toml(&mut out, code, theme.fg, Modifier::empty());
+        }
+        if let Some(c) = comment {
+            push_toml(&mut out, c, theme.syntax_comment, Modifier::ITALIC);
+        }
+        if out.is_empty() {
+            out.push(HiToken {
+                text: text.to_string(),
+                fg: theme.fg,
+                modifier: Modifier::empty(),
+            });
+        }
+        return out;
+    }
+
+    let trimmed = code.trim_start();
+    if trimmed.starts_with('[') {
+        // Table header: `[table]` / `[[array]]`, possibly indented.
+        let indent = code.len() - trimmed.len();
+        push_toml(&mut out, &code[..indent], theme.fg, Modifier::empty());
+        let rest = &code[indent..];
+        match (rest.find('['), rest.rfind(']')) {
+            (Some(open), Some(close)) if open < close => {
+                // `[[array]]` opens/closes with a double bracket.
+                let double = rest[open..].starts_with("[[")
+                    && close >= 1
+                    && rest.as_bytes()[close - 1] == b']';
+                let (open_end, inner_end) = if double {
+                    (open + 2, close - 1)
+                } else {
+                    (open + 1, close)
+                };
+                push_toml(&mut out, &rest[..open_end], theme.hint, Modifier::empty());
+                let inner = &rest[open_end..inner_end];
+                let inner_trimmed = inner.trim();
+                let lead = inner.len() - inner.trim_start().len();
+                let trail = inner.len() - inner.trim_end().len();
+                push_toml(&mut out, &inner[..lead], theme.fg, Modifier::empty());
+                highlight_toml_dotted(
+                    inner_trimmed,
+                    &mut out,
+                    theme.syntax_type,
+                    Modifier::BOLD,
+                    theme,
+                );
+                push_toml(
+                    &mut out,
+                    &inner[inner.len() - trail..],
+                    theme.fg,
+                    Modifier::empty(),
+                );
+                push_toml(
+                    &mut out,
+                    &rest[inner_end..close + 1],
+                    theme.hint,
+                    Modifier::empty(),
+                );
+                let tail = &rest[close + 1..];
+                if !tail.is_empty() {
+                    // Anything after `]` on a valid line is whitespace;
+                    // render stray text as plain value content.
+                    if tail.trim().is_empty() {
+                        push_toml(&mut out, tail, theme.fg, Modifier::empty());
+                    } else {
+                        highlight_toml_value(tail, theme, &mut out);
+                    }
+                }
+            }
+            _ => highlight_toml_value(code, theme, &mut out),
+        }
+    } else if let Some(eq) = find_toml_equals(code) {
+        let left = &code[..eq];
+        let left_trimmed = left.trim();
+        let lead = left.len() - left.trim_start().len();
+        let trail = left.len() - left.trim_end().len();
+        push_toml(&mut out, &left[..lead], theme.fg, Modifier::empty());
+        highlight_toml_dotted(
+            left_trimmed,
+            &mut out,
+            theme.syntax_function,
+            Modifier::empty(),
+            theme,
+        );
+        push_toml(
+            &mut out,
+            &left[left.len() - trail..],
+            theme.fg,
+            Modifier::empty(),
+        );
+        push_toml(&mut out, "=", theme.hint, Modifier::empty());
+        highlight_toml_value(&code[eq + 1..], theme, &mut out);
+    } else {
+        highlight_toml_value(code, theme, &mut out);
+    }
+    if let Some(c) = comment {
+        push_toml(&mut out, c, theme.syntax_comment, Modifier::ITALIC);
+    }
+    if out.is_empty() {
+        out.push(HiToken {
+            text: text.to_string(),
+            fg: theme.fg,
+            modifier: Modifier::empty(),
+        });
+    }
+    out
 }
 
 #[cfg(test)]
@@ -467,8 +947,8 @@ mod tests {
         let code = toks.iter().find(|t| t.text == "code").expect("code token");
         assert_eq!(code.fg, theme.syntax_string, "{toks:?}");
         assert!(
-            toks.iter().any(|t| t.fg == theme.syntax_type
-                && t.modifier.contains(Modifier::UNDERLINED)),
+            toks.iter()
+                .any(|t| t.fg == theme.syntax_type && t.modifier.contains(Modifier::UNDERLINED)),
             "link should be underlined cyan: {toks:?}"
         );
     }
@@ -578,9 +1058,157 @@ mod tests {
         let fg_base = base_fn.iter().find(|t| t.text == "fn").unwrap().fg;
         let fg_custom = custom_fn.iter().find(|t| t.text == "fn").unwrap().fg;
         assert_eq!(fg_base, base.syntax_keyword);
-        assert_ne!(fg_custom, fg_base, "custom theme must not get cached tokens");
+        assert_ne!(
+            fg_custom, fg_base,
+            "custom theme must not get cached tokens"
+        );
         // And the base theme still resolves correctly afterwards.
         let again = highlight_line("a.rs", line, base);
         assert_eq!(again.iter().find(|t| t.text == "fn").unwrap().fg, fg_base);
+    }
+
+    #[test]
+    fn toml_table_header_is_bold_type_color() {
+        let theme = Theme::tokyo_night();
+        for (line, name) in [
+            ("[workspace]", "workspace"),
+            ("[profile.release]", "profile"),
+            ("[[bin]]", "bin"),
+        ] {
+            let toks = highlight_line("Cargo.toml", line, theme);
+            let joined: String = toks.iter().map(|t| t.text.as_str()).collect();
+            assert_eq!(joined, line, "{toks:?}");
+            let head = toks
+                .iter()
+                .find(|t| t.text == name)
+                .expect("table name token");
+            assert_eq!(head.fg, theme.syntax_type, "{line}: {toks:?}");
+            assert!(
+                head.modifier.contains(Modifier::BOLD),
+                "{line}: table should be bold: {toks:?}"
+            );
+            assert!(
+                toks.iter()
+                    .any(|t| t.fg == theme.hint && t.text.contains('[')),
+                "{line}: brackets should be dimmed: {toks:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn toml_key_is_function_and_equals_is_dimmed() {
+        let theme = Theme::tokyo_night();
+        let line = "members = [\"a\", \"b\"]";
+        let toks = highlight_line("Cargo.toml", line, theme);
+        let joined: String = toks.iter().map(|t| t.text.as_str()).collect();
+        assert_eq!(joined, line, "{toks:?}");
+        let key = toks
+            .iter()
+            .find(|t| t.text == "members")
+            .expect("key token");
+        assert_eq!(key.fg, theme.syntax_function, "{toks:?}");
+        let eq = toks.iter().find(|t| t.text == "=").expect("equals token");
+        assert_eq!(eq.fg, theme.hint, "{toks:?}");
+        assert!(
+            toks.iter()
+                .any(|t| t.text == "\"a\"" && t.fg == theme.syntax_string),
+            "array strings should be green: {toks:?}"
+        );
+    }
+
+    #[test]
+    fn toml_strings_numbers_and_bools_are_styled() {
+        let theme = Theme::tokyo_night();
+        let cases = [
+            (
+                "name = \"tokyo-night\"",
+                "\"tokyo-night\"",
+                theme.syntax_string,
+            ),
+            ("path = 'literal'", "'literal'", theme.syntax_string),
+            ("count = 42", "42", theme.syntax_number),
+            ("ratio = 3.14", "3.14", theme.syntax_number),
+            ("hex = 0xDEAD_beef", "0xDEAD_beef", theme.syntax_number),
+            (
+                "when = 1979-05-27T07:32:00Z",
+                "1979-05-27T07:32:00Z",
+                theme.syntax_number,
+            ),
+        ];
+        for (line, word, fg) in cases {
+            let toks = highlight_line("config.toml", line, theme);
+            let joined: String = toks.iter().map(|t| t.text.as_str()).collect();
+            assert_eq!(joined, line, "{toks:?}");
+            assert!(
+                toks.iter().any(|t| t.text == word && t.fg == fg),
+                "{line}: {word:?} should be {fg:?}: {toks:?}"
+            );
+        }
+        for word in ["true", "false"] {
+            let line = format!("enabled = {word}");
+            let toks = highlight_line("config.toml", &line, theme);
+            let tok = toks.iter().find(|t| t.text == word).expect("bool token");
+            assert_eq!(tok.fg, theme.syntax_keyword, "{toks:?}");
+            assert!(
+                tok.modifier.contains(Modifier::ITALIC),
+                "bool should be italic: {toks:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn toml_comments_are_italic_and_hash_in_string_survives() {
+        let theme = Theme::tokyo_night();
+        let toks = highlight_line("Cargo.toml", "# hello world", theme);
+        assert!(
+            toks.iter().all(|t| t.fg == theme.syntax_comment),
+            "full-line comment should be uniform: {toks:?}"
+        );
+        assert!(
+            toks.iter().any(|t| t.modifier.contains(Modifier::ITALIC)),
+            "comment should be italic: {toks:?}"
+        );
+        let line = "name = \"a#b\"  # trailing";
+        let toks = highlight_line("Cargo.toml", line, theme);
+        let joined: String = toks.iter().map(|t| t.text.as_str()).collect();
+        assert_eq!(joined, line, "{toks:?}");
+        let value = toks
+            .iter()
+            .find(|t| t.text == "\"a#b\"")
+            .expect("string token");
+        assert_eq!(value.fg, theme.syntax_string, "{toks:?}");
+        let comment = toks
+            .iter()
+            .find(|t| t.text.starts_with('#'))
+            .expect("comment token");
+        assert_eq!(comment.fg, theme.syntax_comment, "{toks:?}");
+    }
+
+    #[test]
+    fn toml_dotted_keys_and_cargo_lock_name_highlight() {
+        let theme = Theme::tokyo_night();
+        let toks = highlight_line("config.toml", "a.b = 1", theme);
+        for seg in ["a", "b"] {
+            assert!(
+                toks.iter()
+                    .any(|t| t.text == seg && t.fg == theme.syntax_function),
+                "dotted key segment {seg:?} should be blue: {toks:?}"
+            );
+        }
+        assert!(
+            toks.iter().any(|t| t.text == "." && t.fg == theme.hint),
+            "dotted key separator should be dimmed: {toks:?}"
+        );
+        // Cargo.lock is TOML content without the extension.
+        let toks = highlight_line("Cargo.lock", "version = \"3\"", theme);
+        assert!(
+            toks.iter()
+                .any(|t| t.text == "\"3\"" && t.fg == theme.syntax_string),
+            "Cargo.lock should highlight as TOML: {toks:?}"
+        );
+        let out = highlight_file_lines("Cargo.toml", &["[workspace]", "members = []"], theme);
+        assert_eq!(out.len(), 2);
+        let joined: String = out[0].iter().map(|t| t.text.as_str()).collect();
+        assert_eq!(joined, "[workspace]");
     }
 }

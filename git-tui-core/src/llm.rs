@@ -120,11 +120,12 @@ pub struct StagedFile {
 pub fn staged_context(repo: &git2::Repository) -> Result<Vec<StagedFile>, GitError> {
     let st = status::repo_status(repo)?;
     let mut out = Vec::new();
-    for entry in st
-        .files
-        .iter()
-        .filter(|e| matches!(e.state, FileState::Staged | FileState::BothStagedAndUnstaged))
-    {
+    for entry in st.files.iter().filter(|e| {
+        matches!(
+            e.state,
+            FileState::Staged | FileState::BothStagedAndUnstaged
+        )
+    }) {
         let diff = diff::staged_diff(repo, &entry.path).unwrap_or(FileDiff {
             path: entry.path.clone(),
             hunks: Vec::new(),
@@ -252,9 +253,7 @@ pub fn heuristic_message(files: &[StagedFile]) -> String {
     };
     let total_added: usize = files.iter().map(|f| f.added).sum();
     let total_removed: usize = files.iter().map(|f| f.removed).sum();
-    let any_new = files
-        .iter()
-        .any(|f| f.status_label.contains("new file"));
+    let any_new = files.iter().any(|f| f.status_label.contains("new file"));
     let verb = if any_new && total_removed == 0 {
         "add"
     } else if total_removed > total_added * 2 {
@@ -280,21 +279,12 @@ pub fn heuristic_message(files: &[StagedFile]) -> String {
 fn common_scope(files: &[StagedFile]) -> String {
     let dirs: Vec<&str> = files
         .iter()
-        .map(|f| {
-            f.path
-                .rfind('/')
-                .map(|i| &f.path[..i])
-                .unwrap_or_default()
-        })
+        .map(|f| f.path.rfind('/').map(|i| &f.path[..i]).unwrap_or_default())
         .collect();
     if dirs.is_empty() || !dirs.iter().all(|d| *d == dirs[0]) || dirs[0].is_empty() {
         return String::new();
     }
-    dirs[0]
-        .rsplit('/')
-        .next()
-        .unwrap_or_default()
-        .to_string()
+    dirs[0].rsplit('/').next().unwrap_or_default().to_string()
 }
 
 /// Strip markdown fences / surrounding quotes models love to add.
@@ -322,7 +312,7 @@ pub fn clean_message(raw: &str) -> String {
     let mut out = kept.join("\n").trim().to_string();
     if out.len() > 1000 {
         out.truncate(1000);
-        out.push_str("…");
+        out.push('…');
     }
     out
 }
@@ -363,7 +353,7 @@ fn missing_key_hint(config: &LlmConfig) -> String {
     };
     format!(
         "no API key for provider {:?}: press A in the file list to configure it via TUI, \
-         or set [llm] api_key in ~/.config/git-tui/config.toml or ${var} (or $LLM_API_KEY)",
+         or set [llm] api_key in ~/.config/agentgit/config.toml or ${var} (or $LLM_API_KEY)",
         config.provider
     )
 }
@@ -398,8 +388,8 @@ fn call_openai_compatible(config: &LlmConfig, prompt: &str) -> Result<String, Gi
     }
     if config.provider == "openrouter" {
         req = req
-            .set("HTTP-Referer", "https://github.com/git-tui")
-            .set("X-Title", "git-tui");
+            .set("HTTP-Referer", "https://github.com/DevarshVasani/AgentGit")
+            .set("X-Title", "agentgit");
     }
     let resp = req.send_json(body).map_err(map_http_err)?;
     let json: serde_json::Value = resp.into_json().map_err(|e| GitError::Llm(e.to_string()))?;
@@ -471,9 +461,7 @@ fn call_gemini(config: &LlmConfig, prompt: &str) -> Result<String, GitError> {
 fn map_http_err(e: ureq::Error) -> GitError {
     match e {
         ureq::Error::Status(code, resp) => {
-            let body = resp
-                .into_string()
-                .unwrap_or_else(|_| "<unreadable>".into());
+            let body = resp.into_string().unwrap_or_else(|_| "<unreadable>".into());
             let short: String = body.chars().take(300).collect();
             GitError::Llm(format!("provider HTTP {code}: {short}"))
         }
@@ -574,7 +562,10 @@ mod tests {
         let p = build_commit_prompt(&files);
         assert!(p.contains("src/api.rs"), "prompt must reference files");
         assert!(p.contains("README.md"));
-        assert!(p.contains("Conventional"), "prompt must ask conventional commits");
+        assert!(
+            p.contains("Conventional"),
+            "prompt must ask conventional commits"
+        );
     }
 
     #[test]

@@ -1,10 +1,18 @@
 [package]
-name = "git-tui"
+name = "agentgit"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-description = "Terminal UI for the git-tui commit workflow"
+repository.workspace = true
+description = "A fast, keyboard-driven git TUI: status, side-by-side diffs, hunk staging, AI commit messages"
+readme = "../README.md"
+keywords = ["git", "tui", "terminal", "diff", "ratatui"]
+categories = ["command-line-utilities", "development-tools"]
+
+[[bin]]
+name = "agentgit"
+path = "src/main.rs"
 
 [dependencies]
 git-tui-core = { path = "../git-tui-core" }
@@ -16,6 +24,7 @@ serde = { version = "1.0.229", features = ["derive"] }
 toml = "0.9.6"
 unicode-width = "0.1"
 syntect = { version = "5.2", default-features = false, features = ["default-syntaxes", "default-themes", "parsing", "regex-onig"] }
+pulldown-cmark = { version = "0.12", default-features = false, features = ["simd"] }
 
 [dev-dependencies]
 tempfile = "3"

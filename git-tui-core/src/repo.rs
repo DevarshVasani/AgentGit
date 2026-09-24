@@ -70,9 +70,9 @@ impl Repo {
         let start = input.as_ref().to_path_buf();
         let repo = git2::Repository::discover(&start)
             .map_err(|_| GitError::NotARepo(start.display().to_string()))?;
-        repo.workdir().map(|p| p.to_path_buf()).ok_or_else(|| {
-            GitError::BareRepo(start.display().to_string())
-        })
+        repo.workdir()
+            .map(|p| p.to_path_buf())
+            .ok_or_else(|| GitError::BareRepo(start.display().to_string()))
     }
 
     /// Walk upward from `path` to find `.git`.
@@ -125,6 +125,11 @@ impl Repo {
     /// Whole file content for viewing files with no changes.
     pub fn whole_file(&self, path: &str) -> Result<FileDiff, GitError> {
         diff::whole_file_diff(&self.inner, path)
+    }
+
+    /// Full new-version text for Markdown preview.
+    pub fn new_content(&self, path: &str, staged: bool) -> Result<String, GitError> {
+        diff::new_content(&self.inner, path, staged)
     }
 
     pub fn stage_file(&self, path: &str) -> Result<(), GitError> {

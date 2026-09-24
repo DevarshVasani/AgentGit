@@ -17,7 +17,7 @@ use std::cell::Cell;
 
 use crate::config::{Config, KeyBindings, Theme};
 use crate::fuzzy;
-use crate::ui::{diff_rows, DiffRow};
+use crate::ui::{cursor_line_text, diff_rows, wrap_draft, DiffRow};
 
 /// Labels for the LLM setup form rows: provider, model, API key, base URL.
 pub const LLM_FIELD_LABELS: [&str; 4] = [
@@ -123,7 +123,30 @@ pub struct App {
     /// selected path changes.
     fallback_whole_file: bool,
     hunk: usize,
+    /// Line cursor: index into `diff_rows` (both the fullscreen view and
+    /// the right-side preview). `j/k`/`↑`/`↓` move it one row, `J`/`K`
+    /// jump by hunk, `PgUp`/`PgDn` move it by 10. Nvim-style: the cursor
+    /// walks inside the viewport first and the view only scrolls at the
+    /// edge (see `ensure_cursor_visible`); transitions (open/close,
+    /// reload) top-pin via `snap_scroll_to_cursor` instead.
+    cursor: usize,
+    /// Nvim-style block column: char index into the cursor row's logical
+    /// text (`h`/`l` move it, clamped to the line; row moves keep it so
+    /// it behaves like vim's sticky column). Rendered as one reversed
+    /// cell in `ui.rs`.
+    cursor_col: usize,
     diff_scroll: u16,
+    /// Last rendered inner heights of the fullscreen diff and the
+    /// right-side preview (recorded by the renderer, which only gets
+    /// `&App` — same pattern as `draft_wrap_width`). Drives
+    /// `ensure_cursor_visible`. Zero until the first frame, which reads
+    /// as height 1 (top-pin) so the cursor is never stranded.
+    full_view_h: Cell<usize>,
+    prev_view_h: Cell<usize>,
+    /// Nvim-style visual selection anchor (`v` charwise, `V` linewise).
+    /// The live end is the line cursor; `y` yanks, `Esc` cancels.
+    /// Cleared whenever the diff reloads.
+    visual: Option<Visual>,
     branches: Option<Vec<BranchInfo>>,
     branch_selected: usize,
     log: Option<Vec<CommitInfo>>,
@@ -141,10 +164,39 @@ pub struct App {
     files_scroll: Cell<usize>,
     branch_scroll: Cell<usize>,
     stash_scroll: Cell<usize>,
+    /// Content width of the commit box as last rendered. The renderer
+    /// records it so ↑/↓ move by the same soft-wrapped rows the user sees.
+    draft_wrap_width: Cell<usize>,
     /// Collapsed directory prefixes in the files tree (no trailing slash).
     collapsed: std::collections::HashSet<String>,
     /// Directory picker for opening projects (`Mode::OpenProject`).
     open_browser: Option<OpenBrowser>,
+    /// Rendered Markdown preview toggle (`m` for `.md` files).
+    markdown_preview: bool,
+    /// (path, staged) the loaded/loading Markdown text belongs to.
+    md_for: Option<(String, bool)>,
+    /// Full new-version text for the Markdown preview.
+    md_text: Option<String>,
+}
+
+/// Nvim-style visual selection: charwise (`v`) or linewise (`V`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VisualMode {
+    Charwise,
+    Linewise,
+}
+
+/// Normalized visual selection `((start_row, start_col), (end_row,
+/// end_col), linewise)`; see `App::visual_selection`.
+pub(crate) type VisualSel = ((usize, usize), (usize, usize), bool);
+
+/// Visual anchor: the fixed end of the selection. The live end is the
+/// line cursor (`cursor`, `cursor_col`); see `App::visual_selection`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Visual {
+    pub(crate) anchor_row: usize,
+    pub(crate) anchor_col: usize,
+    pub(crate) mode: VisualMode,
 }
 
 /// One subdirectory row in the project browser.
@@ -315,8 +367,7 @@ impl OpenBrowser {
 /// Subdirectories of `dir`, sorted by name. Files are hidden: only
 /// folders can become projects.
 fn read_subdirs(dir: &std::path::Path) -> Result<Vec<DirEntry>, String> {
-    let rd = std::fs::read_dir(dir)
-        .map_err(|e| format!("cannot list {}: {e}", dir.display()))?;
+    let rd = std::fs::read_dir(dir).map_err(|e| format!("cannot list {}: {e}", dir.display()))?;
     let mut out = Vec::new();
     for entry in rd {
         let entry = entry.map_err(|e| format!("cannot list {}: {e}", dir.display()))?;
@@ -324,9 +375,7 @@ fn read_subdirs(dir: &std::path::Path) -> Result<Vec<DirEntry>, String> {
             .file_type()
             .map_err(|e| format!("cannot list {}: {e}", dir.display()))?;
         // Follow symlinked dirs so linked projects stay browsable.
-        let is_dir = ft.is_dir()
-            || (ft.is_symlink()
-                && entry.path().is_dir());
+        let is_dir = ft.is_dir() || (ft.is_symlink() && entry.path().is_dir());
         if !is_dir {
             continue;
         }
@@ -397,7 +446,12 @@ impl App {
             diff_whole_file: false,
             fallback_whole_file: false,
             hunk: 0,
+            cursor: 0,
+            cursor_col: 0,
             diff_scroll: 0,
+            full_view_h: Cell::new(0),
+            prev_view_h: Cell::new(0),
+            visual: None,
             branches: None,
             branch_selected: 0,
             log: None,
@@ -409,8 +463,14 @@ impl App {
             files_scroll: Cell::new(0),
             branch_scroll: Cell::new(0),
             stash_scroll: Cell::new(0),
+            // Default matches the commit modal's usual inner width (60 − 2
+            // borders) until the renderer records the real one.
+            draft_wrap_width: Cell::new(58),
             collapsed: Default::default(),
             open_browser: None,
+            markdown_preview: false,
+            md_for: None,
+            md_text: None,
         };
         app.refresh();
         app.preload_panels();
@@ -494,7 +554,11 @@ impl App {
             return;
         }
         let byte = self.draft_byte_index();
-        let prev = self.draft[..byte].chars().next_back().map(|c| c.len_utf8()).unwrap_or(0);
+        let prev = self.draft[..byte]
+            .chars()
+            .next_back()
+            .map(|c| c.len_utf8())
+            .unwrap_or(0);
         self.draft.drain(byte - prev..byte);
         self.draft_cursor = cursor - 1;
     }
@@ -505,7 +569,11 @@ impl App {
         if byte >= self.draft.len() {
             return;
         }
-        let len = self.draft[byte..].chars().next().map(|c| c.len_utf8()).unwrap_or(0);
+        let len = self.draft[byte..]
+            .chars()
+            .next()
+            .map(|c| c.len_utf8())
+            .unwrap_or(0);
         self.draft.drain(byte..byte + len);
         self.draft_cursor = self.draft_cursor();
     }
@@ -526,64 +594,57 @@ impl App {
         self.draft_cursor = self.draft.chars().count();
     }
 
-    /// (0-based hard line, char col within it) of the cursor. Hard lines
-    /// are `\n`-separated; the wrapping renderer soft-wraps them further.
-    fn draft_line_col(&self) -> (usize, usize) {
+    /// Up in the commit box: one visual (soft-wrapped) row up, preserving
+    /// the display column when the target row is long enough.
+    pub fn move_draft_up_line(&mut self) {
+        self.move_draft_visual_row(-1);
+    }
+
+    /// Down in the commit box: one visual (soft-wrapped) row down, then
+    /// the very end past the last row.
+    pub fn move_draft_down_line(&mut self) {
+        self.move_draft_visual_row(1);
+    }
+
+    /// Move the draft cursor by `delta` visual rows using the same wrap
+    /// the renderer drew (`draft_wrap_width`). The display column is
+    /// preserved; past the first/last row clamps to document start/end.
+    fn move_draft_visual_row(&mut self, delta: i32) {
+        use unicode_width::UnicodeWidthChar;
+        let width = self.draft_wrap_width.get().max(1);
         let cursor = self.draft_cursor();
-        let mut line = 0;
-        let mut col = 0;
-        for (i, ch) in self.draft.chars().enumerate() {
-            if i == cursor {
+        let wrap = wrap_draft(&self.draft, cursor, width);
+        if wrap.bounds.is_empty() {
+            return;
+        }
+        let target = wrap.cursor_row as i32 + delta;
+        if target < 0 {
+            self.draft_cursor = 0;
+            return;
+        }
+        let target = target as usize;
+        if target >= wrap.bounds.len() {
+            self.draft_cursor = self.draft.chars().count();
+            return;
+        }
+        let (rs, re) = wrap.bounds[target];
+        let chars: Vec<char> = self.draft.chars().collect();
+        let mut col = 0usize;
+        let mut idx = rs;
+        while idx < re && idx < chars.len() {
+            let w = chars[idx].width().unwrap_or(0);
+            if col + w > wrap.cursor_col {
                 break;
             }
-            if ch == '\n' {
-                line += 1;
-                col = 0;
-            } else {
-                col += 1;
-            }
+            col += w;
+            idx += 1;
         }
-        (line, col)
+        self.draft_cursor = idx;
     }
 
-    /// Char index where hard line `line` starts (clamped to the text end).
-    fn draft_hard_line_start(&self, line: usize) -> usize {
-        if line == 0 {
-            return 0;
-        }
-        let mut seen = 0;
-        for (i, ch) in self.draft.chars().enumerate() {
-            if ch == '\n' {
-                seen += 1;
-                if seen == line {
-                    return i + 1;
-                }
-            }
-        }
-        self.draft.chars().count()
-    }
-
-    /// Up in the commit box: to the start of the previous hard line (or
-    /// the very start on the first line).
-    pub fn move_draft_up_line(&mut self) {
-        let (line, _) = self.draft_line_col();
-        self.draft_cursor = if line == 0 {
-            0
-        } else {
-            self.draft_hard_line_start(line - 1)
-        };
-    }
-
-    /// Down in the commit box: to the start of the next hard line (or the
-    /// very end on the last line).
-    pub fn move_draft_down_line(&mut self) {
-        let (line, _) = self.draft_line_col();
-        let last = self.draft.chars().filter(|&c| c == '\n').count();
-        self.draft_cursor = if line >= last {
-            self.draft.chars().count()
-        } else {
-            self.draft_hard_line_start(line + 1)
-        };
+    /// Recorded by the commit-box renderer each frame.
+    pub(crate) fn set_draft_wrap_width(&self, width: usize) {
+        self.draft_wrap_width.set(width.max(1));
     }
 
     /// Cancel the open-project flow entirely (Esc in the browser).
@@ -746,6 +807,9 @@ impl App {
     fn set_diff(&mut self, diff: Option<FileDiff>) {
         self.diff_rows = diff.as_ref().map(diff_rows).unwrap_or_default();
         self.diff = diff;
+        self.cursor = self.cursor.min(self.diff_rows.len().saturating_sub(1));
+        // A fresh diff shifts rows: drop any visual selection with it.
+        self.visual = None;
     }
 
     /// Whether the loaded diff shows staged (`Some(true)`) or unstaged
@@ -759,8 +823,117 @@ impl App {
         self.diff_whole_file
     }
 
+    /// Full new-version Markdown text, if loaded for the current target.
+    pub fn markdown_text(&self) -> Option<&str> {
+        self.md_text.as_deref()
+    }
+
+    /// Whether the preview should show for the selected file: toggled on
+    /// and the selected path is Markdown.
+    pub fn show_markdown_preview(&self) -> bool {
+        self.markdown_preview
+            && self
+                .selected_file()
+                .is_some_and(|f| crate::markdown::is_markdown_path(&f.path))
+    }
+
+    /// `m`: toggle rendered Markdown preview for `.md` files.
+    pub fn toggle_markdown_preview(&mut self) {
+        let Some(file) = self.selected_file().cloned() else {
+            return;
+        };
+        if !crate::markdown::is_markdown_path(&file.path) {
+            self.error =
+                Some("markdown preview is only for .md files (press enter for diff)".into());
+            return;
+        }
+        self.markdown_preview = !self.markdown_preview;
+        self.diff_scroll = 0;
+        // The Markdown view has no diff rows: drop any selection with it.
+        self.visual = None;
+        if !self.markdown_preview {
+            self.snap_scroll_to_cursor();
+        }
+        if self.markdown_preview {
+            self.maybe_load_markdown();
+        }
+    }
+
+    /// Request full new-version text for the selected Markdown file,
+    /// unless it is already loaded/loading.
+    fn maybe_load_markdown(&mut self) {
+        if !self.show_markdown_preview() {
+            return;
+        }
+        let target = self.diff_target();
+        if target == self.md_for && self.md_text.is_some() {
+            return;
+        }
+        // Only (re)submit when the target changed or nothing is cached.
+        if target == self.md_for {
+            return;
+        }
+        self.md_for = target.clone();
+        self.md_text = None;
+        if let Some((path, staged)) = target {
+            if let Err(e) = self.queue.submit(AsyncJob::LoadMarkdown { path, staged }) {
+                self.error = Some(e.to_string());
+            }
+        }
+    }
+
     pub fn hunk(&self) -> usize {
         self.hunk
+    }
+
+    /// Line-cursor row into `diff_rows` (clamped; 0 when no diff loaded).
+    pub fn cursor_row(&self) -> usize {
+        self.cursor.min(self.diff_rows.len().saturating_sub(1))
+    }
+
+    /// Nvim-style block column: char index into the cursor row's text.
+    pub fn cursor_col(&self) -> usize {
+        self.cursor_col
+    }
+
+    /// Active visual selection, if any.
+    pub fn visual(&self) -> Option<Visual> {
+        self.visual
+    }
+
+    /// Normalized selection `((start_row, start_col), (end_row, end_col),
+    /// linewise)` from the anchor and the live cursor, clamped to the
+    /// loaded rows. `None` when visual mode is off or no diff is loaded.
+    pub(crate) fn visual_selection(&self) -> Option<VisualSel> {
+        let v = self.visual?;
+        if self.diff_rows.is_empty() {
+            return None;
+        }
+        let max = self.diff_rows.len() - 1;
+        let (ar, ac) = (v.anchor_row.min(max), v.anchor_col);
+        let (cr, cc) = (self.cursor.min(max), self.cursor_col);
+        let ((r1, c1), (r2, c2)) = if (ar, ac) <= (cr, cc) {
+            ((ar, ac), (cr, cc))
+        } else {
+            ((cr, cc), (ar, ac))
+        };
+        Some(((r1, c1), (r2, c2), v.mode == VisualMode::Linewise))
+    }
+
+    /// Recorded by the fullscreen renderer each frame.
+    pub(crate) fn set_full_view_h(&self, h: usize) {
+        self.full_view_h.set(h);
+    }
+
+    /// Recorded by the preview renderer each frame.
+    pub(crate) fn set_prev_view_h(&self, h: usize) {
+        self.prev_view_h.set(h);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_view_h_for_test(&mut self, full: usize, prev: usize) {
+        self.full_view_h.set(full);
+        self.prev_view_h.set(prev);
     }
 
     pub fn diff_scroll(&self) -> u16 {
@@ -1014,6 +1187,8 @@ impl App {
         self.diff_whole_file = false;
         self.set_diff(Some(diff));
         self.hunk = 0;
+        self.cursor = 0;
+        self.cursor_col = 0;
         self.diff_scroll = 0;
     }
 
@@ -1092,10 +1267,7 @@ impl App {
         // from this action arrive later via `poll` and replace them.
         self.error = None;
         self.notice = None;
-        if self.mode == Mode::Committing
-            && matches!(key, KeyCode::Char('a' | 'A'))
-            && shift_held
-        {
+        if self.mode == Mode::Committing && matches!(key, KeyCode::Char('a' | 'A')) && shift_held {
             self.begin_generate_commit_message();
             return;
         }
@@ -1197,6 +1369,11 @@ impl App {
         // Binding dispatch (first match wins; modal keys above stay fixed).
         // Cloned: small vecs, and it keeps the borrow checker happy while
         // the arms below take &mut self.
+        // Esc with an active selection only leaves visual mode.
+        if key == KeyCode::Esc && self.visual.is_some() {
+            self.visual = None;
+            return;
+        }
         let k = self.keys.clone();
         if k.focus_next.contains(&key) {
             // Tab cycles the left rail only (Status -> Branches -> Log ->
@@ -1234,6 +1411,20 @@ impl App {
             self.move_down();
         } else if k.nav_up.contains(&key) {
             self.move_up();
+        } else if key == KeyCode::Char('h') && self.focus == Focus::Diff {
+            self.move_column(-1);
+        } else if key == KeyCode::Char('l') && self.focus == Focus::Diff {
+            self.move_column(1);
+        } else if (key == KeyCode::Char('0') || key == KeyCode::Home) && self.focus == Focus::Diff {
+            self.column_home();
+        } else if key == KeyCode::End && self.focus == Focus::Diff {
+            self.column_end();
+        } else if key == KeyCode::Char('v') && self.focus == Focus::Diff {
+            self.begin_visual(VisualMode::Charwise);
+        } else if key == KeyCode::Char('V') && self.focus == Focus::Diff {
+            self.begin_visual(VisualMode::Linewise);
+        } else if key == KeyCode::Char('y') && self.focus == Focus::Diff {
+            self.begin_yank();
         } else if k.checkout.contains(&key) && self.focus == Focus::Branches {
             self.checkout_selected_branch();
         } else if k.stash_pop.contains(&key) && self.focus == Focus::Stash {
@@ -1258,12 +1449,22 @@ impl App {
         } else if k.stash_drop.contains(&key) && self.focus == Focus::Stash {
             self.drop_selected_stash();
         } else if k.scroll_up.contains(&key) {
-            self.scroll_diff_by(-10);
+            if self.focus == Focus::Diff && !self.show_markdown_preview() {
+                self.move_cursor(-10);
+            } else {
+                self.scroll_diff_by(-10);
+            }
         } else if k.scroll_down.contains(&key) {
-            self.scroll_diff_by(10);
+            if self.focus == Focus::Diff && !self.show_markdown_preview() {
+                self.move_cursor(10);
+            } else {
+                self.scroll_diff_by(10);
+            }
         } else if k.commit.contains(&key) {
             self.mode = Mode::Committing;
             self.draft.clear();
+        } else if k.toggle_markdown_preview.contains(&key) {
+            self.toggle_markdown_preview();
         } else if k.llm_settings.contains(&key) {
             self.begin_llm_settings();
         } else if k.find_files.contains(&key) {
@@ -1279,31 +1480,56 @@ impl App {
         }
     }
 
-    /// Keys inside the fullscreen diff overlay. hunk navigation and staging
-    /// mirror the old diff-pane keys; `/` finds another file without
-    /// leaving fullscreen; Esc closes back to the file list.
+    /// Keys inside the fullscreen diff overlay. `j/k`/`↑`/`↓` move the
+    /// line cursor, `h/l`/`←`/`→` move the nvim-style block column,
+    /// `0`/`Home`/`End` jump it, `J`/`K` jump by hunk, `v`/`V` select,
+    /// `y` yanks, `/` finds another file without leaving fullscreen;
+    /// Esc leaves visual mode first, then closes back to the file list.
     fn on_key_full_diff(&mut self, key: KeyCode) {
         let k = self.keys.clone();
         if key == KeyCode::Esc {
-            self.mode = Mode::Normal;
+            if self.visual.is_some() {
+                self.visual = None;
+            } else {
+                self.mode = Mode::Normal;
+                self.snap_scroll_to_cursor();
+            }
+        } else if k.toggle_markdown_preview.contains(&key) {
+            self.toggle_markdown_preview();
         } else if k.find_files.contains(&key) {
             self.open_finder();
         } else if key == KeyCode::Up {
-            // Arrows scroll line-by-line so long single-hunk diffs stay
-            // viewable; j/k below jump by hunk.
-            self.scroll_diff_by(-1);
-        } else if key == KeyCode::Down {
-            self.scroll_diff_by(1);
-        } else if k.nav_down.contains(&key) {
-            self.select_hunk(self.hunk.saturating_add(1));
+            // Arrows move the line cursor so long single-hunk diffs stay
+            // viewable line by line; `J`/`K` below jump by hunk.
+            self.move_cursor_or_scroll(-1);
+        } else if key == KeyCode::Down || k.nav_down.contains(&key) {
+            self.move_cursor_or_scroll(1);
         } else if k.nav_up.contains(&key) {
-            self.select_hunk(self.hunk.saturating_sub(1));
+            self.move_cursor_or_scroll(-1);
+        } else if key == KeyCode::Char('h') || key == KeyCode::Left {
+            self.move_column_or_scroll(-1);
+        } else if key == KeyCode::Char('l') || key == KeyCode::Right {
+            self.move_column_or_scroll(1);
+        } else if key == KeyCode::Char('0') || key == KeyCode::Home {
+            self.column_home();
+        } else if key == KeyCode::End {
+            self.column_end();
+        } else if key == KeyCode::Char('v') {
+            self.begin_visual(VisualMode::Charwise);
+        } else if key == KeyCode::Char('V') {
+            self.begin_visual(VisualMode::Linewise);
+        } else if key == KeyCode::Char('y') {
+            self.begin_yank();
         } else if k.stage.contains(&key) {
             self.stage_selected_hunk();
         } else if k.scroll_up.contains(&key) {
-            self.scroll_diff_by(-10);
+            self.move_cursor_or_scroll(-10);
         } else if k.scroll_down.contains(&key) {
-            self.scroll_diff_by(10);
+            self.move_cursor_or_scroll(10);
+        } else if key == KeyCode::Char('J') && !self.show_markdown_preview() {
+            self.select_hunk(self.hunk.saturating_add(1));
+        } else if key == KeyCode::Char('K') && !self.show_markdown_preview() {
+            self.select_hunk(self.hunk.saturating_sub(1));
         } else if k.sync_pull.contains(&key) {
             self.start_pull();
         } else if k.sync_push.contains(&key) {
@@ -1317,6 +1543,7 @@ impl App {
     fn open_full_diff(&mut self) {
         if self.selected_file().is_some() {
             self.mode = Mode::FullDiff;
+            self.snap_scroll_to_cursor();
         }
     }
 
@@ -1335,8 +1562,7 @@ impl App {
                         self.selected = n;
                     }
                 } else {
-                    self.selected = (self.selected + 1)
-                        .min(self.file_count().saturating_sub(1));
+                    self.selected = (self.selected + 1).min(self.file_count().saturating_sub(1));
                 }
                 self.maybe_load_diff();
             }
@@ -1356,10 +1582,10 @@ impl App {
                     .saturating_add(1)
                     .min(self.stash_count().saturating_sub(1));
             }
-            // Right-side preview: navigation scrolls the file line by line
+            // Right-side preview: navigation moves the line cursor
             // (PgUp/PgDn below page by 10 regardless of focus).
             Focus::Diff => {
-                self.scroll_diff_by(1);
+                self.move_cursor_or_scroll(1);
             }
         }
     }
@@ -1389,7 +1615,7 @@ impl App {
                 self.stash_selected = self.stash_selected.saturating_sub(1);
             }
             Focus::Diff => {
-                self.scroll_diff_by(-1);
+                self.move_cursor_or_scroll(-1);
             }
         }
     }
@@ -1471,9 +1697,7 @@ impl App {
             self.expand_selected();
             return;
         }
-        if self.selected + 1 < self.file_count()
-            && self.is_hidden_index(self.selected + 1)
-        {
+        if self.selected + 1 < self.file_count() && self.is_hidden_index(self.selected + 1) {
             let path = self.file_list[self.selected + 1].path.clone();
             if let Some(dir) = self.collapsed_dir_for(&path) {
                 self.set_collapsed(&dir, false);
@@ -1495,8 +1719,258 @@ impl App {
     fn select_hunk(&mut self, index: usize) {
         let clamped = index.min(self.hunk_count().saturating_sub(1));
         self.hunk = clamped;
+        self.cursor = self.hunk_start_row(clamped) as usize;
+        self.cursor = self.cursor.min(self.diff_rows.len().saturating_sub(1));
         // Snap the selected hunk to the top of the view.
         self.diff_scroll = self.hunk_start_row(clamped);
+    }
+
+    /// Move the line cursor by `delta` rows, clamped to the loaded rows.
+    /// The hunk follows the cursor (nearest header at or above it) so
+    /// `space` stages the hunk under the cursor; the view follows at the
+    /// edge only (`ensure_cursor_visible`), nvim-style. No-op with no
+    /// diff or in Markdown preview (which owns plain scrolling instead).
+    fn move_cursor(&mut self, delta: isize) {
+        if self.diff_rows.is_empty() || self.show_markdown_preview() {
+            return;
+        }
+        let max = self.diff_rows.len().saturating_sub(1) as isize;
+        let cur = (self.cursor as isize).clamp(0, max);
+        self.cursor = (cur + delta).clamp(0, max) as usize;
+        self.sync_hunk_to_cursor();
+        self.ensure_cursor_visible();
+    }
+
+    /// Nvim-style viewport follow: the cursor walks freely inside the
+    /// visible window and the view scrolls only once it would leave it
+    /// (top edge pins, bottom edge advances minimally). Fullscreen counts
+    /// side-by-side rows, the preview unified lines (a del/add pair keeps
+    /// both of its lines visible). Unknown height (no frame rendered yet)
+    /// reads as 1, i.e. top-pin, so the cursor is never stranded.
+    fn ensure_cursor_visible(&mut self) {
+        if self.show_markdown_preview() || self.diff_rows.is_empty() {
+            return;
+        }
+        if self.mode == Mode::FullDiff {
+            let h = self.full_view_h.get().max(1);
+            let scroll = self.diff_scroll as usize;
+            if self.cursor < scroll {
+                self.diff_scroll = self.cursor.min(u16::MAX as usize) as u16;
+            } else if self.cursor + 1 > scroll + h {
+                self.diff_scroll = (self.cursor + 1 - h).min(u16::MAX as usize) as u16;
+            }
+        } else {
+            let h = self.prev_view_h.get().max(1);
+            let c = self.cursor_row();
+            let start = crate::ui::rows_unified_len(&self.diff_rows[..c]);
+            let end = start + crate::ui::unified_row_count(&self.diff_rows[c]);
+            let scroll = self.diff_scroll as usize;
+            if start < scroll {
+                self.diff_scroll = start.min(u16::MAX as usize) as u16;
+            } else if end > scroll + h {
+                self.diff_scroll = end.saturating_sub(h).min(u16::MAX as usize) as u16;
+            }
+        }
+    }
+
+    /// Hunk under the cursor: nearest hunk header at or above it.
+    fn sync_hunk_to_cursor(&mut self) {
+        let mut hunk = 0;
+        for (i, row) in self.diff_rows.iter().enumerate() {
+            if i > self.cursor {
+                break;
+            }
+            if let DiffRow::Header { index } = row {
+                hunk = *index;
+            }
+        }
+        self.hunk = hunk.min(self.hunk_count().saturating_sub(1));
+    }
+
+    /// Keep the cursor visible by top-pinning the view on its row:
+    /// side-by-side rows fullscreen, unified lines in the preview.
+    fn snap_scroll_to_cursor(&mut self) {
+        if self.show_markdown_preview() {
+            return;
+        }
+        if self.mode == Mode::FullDiff {
+            self.diff_scroll = (self.cursor as u16).min(self.diff_full_max());
+        } else {
+            let off = crate::ui::rows_unified_len(
+                &self.diff_rows[..self.cursor.min(self.diff_rows.len())],
+            );
+            self.diff_scroll = (off as u16).min(self.diff_preview_max());
+        }
+    }
+
+    /// Line-cursor step, or plain scroll when the Markdown preview owns
+    /// the view (it has no diff rows to point at).
+    fn move_cursor_or_scroll(&mut self, delta: isize) {
+        if self.show_markdown_preview() {
+            self.scroll_diff_by(delta);
+        } else {
+            self.move_cursor(delta);
+        }
+    }
+
+    /// Nvim-style `h`/`l`: move the block column within the cursor row's
+    /// text, clamped to its last char (like `$`). Row moves never touch
+    /// it, so it sticks across short/long lines like vim's column.
+    /// No-op with no diff or in Markdown preview.
+    fn move_column(&mut self, delta: isize) {
+        if self.show_markdown_preview() {
+            return;
+        }
+        let max = self.cursor_text_len().saturating_sub(1) as isize;
+        // No text under the block (blank side): nowhere to move.
+        if self.cursor_text_len() == 0 {
+            return;
+        }
+        let cur = (self.cursor_col as isize).clamp(0, max);
+        self.cursor_col = (cur + delta).clamp(0, max) as usize;
+    }
+
+    /// Char count of the text under the block cursor (0 with no diff).
+    fn cursor_text_len(&self) -> usize {
+        match (self.diff_rows.get(self.cursor_row()), self.diff.as_ref()) {
+            (Some(row), Some(diff)) => cursor_line_text(diff, row).chars().count(),
+            _ => 0,
+        }
+    }
+
+    /// Nvim-style `0`/`Home`: block to the line start.
+    fn column_home(&mut self) {
+        if self.show_markdown_preview() {
+            return;
+        }
+        if self.diff_rows.get(self.cursor_row()).is_some() {
+            self.cursor_col = 0;
+        }
+    }
+
+    /// Nvim-style `End`: block to the line's last char.
+    fn column_end(&mut self) {
+        if self.show_markdown_preview() {
+            return;
+        }
+        self.cursor_col = self.cursor_text_len().saturating_sub(1);
+    }
+
+    /// Block-column step, or plain scroll when the Markdown preview owns
+    /// the view.
+    fn move_column_or_scroll(&mut self, delta: isize) {
+        if self.show_markdown_preview() {
+            self.scroll_diff_by(delta);
+        } else {
+            self.move_column(delta);
+        }
+    }
+
+    /// `v`/`V`: enter visual mode anchoring at the cursor (charwise /
+    /// linewise). Same key again leaves it; the other key flips the mode
+    /// keeping the anchor, like nvim. Motions extend the selection since
+    /// its live end is the line cursor.
+    fn begin_visual(&mut self, mode: VisualMode) {
+        if self.diff_rows.is_empty() || self.show_markdown_preview() {
+            return;
+        }
+        match self.visual {
+            Some(v) if v.mode == mode => self.visual = None,
+            Some(mut v) => {
+                v.mode = mode;
+                self.visual = Some(v);
+            }
+            None => {
+                self.visual = Some(Visual {
+                    anchor_row: self.cursor_row(),
+                    anchor_col: self.cursor_col,
+                    mode,
+                })
+            }
+        }
+    }
+
+    /// Char slice `[from..=to]` without cutting UTF-8 boundaries.
+    fn slice_chars(text: &str, from: usize, to_incl: usize) -> String {
+        if from > to_incl {
+            return String::new();
+        }
+        text.chars().skip(from).take(to_incl - from + 1).collect()
+    }
+
+    /// Text the next yank would take: the selection (linewise whole rows
+    /// with trailing newlines, charwise endpoint slices joined by `\n`),
+    /// or the cursor line when visual mode is off. `None` when empty.
+    fn yank_text(&self) -> Option<String> {
+        let diff = self.diff.as_ref()?;
+        if self.diff_rows.is_empty() {
+            return None;
+        }
+        let text = match self.visual_selection() {
+            None => {
+                let line = cursor_line_text(diff, &self.diff_rows[self.cursor_row()]);
+                if line.is_empty() {
+                    return None;
+                }
+                format!("{line}\n")
+            }
+            Some(((r1, c1), (r2, c2), linewise)) => {
+                if linewise {
+                    let mut s = String::new();
+                    for r in r1..=r2 {
+                        s.push_str(&cursor_line_text(diff, &self.diff_rows[r]));
+                        s.push('\n');
+                    }
+                    s
+                } else if r1 == r2 {
+                    Self::slice_chars(&cursor_line_text(diff, &self.diff_rows[r1]), c1, c2)
+                } else {
+                    let mut s = String::new();
+                    let first = cursor_line_text(diff, &self.diff_rows[r1]);
+                    s.push_str(&first.chars().skip(c1).collect::<String>());
+                    for r in r1 + 1..r2 {
+                        s.push('\n');
+                        s.push_str(&cursor_line_text(diff, &self.diff_rows[r]));
+                    }
+                    s.push('\n');
+                    s.push_str(&Self::slice_chars(
+                        &cursor_line_text(diff, &self.diff_rows[r2]),
+                        0,
+                        c2,
+                    ));
+                    s
+                }
+            }
+        };
+        if text.is_empty() {
+            None
+        } else {
+            Some(text)
+        }
+    }
+
+    /// `y`: yank the selection (or the cursor line) to the system
+    /// clipboard via OSC 52 and leave visual mode. Empty selections
+    /// report instead of clobbering the clipboard.
+    fn begin_yank(&mut self) {
+        let Some(text) = self.yank_text() else {
+            self.error = Some("nothing to yank".into());
+            return;
+        };
+        self.visual = None;
+        if text.ends_with('\n') {
+            let lines = text.lines().count();
+            self.notice = Some(format!(
+                "yanked {} line{}",
+                lines,
+                if lines == 1 { "" } else { "s" }
+            ));
+        } else {
+            self.notice = Some(format!("yanked {} chars", text.chars().count()));
+        }
+        if !yank_to_clipboard(&text) {
+            self.error = Some("yanked, but the terminal refused the clipboard (OSC 52)".into());
+        }
     }
 
     /// Rendered row offset where hunk `index` starts (its header row in the
@@ -1504,7 +1978,6 @@ impl App {
     fn hunk_start_row(&self, index: usize) -> u16 {
         crate::ui::rows_hunk_start(&self.diff_rows, index)
     }
-
     /// Last valid preview scroll offset (unified lines), so scrolling the
     /// [5] tab stops on the last line instead of running into blank space.
     fn diff_preview_max(&self) -> u16 {
@@ -1523,9 +1996,15 @@ impl App {
 
     /// Scroll the diff by `delta` lines, clamped to the content of the
     /// currently shown view (unified preview in Normal, side-by-side rows
-    /// in FullDiff).
+    /// in FullDiff). Markdown preview lines depend on the render width,
+    /// so they use a generous cap and the renderer clamps the slice.
     fn scroll_diff_by(&mut self, delta: isize) {
-        let max = if self.mode == Mode::FullDiff {
+        let max = if self.show_markdown_preview() {
+            self.md_text
+                .as_ref()
+                .map(|t| (t.lines().count() * 4 + 16).min(u16::MAX as usize) as u16)
+                .unwrap_or(u16::MAX)
+        } else if self.mode == Mode::FullDiff {
             self.diff_full_max()
         } else {
             self.diff_preview_max()
@@ -1645,7 +2124,12 @@ impl App {
     }
 
     fn submit_commit(&mut self) {
+        if self.generating {
+            self.notice = Some("still generating a message…".into());
+            return;
+        }
         if self.draft.trim().is_empty() {
+            self.notice = Some("type a commit message first".into());
             return;
         }
         let job = AsyncJob::Commit {
@@ -1730,6 +2214,8 @@ impl App {
         // Stale view: show loading until the fresh diff arrives.
         self.set_diff(None);
         self.hunk = 0;
+        self.cursor = 0;
+        self.cursor_col = 0;
         self.diff_scroll = 0;
         self.diff_whole_file = whole;
         if let Some((path, staged)) = target {
@@ -1755,6 +2241,17 @@ impl App {
                 self.error = Some(e.to_string());
             }
         }
+        self.reload_markdown();
+    }
+
+    /// Re-request Markdown text after a mutation (stage/commit/…).
+    fn reload_markdown(&mut self) {
+        if !self.show_markdown_preview() {
+            return;
+        }
+        self.md_for = None;
+        self.md_text = None;
+        self.maybe_load_markdown();
     }
 
     fn branch_count(&self) -> usize {
@@ -2076,89 +2573,140 @@ impl App {
             self.apply(result);
         }
         self.maybe_load_diff();
+        self.maybe_load_markdown();
     }
 
     fn apply(&mut self, result: AsyncResult) {
-            match result {
-                AsyncResult::Status(st) => {
-                    self.status = Some(st);
-                    self.rebuild_file_list();
-                    self.error = None;
-                }
-                AsyncResult::Diff(d) => {
-                    // Drop overtaken loads: only the latest target counts
-                    // (jobs run FIFO, so a newer LoadDiff may follow).
-                    if self.diff_for.as_ref().is_some_and(|(p, _)| *p == d.path) {
-                        if d.hunks.is_empty() && !self.diff_whole_file {
-                            // Listed but no content diff (e.g. mode-only
-                            // change): show the whole file automatically.
-                            self.fallback_whole_file = true;
-                            self.set_diff(None);
-                            self.hunk = 0;
-                            self.diff_scroll = 0;
-                            self.diff_whole_file = true;
-                            let job = AsyncJob::LoadFile { path: d.path };
-                            if let Err(e) = self.queue.submit(job) {
-                                self.error = Some(e.to_string());
-                            }
-                        } else {
-                            self.set_diff(Some(d));
-                            self.hunk = self.hunk.min(self.hunk_count().saturating_sub(1));
+        match result {
+            AsyncResult::Status(st) => {
+                self.status = Some(st);
+                self.rebuild_file_list();
+                self.error = None;
+            }
+            AsyncResult::Diff(d) => {
+                // Drop overtaken loads: only the latest target counts
+                // (jobs run FIFO, so a newer LoadDiff may follow).
+                if self.diff_for.as_ref().is_some_and(|(p, _)| *p == d.path) {
+                    if d.hunks.is_empty() && !self.diff_whole_file {
+                        // Listed but no content diff (e.g. mode-only
+                        // change): show the whole file automatically.
+                        self.fallback_whole_file = true;
+                        self.set_diff(None);
+                        self.hunk = 0;
+                        self.diff_scroll = 0;
+                        self.diff_whole_file = true;
+                        let job = AsyncJob::LoadFile { path: d.path };
+                        if let Err(e) = self.queue.submit(job) {
+                            self.error = Some(e.to_string());
+                        }
+                    } else {
+                        self.set_diff(Some(d));
+                        self.sync_hunk_to_cursor();
+                        if self.show_markdown_preview() {
                             // The fresh content may be shorter: keep the
                             // offset inside the new content.
-                            self.diff_scroll =
-                                self.diff_scroll.min(self.diff_preview_max());
+                            self.diff_scroll = self.diff_scroll.min(self.diff_preview_max());
+                        } else {
+                            self.snap_scroll_to_cursor();
                         }
                     }
-                }
-                AsyncResult::Branches(b) => {
-                    self.branch_selected = self.branch_selected.min(b.len().saturating_sub(1));
-                    self.branches = Some(b);
-                }
-                AsyncResult::Log(entries) => {
-                    self.log_scroll = self.log_scroll.min(entries.len().saturating_sub(1) as u16);
-                    self.log = Some(entries);
-                }
-                AsyncResult::Stash(entries) => {
-                    self.stash_selected = self.stash_selected.min(entries.len().saturating_sub(1));
-                    self.stash = Some(entries);
-                }
-                AsyncResult::SyncStatus(st) => {
-                    self.sync = Some(st);
-                }
-                AsyncResult::GeneratedMessage(msg) => {
-                    self.generating = false;
-                    // The user may have Esc'd while the network call was in
-                    // flight: only fill the open commit box.
-                    if self.mode == Mode::Committing {
-                        self.draft = msg;
-                        self.move_draft_end();
-                        self.error = None;
-                    }
-                }
-                AsyncResult::MutationDone => {
-                    self.syncing = None;
-                    self.refresh();
-                    self.reload_diff();
-                    self.reload_branches();
-                    self.reload_log();
-                    self.reload_stash();
-                    self.reload_sync();
-                }
-                AsyncResult::Error(e) => {
-                    self.syncing = None;
-                    self.generating = false;
-                    // EmptyCommit on its own doesn't say how to fix it.
-                    self.error = Some(match e {
-                        GitError::EmptyCommit => {
-                            "nothing to commit: press space on a file to stage it, then c to commit"
-                                .into()
-                        }
-                        _ => e.to_string(),
-                    });
                 }
             }
+            AsyncResult::Markdown { path, staged, text } => {
+                if self
+                    .md_for
+                    .as_ref()
+                    .is_some_and(|(p, s)| *p == path && *s == staged)
+                {
+                    self.md_text = Some(text);
+                    self.diff_scroll = 0;
+                }
+            }
+            AsyncResult::Branches(b) => {
+                self.branch_selected = self.branch_selected.min(b.len().saturating_sub(1));
+                self.branches = Some(b);
+            }
+            AsyncResult::Log(entries) => {
+                self.log_scroll = self.log_scroll.min(entries.len().saturating_sub(1) as u16);
+                self.log = Some(entries);
+            }
+            AsyncResult::Stash(entries) => {
+                self.stash_selected = self.stash_selected.min(entries.len().saturating_sub(1));
+                self.stash = Some(entries);
+            }
+            AsyncResult::SyncStatus(st) => {
+                self.sync = Some(st);
+            }
+            AsyncResult::GeneratedMessage(msg) => {
+                self.generating = false;
+                // The user may have Esc'd while the network call was in
+                // flight: only fill the open commit box.
+                if self.mode == Mode::Committing {
+                    self.draft = msg;
+                    self.move_draft_end();
+                    self.error = None;
+                }
+            }
+            AsyncResult::MutationDone => {
+                self.syncing = None;
+                self.refresh();
+                self.reload_diff();
+                self.reload_branches();
+                self.reload_log();
+                self.reload_stash();
+                self.reload_sync();
+            }
+            AsyncResult::Error(e) => {
+                self.syncing = None;
+                self.generating = false;
+                // EmptyCommit on its own doesn't say how to fix it.
+                self.error = Some(match e {
+                    GitError::EmptyCommit => {
+                        "nothing to commit: press space on a file to stage it, then c to commit"
+                            .into()
+                    }
+                    _ => e.to_string(),
+                });
+            }
+        }
     }
+}
+
+/// Push `text` to the system clipboard with an OSC 52 escape. Terminal-
+/// native (kitty, foot, alacritty, wezterm, tmux passthrough, SSH), no
+/// windowing libraries needed. Returns whether the write succeeded.
+fn yank_to_clipboard(text: &str) -> bool {
+    use std::io::Write;
+    let encoded = base64_encode(text.as_bytes());
+    let mut out = std::io::stdout().lock();
+    write!(out, "\x1b]52;c;{encoded}\x07")
+        .and_then(|_| out.flush())
+        .is_ok()
+}
+
+/// Minimal standard base64 (no external crate): 3 bytes -> 4 chars.
+fn base64_encode(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
+        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(TABLE[((n >> 18) & 63) as usize] as char);
+        out.push(TABLE[((n >> 12) & 63) as usize] as char);
+        out.push(if chunk.len() > 1 {
+            TABLE[((n >> 6) & 63) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            TABLE[(n & 63) as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
 }
 
 #[cfg(test)]
@@ -2629,7 +3177,7 @@ mod tests {
     }
 
     #[test]
-    fn commit_box_up_down_moves_between_hard_lines() {
+    fn commit_box_up_down_moves_between_visual_rows() {
         let mut fx = harness(&["a.txt"]);
         fx.app.on_key(KeyCode::Char('c'));
         for c in "subject".chars() {
@@ -2641,20 +3189,84 @@ mod tests {
         }
         assert_eq!(fx.app.draft(), "subject\nbody");
         assert_eq!(fx.app.draft_cursor(), 12);
-        // Up jumps to the start of the previous line.
+        // Up keeps the display column (end of "body" → col 4 in "subject").
+        fx.app.on_key(KeyCode::Up);
+        assert_eq!(fx.app.draft_cursor(), 4);
+        // Up past the first row clamps to the document start.
         fx.app.on_key(KeyCode::Up);
         assert_eq!(fx.app.draft_cursor(), 0);
-        // Up on the first line stays at the start.
-        fx.app.on_key(KeyCode::Up);
-        assert_eq!(fx.app.draft_cursor(), 0);
-        // Down jumps to the start of the next line, then to the very end.
+        // Down preserves the column into the next row.
         fx.app.on_key(KeyCode::Down);
         assert_eq!(fx.app.draft_cursor(), 8);
+        // Down past the last row jumps to the very end.
         fx.app.on_key(KeyCode::Down);
         assert_eq!(fx.app.draft_cursor(), 12);
         // Enter still commits a multi-line message.
         fx.app.on_key(KeyCode::Enter);
         assert_eq!(fx.app.mode(), Mode::Normal);
+    }
+
+    #[test]
+    fn commit_box_up_down_follows_soft_wrapped_rows() {
+        let mut fx = harness(&["a.txt"]);
+        // Narrow wrap so a single hard line becomes several visual rows.
+        fx.app.set_draft_wrap_width(5);
+        fx.app.on_key(KeyCode::Char('c'));
+        for c in "hello world".chars() {
+            fx.app.on_key(KeyCode::Char(c));
+        }
+        assert_eq!(fx.app.draft_cursor(), 11);
+        // Rows are "hello" / " worl" / "d": end-of-doc col is 1 ("d"), so
+        // up lands at col 1 of the previous row (index 6, after the space).
+        fx.app.on_key(KeyCode::Up);
+        assert_eq!(
+            fx.app.draft_cursor(),
+            6,
+            "same display col on prev visual row"
+        );
+        fx.app.on_key(KeyCode::Down);
+        assert_eq!(fx.app.draft_cursor(), 11, "back to end on the last row");
+        fx.app.on_key(KeyCode::Down);
+        assert_eq!(fx.app.draft_cursor(), 11, "clamps at document end");
+        // From the document start, down walks visual rows without jumping
+        // to the end of the hard line.
+        fx.app.on_key(KeyCode::Home);
+        assert_eq!(fx.app.draft_cursor(), 0);
+        fx.app.on_key(KeyCode::Down);
+        assert_eq!(fx.app.draft_cursor(), 5, "start of second visual row");
+    }
+
+    #[test]
+    fn empty_commit_shows_notice_and_stays_open() {
+        let mut fx = harness(&["a.txt"]);
+        fx.app.on_key(KeyCode::Char('c'));
+        fx.app.on_key(KeyCode::Enter);
+        assert_eq!(fx.app.mode(), Mode::Committing, "box stays open");
+        let notice = fx.app.notice().unwrap_or("");
+        assert!(
+            notice.contains("type a commit message"),
+            "expected empty-draft notice, got: {notice:?}"
+        );
+        assert!(fx.app.error().is_none());
+    }
+
+    #[test]
+    fn enter_while_generating_is_ignored_with_notice() {
+        let mut fx = harness(&["a.txt"]);
+        fx.app.on_key(KeyCode::Char('c'));
+        fx.app.generating = true;
+        for c in "wip".chars() {
+            fx.app.on_key(KeyCode::Char(c));
+        }
+        fx.app.on_key(KeyCode::Enter);
+        assert_eq!(
+            fx.app.mode(),
+            Mode::Committing,
+            "must not commit mid-generation"
+        );
+        assert_eq!(fx.app.draft(), "wip");
+        let notice = fx.app.notice().unwrap_or("");
+        assert!(notice.contains("generating"), "got: {notice:?}");
     }
 
     #[test]
@@ -2723,8 +3335,8 @@ mod tests {
         assert_eq!(fx.app.diff_scroll(), 2);
         fx.app.on_key(KeyCode::Up);
         assert_eq!(fx.app.diff_scroll(), 1);
-        // j/k still jump by hunk (and snap scroll to the hunk top).
-        fx.app.on_key(KeyCode::Char('j'));
+        // J/K jump by hunk (and snap scroll to the hunk top).
+        fx.app.on_key(KeyCode::Char('J'));
         assert_eq!(fx.app.hunk(), 1);
         assert!(fx.app.diff_scroll() > 1);
     }
@@ -3321,7 +3933,9 @@ mod tests {
         let mut fx = two_hunk_fixture();
         fx.app.on_key(KeyCode::Enter);
         assert_eq!(fx.app.mode(), Mode::FullDiff);
-        let max = fx.app.diff_rows()
+        let max = fx
+            .app
+            .diff_rows()
             .len()
             .saturating_sub(1)
             .min(u16::MAX as usize) as u16;
@@ -3403,14 +4017,400 @@ mod tests {
         assert_eq!(fx.app.hunk(), 0);
         fx.app.on_key(KeyCode::Enter);
         assert_eq!(fx.app.mode(), Mode::FullDiff);
-        fx.app.on_key(KeyCode::Char('j'));
+        fx.app.on_key(KeyCode::Char('J'));
         assert_eq!(fx.app.hunk(), 1);
         // Snaps the selected hunk to the top of the view.
         assert!(fx.app.diff_scroll() > 0);
-        fx.app.on_key(KeyCode::Char('j'));
+        fx.app.on_key(KeyCode::Char('J'));
         assert_eq!(fx.app.hunk(), 1, "clamps at last hunk");
-        fx.app.on_key(KeyCode::Char('k'));
+        fx.app.on_key(KeyCode::Char('K'));
         assert_eq!(fx.app.hunk(), 0);
+    }
+
+    #[test]
+    fn jk_moves_line_cursor_and_syncs_hunk() {
+        let mut fx = two_hunk_fixture();
+        fx.app.on_key(KeyCode::Enter);
+        assert_eq!(fx.app.mode(), Mode::FullDiff);
+        assert_eq!(fx.app.cursor_row(), 0);
+        fx.app.on_key(KeyCode::Char('j'));
+        assert_eq!(fx.app.cursor_row(), 1);
+        assert_eq!(fx.app.diff_scroll(), 1, "view follows the cursor");
+        assert_eq!(fx.app.hunk(), 0, "still inside the first hunk");
+        fx.app.on_key(KeyCode::Char('k'));
+        assert_eq!(fx.app.cursor_row(), 0);
+        assert_eq!(fx.app.diff_scroll(), 0);
+    }
+
+    #[test]
+    fn shift_jk_jumps_between_hunks() {
+        let mut fx = two_hunk_fixture();
+        fx.app.on_key(KeyCode::Enter);
+        fx.app.on_key(KeyCode::Char('J'));
+        assert_eq!(fx.app.hunk(), 1);
+        let start = crate::ui::rows_hunk_start(fx.app.diff_rows(), 1) as usize;
+        assert_eq!(fx.app.cursor_row(), start);
+        assert_eq!(fx.app.diff_scroll(), start as u16);
+        // Clamps at the last hunk.
+        fx.app.on_key(KeyCode::Char('J'));
+        assert_eq!(fx.app.hunk(), 1);
+        fx.app.on_key(KeyCode::Char('K'));
+        assert_eq!(fx.app.hunk(), 0);
+        assert_eq!(fx.app.cursor_row(), 0);
+    }
+
+    #[test]
+    fn line_cursor_clamps_at_ends() {
+        let mut fx = two_hunk_fixture();
+        fx.app.on_key(KeyCode::Enter);
+        let last = fx.app.diff_rows().len() - 1;
+        assert!(last > 2, "fixture must have several rows");
+        for _ in 0..500 {
+            fx.app.on_key(KeyCode::Char('j'));
+        }
+        assert_eq!(fx.app.cursor_row(), last);
+        assert_eq!(fx.app.diff_scroll(), last as u16);
+        for _ in 0..500 {
+            fx.app.on_key(KeyCode::Char('k'));
+        }
+        assert_eq!(fx.app.cursor_row(), 0);
+        assert_eq!(fx.app.diff_scroll(), 0);
+    }
+
+    #[test]
+    fn cursor_moves_within_view_before_scrolling_down() {
+        let mut fx = two_hunk_fixture();
+        fx.app.on_key(KeyCode::Enter);
+        fx.app.set_view_h_for_test(4, 4);
+        fx.app.on_key(KeyCode::Char('j'));
+        fx.app.on_key(KeyCode::Char('j'));
+        fx.app.on_key(KeyCode::Char('j'));
+        assert_eq!(fx.app.cursor_row(), 3);
+        assert_eq!(fx.app.diff_scroll(), 0, "view must not scroll yet");
+        fx.app.on_key(KeyCode::Char('j'));
+        assert_eq!(fx.app.cursor_row(), 4);
+        assert_eq!(fx.app.diff_scroll(), 1, "scrolls only at the edge");
+        fx.app.on_key(KeyCode::Char('j'));
+        assert_eq!(fx.app.cursor_row(), 5);
+        assert_eq!(fx.app.diff_scroll(), 2);
+    }
+
+    #[test]
+    fn scrolling_up_follows_the_top_edge() {
+        let mut fx = two_hunk_fixture();
+        fx.app.on_key(KeyCode::Enter);
+        fx.app.set_view_h_for_test(4, 4);
+        for _ in 0..5 {
+            fx.app.on_key(KeyCode::Char('j'));
+        }
+        assert_eq!((fx.app.cursor_row(), fx.app.diff_scroll()), (5, 2));
+        fx.app.on_key(KeyCode::Char('k'));
+        assert_eq!(fx.app.diff_scroll(), 2, "still visible, no scroll");
+        fx.app.on_key(KeyCode::Char('k'));
+        fx.app.on_key(KeyCode::Char('k'));
+        assert_eq!(fx.app.diff_scroll(), 2);
+        fx.app.on_key(KeyCode::Char('k'));
+        assert_eq!((fx.app.cursor_row(), fx.app.diff_scroll()), (1, 1));
+    }
+
+    #[test]
+    fn preview_follows_unified_lines_at_edges() {
+        let mut fx = two_hunk_fixture();
+        fx.app.on_key(KeyCode::Char('5'));
+        assert_eq!(fx.app.focus(), Focus::Diff);
+        fx.app.set_view_h_for_test(4, 4);
+        fx.app.on_key(KeyCode::Char('j'));
+        fx.app.on_key(KeyCode::Char('j'));
+        fx.app.on_key(KeyCode::Char('j'));
+        assert_eq!(fx.app.cursor_row(), 3);
+        assert_eq!(fx.app.diff_scroll(), 0, "three context lines fit");
+        // Row 4 is a del/add pair (two unified lines): the whole row
+        // must become visible.
+        fx.app.on_key(KeyCode::Char('j'));
+        assert_eq!(fx.app.cursor_row(), 4);
+        assert_eq!(fx.app.diff_scroll(), 2);
+        fx.app.on_key(KeyCode::Char('k'));
+        fx.app.on_key(KeyCode::Char('k'));
+        assert_eq!(fx.app.diff_scroll(), 2, "still visible, no scroll");
+        fx.app.on_key(KeyCode::Char('k'));
+        assert_eq!((fx.app.cursor_row(), fx.app.diff_scroll()), (1, 1));
+    }
+
+    #[test]
+    fn page_keys_move_cursor_with_follow() {
+        let mut fx = two_hunk_fixture();
+        fx.app.on_key(KeyCode::Enter);
+        fx.app.set_view_h_for_test(5, 5);
+        fx.app.on_key(KeyCode::PageDown);
+        assert_eq!(fx.app.cursor_row(), 10);
+        assert_eq!(fx.app.hunk(), 1, "crossed into the second hunk");
+        assert_eq!(fx.app.diff_scroll(), 6);
+        fx.app.on_key(KeyCode::PageUp);
+        assert_eq!((fx.app.cursor_row(), fx.app.diff_scroll()), (0, 0));
+    }
+
+    #[test]
+    fn arrows_move_line_cursor_in_fullscreen() {
+        let mut fx = two_hunk_fixture();
+        fx.app.on_key(KeyCode::Enter);
+        fx.app.on_key(KeyCode::Down);
+        assert_eq!(fx.app.cursor_row(), 1);
+        assert_eq!(fx.app.diff_scroll(), 1);
+        assert_eq!(fx.app.hunk(), 0, "arrow move must not jump hunks");
+        fx.app.on_key(KeyCode::Up);
+        assert_eq!(fx.app.cursor_row(), 0);
+    }
+
+    #[test]
+    fn preview_jk_moves_line_cursor() {
+        let mut fx = two_hunk_fixture();
+        fx.app.on_key(KeyCode::Char('5'));
+        assert_eq!(fx.app.focus(), Focus::Diff);
+        assert_eq!(fx.app.cursor_row(), 0);
+        fx.app.on_key(KeyCode::Char('j'));
+        assert_eq!(fx.app.cursor_row(), 1);
+        assert_eq!(fx.app.diff_scroll(), 1);
+        assert_eq!(fx.app.hunk(), 0);
+        fx.app.on_key(KeyCode::Char('k'));
+        assert_eq!(fx.app.cursor_row(), 0);
+        assert_eq!(fx.app.diff_scroll(), 0);
+    }
+
+    #[test]
+    fn hl_moves_column_and_clamps_to_line_end() {
+        let mut fx = two_hunk_fixture();
+        fx.app.on_key(KeyCode::Enter);
+        // Row 1 is a short context line; walk right past its end.
+        fx.app.on_key(KeyCode::Char('j'));
+        assert_eq!(fx.app.cursor_row(), 1);
+        assert_eq!(fx.app.cursor_col(), 0);
+        fx.app.on_key(KeyCode::Char('l'));
+        assert_eq!(fx.app.cursor_col(), 1);
+        let len = crate::ui::cursor_line_text(fx.app.diff().unwrap(), &fx.app.diff_rows()[1])
+            .chars()
+            .count();
+        assert!(len > 2, "fixture line must have some width");
+        for _ in 0..500 {
+            fx.app.on_key(KeyCode::Char('l'));
+        }
+        assert_eq!(fx.app.cursor_col(), len - 1, "clamps on last char like $");
+        fx.app.on_key(KeyCode::Char('h'));
+        assert_eq!(fx.app.cursor_col(), len - 2);
+        for _ in 0..500 {
+            fx.app.on_key(KeyCode::Char('h'));
+        }
+        assert_eq!(fx.app.cursor_col(), 0);
+    }
+
+    #[test]
+    fn column_is_sticky_across_rows_with_home_end() {
+        let mut fx = two_hunk_fixture();
+        fx.app.on_key(KeyCode::Enter);
+        fx.app.on_key(KeyCode::Char('j'));
+        fx.app.on_key(KeyCode::Char('l'));
+        fx.app.on_key(KeyCode::Char('l'));
+        fx.app.on_key(KeyCode::Char('l'));
+        assert_eq!(fx.app.cursor_col(), 3);
+        // Moving rows keeps the desired column (nvim sticky column).
+        fx.app.on_key(KeyCode::Char('j'));
+        assert_eq!(fx.app.cursor_row(), 2);
+        assert_eq!(fx.app.cursor_col(), 3);
+        fx.app.on_key(KeyCode::Char('k'));
+        assert_eq!(fx.app.cursor_row(), 1);
+        assert_eq!(fx.app.cursor_col(), 3);
+        fx.app.on_key(KeyCode::End);
+        let len = crate::ui::cursor_line_text(fx.app.diff().unwrap(), &fx.app.diff_rows()[1])
+            .chars()
+            .count();
+        assert_eq!(fx.app.cursor_col(), len - 1);
+        fx.app.on_key(KeyCode::Home);
+        assert_eq!(fx.app.cursor_col(), 0);
+        fx.app.on_key(KeyCode::Char('0'));
+        assert_eq!(fx.app.cursor_col(), 0);
+    }
+
+    #[test]
+    fn arrows_move_column_in_fullscreen() {
+        let mut fx = two_hunk_fixture();
+        fx.app.on_key(KeyCode::Enter);
+        fx.app.on_key(KeyCode::Char('j'));
+        fx.app.on_key(KeyCode::Right);
+        assert_eq!(fx.app.cursor_col(), 1);
+        fx.app.on_key(KeyCode::Left);
+        assert_eq!(fx.app.cursor_col(), 0);
+        fx.app.on_key(KeyCode::Left);
+        assert_eq!(fx.app.cursor_col(), 0, "clamps at line start");
+    }
+
+    #[test]
+    fn preview_hl_moves_column_and_left_still_leaves() {
+        let mut fx = two_hunk_fixture();
+        fx.app.on_key(KeyCode::Char('5'));
+        assert_eq!(fx.app.focus(), Focus::Diff);
+        fx.app.on_key(KeyCode::Char('l'));
+        assert_eq!(fx.app.cursor_col(), 1);
+        fx.app.on_key(KeyCode::Char('h'));
+        assert_eq!(fx.app.cursor_col(), 0);
+        // Plain Left keeps its back-to-files job in the preview.
+        fx.app.on_key(KeyCode::Left);
+        assert_eq!(fx.app.focus(), Focus::Status);
+    }
+
+    #[test]
+    fn visual_linewise_yank_joins_whole_rows() {
+        let mut fx = visual_fixture();
+        fx.app.on_key(KeyCode::Enter);
+        // Anchor on the header, extend one row down, yank whole lines.
+        fx.app.on_key(KeyCode::Char('V'));
+        fx.app.on_key(KeyCode::Char('j'));
+        assert_eq!(
+            fx.app.yank_text().as_deref(),
+            Some("@@ -1,2 +1,2 @@\nsame\n")
+        );
+    }
+
+    #[test]
+    fn visual_charwise_yank_slices_endpoints() {
+        let mut fx = visual_fixture();
+        fx.app.on_key(KeyCode::Enter);
+        fx.app.on_key(KeyCode::Char('j'));
+        fx.app.on_key(KeyCode::Char('l'));
+        fx.app.on_key(KeyCode::Char('v'));
+        fx.app.on_key(KeyCode::Char('j'));
+        // Anchor (1,1) on `same`, cursor (2,1) on the `new` side.
+        assert_eq!(fx.app.yank_text().as_deref(), Some("ame\nne"));
+    }
+
+    #[test]
+    fn visual_charwise_normalizes_reversed_selection() {
+        let mut fx = visual_fixture();
+        fx.app.on_key(KeyCode::Enter);
+        fx.app.on_key(KeyCode::Char('j'));
+        fx.app.on_key(KeyCode::Char('j'));
+        fx.app.on_key(KeyCode::Char('l'));
+        // Anchor below, move up: same text as extending downward.
+        fx.app.on_key(KeyCode::Char('v'));
+        fx.app.on_key(KeyCode::Char('k'));
+        assert_eq!(fx.app.yank_text().as_deref(), Some("ame\nne"));
+    }
+
+    #[test]
+    fn yank_without_visual_takes_cursor_line() {
+        let mut fx = visual_fixture();
+        fx.app.on_key(KeyCode::Enter);
+        fx.app.on_key(KeyCode::Char('j'));
+        assert_eq!(fx.app.yank_text().as_deref(), Some("same\n"));
+        fx.app.on_key(KeyCode::Char('y'));
+        assert!(fx.app.visual_selection().is_none());
+        let notice = fx.app.notice().unwrap_or("").to_string();
+        assert!(notice.contains("yanked"), "got: {notice:?}");
+    }
+
+    #[test]
+    fn esc_leaves_visual_before_closing_fullscreen() {
+        let mut fx = visual_fixture();
+        fx.app.on_key(KeyCode::Enter);
+        fx.app.on_key(KeyCode::Char('v'));
+        assert!(fx.app.visual_selection().is_some());
+        fx.app.on_key(KeyCode::Esc);
+        assert!(fx.app.visual_selection().is_none());
+        assert_eq!(fx.app.mode(), Mode::FullDiff, "still fullscreen");
+        fx.app.on_key(KeyCode::Esc);
+        assert_eq!(fx.app.mode(), Mode::Normal);
+    }
+
+    #[test]
+    fn visual_toggle_and_mode_switch() {
+        let mut fx = visual_fixture();
+        fx.app.on_key(KeyCode::Enter);
+        fx.app.on_key(KeyCode::Char('v'));
+        assert!(fx.app.visual_selection().is_some());
+        // Same key again leaves visual.
+        fx.app.on_key(KeyCode::Char('v'));
+        assert!(fx.app.visual_selection().is_none());
+        // V enters linewise; v switches it back to charwise.
+        fx.app.on_key(KeyCode::Char('V'));
+        assert_eq!(fx.app.visual_selection().map(|s| s.2), Some(true));
+        fx.app.on_key(KeyCode::Char('v'));
+        assert_eq!(fx.app.visual_selection().map(|s| s.2), Some(false));
+    }
+
+    #[test]
+    fn base64_vectors() {
+        assert_eq!(super::base64_encode(b""), "");
+        assert_eq!(super::base64_encode(b"f"), "Zg==");
+        assert_eq!(super::base64_encode(b"fo"), "Zm8=");
+        assert_eq!(super::base64_encode(b"foo"), "Zm9v");
+        assert_eq!(super::base64_encode(b"hello"), "aGVsbG8=");
+    }
+
+    /// One-hunk diff with known text for visual tests: header, a `same`
+    /// context line, and an old/new pair.
+    fn visual_fixture() -> Fixture {
+        use git_tui_core::diff::{DiffLine, FileDiff, Hunk, LineKind};
+        let mut fx = harness(&["a.txt"]);
+        fx.app.set_diff_for_test(
+            FileDiff {
+                path: "a.txt".into(),
+                hunks: vec![Hunk {
+                    header: "@@ -1,2 +1,2 @@".into(),
+                    old_start: 1,
+                    new_start: 1,
+                    lines: vec![
+                        DiffLine {
+                            kind: LineKind::Context,
+                            text: "same".into(),
+                        },
+                        DiffLine {
+                            kind: LineKind::Del,
+                            text: "old".into(),
+                        },
+                        DiffLine {
+                            kind: LineKind::Add,
+                            text: "new".into(),
+                        },
+                    ],
+                }],
+            },
+            false,
+        );
+        fx
+    }
+
+    #[test]
+    fn cursor_resets_when_diff_reloads() {
+        use git_tui_core::diff::{DiffLine, FileDiff, Hunk, LineKind};
+        let mut fx = harness(&["a.txt"]);
+        let diff = FileDiff {
+            path: "a.txt".into(),
+            hunks: vec![Hunk {
+                header: "@@ -1,2 +1,2 @@".into(),
+                old_start: 1,
+                new_start: 1,
+                lines: vec![
+                    DiffLine {
+                        kind: LineKind::Context,
+                        text: "same".into(),
+                    },
+                    DiffLine {
+                        kind: LineKind::Del,
+                        text: "old".into(),
+                    },
+                    DiffLine {
+                        kind: LineKind::Add,
+                        text: "new".into(),
+                    },
+                ],
+            }],
+        };
+        fx.app.set_diff_for_test(diff.clone(), false);
+        fx.app.on_key(KeyCode::Enter);
+        fx.app.on_key(KeyCode::Char('j'));
+        assert_eq!(fx.app.cursor_row(), 1);
+        fx.app.set_diff_for_test(diff, false);
+        assert_eq!(fx.app.cursor_row(), 0, "fresh diff resets the cursor");
+        assert_eq!(fx.app.hunk(), 0);
+        assert_eq!(fx.app.diff_scroll(), 0);
     }
 
     #[test]
@@ -3776,7 +4776,11 @@ mod tests {
         // Shift+A generates instead of typing.
         fx.app.on_key_with_modifiers(KeyCode::Char('a'), true);
         assert!(fx.app.is_generating());
-        assert_eq!(fx.app.draft(), "Aa", "generation must not type into the draft");
+        assert_eq!(
+            fx.app.draft(),
+            "Aa",
+            "generation must not type into the draft"
+        );
     }
 
     #[test]
@@ -3785,9 +4789,10 @@ mod tests {
         fx.app.on_key(KeyCode::Char('c'));
         assert_eq!(fx.app.mode(), Mode::Committing);
         fx.app.generating = true;
-        fx.app.apply(git_tui_core::jobqueue::AsyncResult::GeneratedMessage(
-            "feat: add thing".into(),
-        ));
+        fx.app
+            .apply(git_tui_core::jobqueue::AsyncResult::GeneratedMessage(
+                "feat: add thing".into(),
+            ));
         assert_eq!(fx.app.draft(), "feat: add thing");
         assert_eq!(fx.app.draft_cursor(), fx.app.draft().chars().count());
         assert!(!fx.app.is_generating());
@@ -3802,9 +4807,10 @@ mod tests {
         fx.app.on_key(KeyCode::Esc);
         assert_eq!(fx.app.mode(), Mode::Normal);
         fx.app.generating = true;
-        fx.app.apply(git_tui_core::jobqueue::AsyncResult::GeneratedMessage(
-            "feat: late".into(),
-        ));
+        fx.app
+            .apply(git_tui_core::jobqueue::AsyncResult::GeneratedMessage(
+                "feat: late".into(),
+            ));
         assert!(!fx.app.is_generating());
         assert_eq!(fx.app.draft(), "", "closed box must not be filled");
     }

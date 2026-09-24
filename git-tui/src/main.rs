@@ -1,6 +1,7 @@
 mod app;
 mod config;
 mod fuzzy;
+mod markdown;
 mod session;
 mod syntax;
 mod ui;
@@ -143,7 +144,7 @@ struct Cli {
 }
 
 const USAGE: &str =
-    "usage: git-tui [--theme <default|tokyo-night|catppuccin|legacy>] [--repo <path>]... [<path>...] [-- <path>...]";
+    "usage: agentgit [--theme <default|tokyo-night|catppuccin|legacy>] [--repo <path>]... [<path>...] [-- <path>...]";
 
 fn parse_args(args: impl IntoIterator<Item = impl Into<OsString>>) -> Result<Cli> {
     let mut cli = Cli {
@@ -157,6 +158,9 @@ fn parse_args(args: impl IntoIterator<Item = impl Into<OsString>>) -> Result<Cli
             break;
         } else if arg == "-h" || arg == "--help" {
             println!("{USAGE}");
+            std::process::exit(0);
+        } else if arg == "-V" || arg == "--version" {
+            println!("agentgit {}", env!("CARGO_PKG_VERSION"));
             std::process::exit(0);
         } else if arg == "--theme" {
             let name = args.next().context("--theme needs a value")?;
@@ -219,7 +223,8 @@ fn run(
                         // `normalize_key` folds Shift+a into `A`; the commit
                         // box needs the original Shift state so a literal
                         // `A` (caps lock) still types normally.
-                        shift || matches!(normalize_key(key.code, key.modifiers), KeyCode::Char('A')),
+                        shift
+                            || matches!(normalize_key(key.code, key.modifiers), KeyCode::Char('A')),
                     );
                 }
             }
@@ -367,10 +372,7 @@ mod tests {
 
     #[test]
     fn dead_session_entries_fall_back_to_cwd() {
-        let s = Session::new(
-            vec![PathBuf::from("/definitely/not/here-git-tui-xyz")],
-            0,
-        );
+        let s = Session::new(vec![PathBuf::from("/definitely/not/here-git-tui-xyz")], 0);
         let (paths, current) = resolve_from_session(&s);
         assert!(paths.is_empty());
         assert!(current.is_none());

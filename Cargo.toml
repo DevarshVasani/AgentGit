@@ -6,7 +6,8 @@ members = ["git-tui-core", "git-tui"]
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-rust-version = "1.75"
+rust-version = "1.88"
+repository = "https://github.com/DevarshVasani/AgentGit"
 
 [profile.release]
 lto = true

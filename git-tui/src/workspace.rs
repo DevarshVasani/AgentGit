@@ -70,8 +70,8 @@ impl Workspace {
             self.current = i;
             return Ok(());
         }
-        let queue =
-            JobQueue::spawn(root).map_err(|e| anyhow::anyhow!("cannot open {}: {e}", root.display()))?;
+        let queue = JobQueue::spawn(root)
+            .map_err(|e| anyhow::anyhow!("cannot open {}: {e}", root.display()))?;
         let mut app = App::new_with_config(queue, self.config.clone());
         app.set_config_path(Config::default_path());
         if let Some(name) = root
@@ -153,10 +153,9 @@ impl Workspace {
                         self.current = self.apps.len() - 1;
                         self.save_session();
                     }
-                    Err(e) => self.current_mut().set_browser_error(format!(
-                        "cannot open {}: {e}",
-                        root.display()
-                    )),
+                    Err(e) => self
+                        .current_mut()
+                        .set_browser_error(format!("cannot open {}: {e}", root.display())),
                 }
             }
             Err(GitError::NotARepo(_)) => {
@@ -183,9 +182,10 @@ impl Workspace {
     /// into. A query with no matches is an error, never a fallback to
     /// `.`/`..`.
     pub fn open_selected(&mut self) {
-        let no_match = self.current().open_browser().is_some_and(|b| {
-            !b.filter.is_empty() && b.view.is_empty()
-        });
+        let no_match = self
+            .current()
+            .open_browser()
+            .is_some_and(|b| !b.filter.is_empty() && b.view.is_empty());
         if no_match {
             let q = self
                 .current()
@@ -199,10 +199,7 @@ impl Workspace {
         let Some(target) = self.current().open_browser().map(|b| b.selected_path()) else {
             return;
         };
-        let selected_row = self
-            .current()
-            .open_browser()
-            .map(|b| b.selected_row());
+        let selected_row = self.current().open_browser().map(|b| b.selected_row());
         if matches!(selected_row, Some(crate::app::BrowserRow::Parent)) {
             self.goto_parent();
             return;
@@ -279,10 +276,8 @@ impl Workspace {
             }
         };
         if !path.is_dir() {
-            self.current_mut().set_browser_error(format!(
-                "not a directory: {}",
-                path.display()
-            ));
+            self.current_mut()
+                .set_browser_error(format!("not a directory: {}", path.display()));
             return;
         }
         let dir = std::fs::canonicalize(&path).unwrap_or(path);
@@ -354,9 +349,10 @@ impl Workspace {
                         )),
                     }
                 }
-                Err(e) => self
-                    .current_mut()
-                    .set_error(format!("initialized {}, but cannot open it: {e}", dir.display())),
+                Err(e) => self.current_mut().set_error(format!(
+                    "initialized {}, but cannot open it: {e}",
+                    dir.display()
+                )),
             },
             Err(e) => self
                 .current_mut()
@@ -464,10 +460,8 @@ impl Workspace {
         // Only in Normal/FullDiff: text modals and the finder treat `q` as
         // literal input. `quit` wins when both actions share a key so a
         // `quit = ["q", "Q"]` override still quits everything.
-        if matches!(
-            self.current().mode(),
-            Mode::Normal | Mode::FullDiff
-        ) && !self.keys.quit.contains(&key)
+        if matches!(self.current().mode(), Mode::Normal | Mode::FullDiff)
+            && !self.keys.quit.contains(&key)
             && self.keys.project_close.contains(&key)
         {
             self.close_current_project();
@@ -928,11 +922,7 @@ mod tests {
         type_text(&mut ws, "x");
         assert_eq!(ws.current().draft(), "xb");
         ws.on_key(KeyCode::Esc);
-        assert!(!ws
-            .current()
-            .open_browser()
-            .unwrap()
-            .editing_path);
+        assert!(!ws.current().open_browser().unwrap().editing_path);
     }
 
     #[test]
@@ -1088,7 +1078,11 @@ mod tests {
         ws.on_key(KeyCode::Char('o'));
         // `[`, `]` and `q` are filter text now, not actions.
         ws.on_key(KeyCode::Char('['));
-        assert_eq!(ws.index(), 0, "project_prev must not fire inside the browser");
+        assert_eq!(
+            ws.index(),
+            0,
+            "project_prev must not fire inside the browser"
+        );
         ws.on_key(KeyCode::Char('q'));
         assert!(!ws.should_quit(), "quit must not fire inside the browser");
         assert_eq!(ws.current().open_browser().unwrap().filter, "[q");
@@ -1140,7 +1134,7 @@ mod tests {
     }
 
     #[test]
-    fn q_in_fullscreen_closes_project_and_Q_quits() {
+    fn q_in_fullscreen_closes_project_and_shift_q_quits() {
         let a = init_repo_with_file("a", "a.txt", "a\n");
         let b = init_repo_with_file("b", "b.txt", "b\n");
         let mut ws = Workspace::open(
