@@ -7,7 +7,7 @@
 Status → diff → stage → commit, without leaving the terminal.
 
 [![Rust](https://img.shields.io/badge/rust-1.88%2B-orange?logo=rust)](https://www.rust-lang.org)
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](Cargo.toml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![ratatui](https://img.shields.io/badge/UI-ratatui%200.29-28a0f0?logo=rust)](https://github.com/ratatui/ratatui)
 
 [Install](#install) · [Features](#features) · [Keys](#keyboard) · [Configuration](#configuration) · [Development](#development)
@@ -76,21 +76,40 @@ credential helpers keep working unchanged.
 
 ## Install
 
-> [!NOTE]
-> Requires Rust **1.88+** and a `git` CLI on `PATH` (used for push/pull).
+Prebuilt binaries for **Linux** and **macOS** (x86_64 and ARM64). You also need a
+`git` CLI on `PATH` (used for push/pull).
+
+**Shell installer**
+
+```sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/DevarshVasani/AgentGit/releases/latest/download/agentgit-installer.sh | sh
+```
+
+**mise**
+
+```sh
+mise use -g github:DevarshVasani/AgentGit
+```
+
+**Manual download:** grab the archive for your platform from the
+[latest release](https://github.com/DevarshVasani/AgentGit/releases/latest),
+unpack it, and put `agentgit` somewhere on your `PATH`.
+
+<details>
+<summary><b>Build from source</b> (Rust 1.88+)</summary>
+
+<br>
 
 ```sh
 cargo install --locked --git https://github.com/DevarshVasani/AgentGit agentgit
-```
-
-Or from a local checkout:
-
-```sh
+# or from a local checkout:
 git clone https://github.com/DevarshVasani/AgentGit && cd AgentGit
 cargo install --locked --path git-tui
 ```
 
-Both install the `agentgit` binary into `~/.cargo/bin`; make sure that's on your `PATH`.
+Both install `agentgit` into `~/.cargo/bin`; make sure that's on your `PATH`.
+
+</details>
 
 ## Quick start
 
@@ -283,6 +302,22 @@ cargo test --workspace
 
 CI runs all three on every push and pull request (`.github/workflows/ci.yml`).
 
+### Releasing
+
+Releases are built by [cargo-dist](https://github.com/axodotdev/cargo-dist)
+(`.github/workflows/release.yml`, config in `dist-workspace.toml`). Pushing a
+version tag builds every target, then publishes the archives, checksums, and
+`agentgit-installer.sh` to a GitHub Release:
+
+```sh
+# bump [workspace.package] version in Cargo.toml, commit, then:
+git tag v0.2.0
+git push origin master v0.2.0
+```
+
+Run `dist plan` to preview the artifacts, and `dist generate` after changing
+the dist config.
+
 ## License
 
-MIT, see `workspace.package.license` in [`Cargo.toml`](Cargo.toml).
+Released under the [MIT License](LICENSE).
