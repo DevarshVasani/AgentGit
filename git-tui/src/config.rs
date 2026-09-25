@@ -17,6 +17,7 @@ pub const ACTIONS: &[&str] = &[
     "nav_down",
     "nav_up",
     "stage",
+    "discard",
     "commit",
     "refresh",
     "quit",
@@ -74,6 +75,8 @@ pub struct KeyBindings {
     pub nav_down: Vec<KeyCode>,
     pub nav_up: Vec<KeyCode>,
     pub stage: Vec<KeyCode>,
+    /// Discard changes in the selected file (`d` by default).
+    pub discard: Vec<KeyCode>,
     pub commit: Vec<KeyCode>,
     pub refresh: Vec<KeyCode>,
     pub quit: Vec<KeyCode>,
@@ -111,6 +114,7 @@ impl Default for KeyBindings {
             nav_down: vec![Char('j'), Down],
             nav_up: vec![Char('k'), Up],
             stage: vec![Char(' '), Char('s')],
+            discard: vec![Char('d')],
             commit: vec![Char('c')],
             refresh: vec![Char('r')],
             quit: vec![Char('Q')],
@@ -476,6 +480,7 @@ impl Config {
                 "nav_down" => k.nav_down = keys,
                 "nav_up" => k.nav_up = keys,
                 "stage" => k.stage = keys,
+                "discard" => k.discard = keys,
                 "commit" => k.commit = keys,
                 "refresh" => k.refresh = keys,
                 "quit" => k.quit = keys,
@@ -552,6 +557,7 @@ mod tests {
         assert!(keys.nav_down.contains(&KeyCode::Down));
         assert!(keys.stage.contains(&KeyCode::Char(' ')));
         assert!(keys.stage.contains(&KeyCode::Char('s')));
+        assert!(keys.discard.contains(&KeyCode::Char('d')));
         // `q` closes the current project, `Q` (Shift+q) quits the app.
         assert!(keys.project_close.contains(&KeyCode::Char('q')));
         assert!(keys.quit.contains(&KeyCode::Char('Q')));

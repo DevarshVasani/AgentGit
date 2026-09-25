@@ -140,6 +140,10 @@ impl Repo {
         crate::stage::unstage_file(&self.inner, path)
     }
 
+    pub fn discard_file(&self, path: &str) -> Result<(), GitError> {
+        crate::stage::discard_file(&self.inner, path)
+    }
+
     pub fn stage_hunk(&self, path: &str, hunk_index: usize) -> Result<(), GitError> {
         crate::stage::stage_hunk(&self.inner, path, hunk_index)
     }

@@ -1933,7 +1933,7 @@ fn footer_hints(app: &App, theme: Theme, multi: bool) -> Paragraph<'static> {
         Mode::SetUpstream => "←/→ move · Home/End jump · Del deletes · Enter push -u · Esc cancel",
         Mode::SetRemote => "←/→ move · Home/End jump · Del deletes · Enter add origin + push · Esc cancel",
         Mode::FullDiff => {
-            "j/k/↑/↓ line · h/l/←/→ col · J/K hunk · 0/Home/End · v/V select · y yank · space stage hunk · PgUp/PgDn page · m preview · / find · p pull · P push · esc leave/close · q close · Q quit"
+            "j/k/↑/↓ line · h/l/←/→ col · J/K hunk · 0/Home/End · v/V select · y yank · space stage hunk · d discard file · PgUp/PgDn page · m preview · / find · p pull · P push · esc leave/close · q close · Q quit"
         }
         Mode::Normal if app.focus() == Focus::Branches => {
             "enter checkout · a new branch · D delete · tab commits · q close · Q quit"
@@ -1952,7 +1952,7 @@ fn footer_hints(app: &App, theme: Theme, multi: bool) -> Paragraph<'static> {
         }
         Mode::ConfirmInit => "enter git init here · esc back · any other key picks another folder",
         Mode::Normal => {
-            "space stage file/dir · c commit · A llm · m preview · p pull · P push · / find · enter diff · Shift+→/5 file · o open · r refresh · q close · Q quit"
+            "space stage file/dir · d discard · c commit · A llm · m preview · p pull · P push · / find · enter diff · Shift+→/5 · o open · r refresh · q close · Q quit"
         }
     };
     let switch = if multi && app.mode() == Mode::Normal {

@@ -33,6 +33,97 @@ pub fn unstage_file(repo: &git2::Repository, path: &str) -> Result<(), GitError>
     Ok(())
 }
 
+/// Discard all changes in a file (staged and unstaged), restoring it to
+/// HEAD. Untracked files are deleted from the workdir. Staged-new files
+/// (added but not in HEAD) are unindexed and deleted. Clean files and
+/// conflicted files are errors.
+pub fn discard_file(repo: &git2::Repository, path: &str) -> Result<(), GitError> {
+    use git2::Status as S;
+    let rel = Path::new(path);
+    let flags = repo
+        .status_file(rel)
+        .map_err(|e| GitError::Discard(format!("cannot discard {path}: {e}")))?;
+    if flags.contains(S::CONFLICTED) {
+        return Err(GitError::Discard(format!(
+            "conflicted: resolve markers in {path} first"
+        )));
+    }
+    let index_bits = S::INDEX_NEW
+        | S::INDEX_MODIFIED
+        | S::INDEX_DELETED
+        | S::INDEX_RENAMED
+        | S::INDEX_TYPECHANGE;
+    let workdir_bits = S::WT_MODIFIED | S::WT_DELETED | S::WT_RENAMED | S::WT_TYPECHANGE;
+    let staged = flags.intersects(index_bits);
+    let unstaged = flags.intersects(workdir_bits);
+    let wt_new = flags.contains(S::WT_NEW);
+
+    // Untracked: only WT_NEW, nothing in the index. Deleting restores a
+    // clean tree; resetting/checkout would be a no-op.
+    if !staged && !unstaged && wt_new {
+        return remove_workdir_path(repo, path);
+    }
+    if !staged && !unstaged {
+        return Err(GitError::Discard(format!(
+            "{path} is unchanged — nothing to discard"
+        )));
+    }
+
+    match repo.head().ok().and_then(|h| h.peel_to_commit().ok()) {
+        Some(commit) => {
+            let in_head = commit
+                .tree()
+                .ok()
+                .and_then(|t| t.get_path(rel).ok())
+                .is_some();
+            let obj = commit.as_object().clone();
+            repo.reset_default(Some(&obj), [path])
+                .map_err(|e| GitError::Discard(format!("cannot discard {path}: {e}")))?;
+            if in_head {
+                // Tracked in HEAD: restore the workdir copy (also brings
+                // back files deleted from the workdir).
+                let mut builder = git2::build::CheckoutBuilder::new();
+                builder.force().path(path);
+                repo.checkout_head(Some(&mut builder))
+                    .map_err(|e| GitError::Discard(format!("cannot discard {path}: {e}")))?;
+            } else {
+                // Added (staged-new): unstage left it untracked, so delete
+                // the workdir copy to actually discard it.
+                remove_workdir_path(repo, path)?;
+            }
+            Ok(())
+        }
+        None => {
+            // Unborn HEAD: everything is new, so drop the index entry and
+            // delete the workdir copy.
+            let mut index = repo.index()?;
+            let _ = index.remove_path(rel);
+            index.write()?;
+            remove_workdir_path(repo, path)?;
+            Ok(())
+        }
+    }
+}
+
+/// Delete `path` from the workdir (file or directory). Missing paths are
+/// success (already discarded).
+fn remove_workdir_path(repo: &git2::Repository, path: &str) -> Result<(), GitError> {
+    let Some(workdir) = repo.workdir() else {
+        return Err(GitError::Discard("bare repo".into()));
+    };
+    let full = workdir.join(Path::new(path));
+    if !full.exists() && !full.is_symlink() {
+        return Ok(());
+    }
+    if full.is_dir() && !full.is_symlink() {
+        std::fs::remove_dir_all(&full)
+            .map_err(|e| GitError::Discard(format!("cannot discard {path}: {e}")))?;
+    } else {
+        std::fs::remove_file(&full)
+            .map_err(|e| GitError::Discard(format!("cannot discard {path}: {e}")))?;
+    }
+    Ok(())
+}
 /// Stage a single hunk (by index into the unstaged diff) via partial-index
 /// application: only that hunk's changes are written to the index.
 pub fn stage_hunk(repo: &git2::Repository, path: &str, hunk_index: usize) -> Result<(), GitError> {
@@ -226,6 +317,68 @@ mod tests {
         let err = stage_hunk(&repo, "a.txt", 99).unwrap_err();
         match err {
             GitError::HunkStaging(_) => {}
+            other => panic!("wrong error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn discard_unstaged_file_restores_head_content() {
+        let (_dir, repo) = testutil::init_repo();
+        testutil::commit_file(&repo, "a.txt", "a\n", "init");
+        testutil::dirty_file(&repo, "a.txt", "more\n");
+        discard_file(&repo, "a.txt").unwrap();
+        let content = fs::read_to_string(repo.workdir().unwrap().join("a.txt")).unwrap();
+        assert_eq!(content, "a\n");
+        let status = crate::status::repo_status(&repo).unwrap();
+        assert!(status.files.iter().all(|e| e.path != "a.txt"));
+    }
+
+    #[test]
+    fn discard_staged_and_unstaged_changes_restores_head() {
+        let (_dir, repo) = testutil::init_repo();
+        testutil::commit_file(&repo, "a.txt", "a\n", "init");
+        testutil::dirty_file(&repo, "a.txt", "staged\n");
+        stage_file(&repo, "a.txt").unwrap();
+        testutil::dirty_file(&repo, "a.txt", "unstaged\n");
+        discard_file(&repo, "a.txt").unwrap();
+        let content = fs::read_to_string(repo.workdir().unwrap().join("a.txt")).unwrap();
+        assert_eq!(content, "a\n");
+        assert!(crate::diff::staged_diff(&repo, "a.txt")
+            .unwrap()
+            .hunks
+            .is_empty());
+        let status = crate::status::repo_status(&repo).unwrap();
+        assert!(status.files.iter().all(|e| e.path != "a.txt"));
+    }
+
+    #[test]
+    fn discard_untracked_file_deletes_it() {
+        let (_dir, repo) = testutil::init_repo();
+        testutil::commit_file(&repo, "a.txt", "a\n", "init");
+        fs::write(repo.workdir().unwrap().join("new.txt"), "new\n").unwrap();
+        discard_file(&repo, "new.txt").unwrap();
+        assert!(!repo.workdir().unwrap().join("new.txt").exists());
+    }
+
+    #[test]
+    fn discard_staged_new_file_deletes_it() {
+        let (_dir, repo) = testutil::init_repo();
+        testutil::commit_file(&repo, "a.txt", "a\n", "init");
+        fs::write(repo.workdir().unwrap().join("new.txt"), "new\n").unwrap();
+        stage_file(&repo, "new.txt").unwrap();
+        discard_file(&repo, "new.txt").unwrap();
+        assert!(!repo.workdir().unwrap().join("new.txt").exists());
+        let status = crate::status::repo_status(&repo).unwrap();
+        assert!(status.files.iter().all(|e| e.path != "new.txt"));
+    }
+
+    #[test]
+    fn discard_clean_file_errors() {
+        let (_dir, repo) = testutil::init_repo();
+        testutil::commit_file(&repo, "a.txt", "a\n", "init");
+        let err = discard_file(&repo, "a.txt").unwrap_err();
+        match err {
+            GitError::Discard(msg) => assert!(msg.contains("nothing to discard"), "got: {msg}"),
             other => panic!("wrong error: {other:?}"),
         }
     }

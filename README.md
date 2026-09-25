@@ -139,6 +139,7 @@ file for one run. With no paths, the last session's projects are reopened
 | `j` / `k`       | Move in the file tree (diff previews inline)           |
 | `enter`         | Open fullscreen side-by-side diff (`esc` closes)       |
 | `space` / `s`   | Stage file / hunk; on a folder, every file in it       |
+| `d`             | Discard file changes (delete untracked); whole folder on a folder |
 | `←` / `→`       | Collapse / expand the folder under the cursor          |
 | `c`             | Commit (`↑`/`↓` move between lines, `enter` commits)   |
 | `Shift+A`       | Generate AI commit message (in commit box)             |
@@ -168,6 +169,7 @@ file for one run. With no paths, the last session's projects are reopened
 | `v` / `V`             | Charwise / linewise visual selection |
 | `y`                   | Yank the selection                   |
 | `space`               | Stage the hunk under the cursor      |
+| `d`                   | Discard the file's changes           |
 | `PgUp` / `PgDn`       | Page                                 |
 
 </details>
@@ -241,7 +243,7 @@ Key names: single characters, plus `space`, `tab`, `enter`, `esc`,
 `pageup`, `pagedown`, `home`, `end`.
 
 ```text
-nav_down  nav_up  stage  commit  refresh  quit  focus_next
+nav_down  nav_up  stage  discard  commit  refresh  quit  focus_next
 focus_status  focus_branches  focus_log  focus_stash  focus_diff
 scroll_up  scroll_down  branch_new  branch_delete  checkout
 stash_pop  stash_push  stash_drop  find_files
@@ -301,6 +303,7 @@ cargo test --workspace
 ```
 
 CI runs all three on every push and pull request (`.github/workflows/ci.yml`).
+See [CONTRIBUTING.md](CONTRIBUTING.md) for contribution guidelines.
 
 ### Releasing
 

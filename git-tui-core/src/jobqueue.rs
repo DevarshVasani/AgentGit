@@ -43,6 +43,9 @@ pub enum AsyncJob {
     UnstageFile {
         path: String,
     },
+    DiscardFile {
+        path: String,
+    },
     Commit {
         message: String,
     },
@@ -204,6 +207,10 @@ fn execute(repo: &mut Repo, job: AsyncJob) -> AsyncResult {
             Err(e) => AsyncResult::Error(e),
         },
         AsyncJob::UnstageFile { path } => match repo.unstage_file(&path) {
+            Ok(()) => AsyncResult::MutationDone,
+            Err(e) => AsyncResult::Error(e),
+        },
+        AsyncJob::DiscardFile { path } => match repo.discard_file(&path) {
             Ok(()) => AsyncResult::MutationDone,
             Err(e) => AsyncResult::Error(e),
         },
@@ -503,6 +510,25 @@ mod tests {
         let st = expect_status(recv_next(&queue));
         let entry = st.files.iter().find(|e| e.path == "a.txt").unwrap();
         assert_eq!(entry.state, FileState::Unstaged);
+    }
+
+    #[test]
+    fn discard_file_via_queue_restores_clean_tree() {
+        let (_dir, repo) = testutil::init_repo();
+        testutil::commit_file(&repo, "a.txt", "a\n", "init");
+        testutil::dirty_file(&repo, "a.txt", "more\n");
+        let path = repo.workdir().unwrap().to_path_buf();
+        drop(repo);
+        let queue = JobQueue::spawn(path).unwrap();
+        queue
+            .submit(AsyncJob::DiscardFile {
+                path: "a.txt".into(),
+            })
+            .unwrap();
+        expect_mutation_done(recv_next(&queue));
+        queue.submit(AsyncJob::RefreshStatus).unwrap();
+        let st = expect_status(recv_next(&queue));
+        assert!(st.files.iter().all(|e| e.path != "a.txt"));
     }
 
     #[test]

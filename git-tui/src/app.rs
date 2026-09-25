@@ -1458,6 +1458,10 @@ impl App {
             if self.focus == Focus::Status {
                 self.toggle_stage();
             }
+        } else if k.discard.contains(&key) {
+            if self.focus == Focus::Status {
+                self.discard_selected();
+            }
         } else if k.branch_new.contains(&key) && self.focus == Focus::Branches {
             self.mode = Mode::NewBranch;
             self.draft.clear();
@@ -1542,6 +1546,8 @@ impl App {
             self.begin_yank();
         } else if k.stage.contains(&key) {
             self.stage_selected_hunk();
+        } else if k.discard.contains(&key) {
+            self.discard_loaded_file();
         } else if k.scroll_up.contains(&key) {
             self.move_cursor_or_scroll(-10);
         } else if k.scroll_down.contains(&key) {
@@ -2219,6 +2225,94 @@ impl App {
             return;
         }
         self.error = Some(format!("nothing to stage under {dir}/"));
+    }
+
+    /// `d`: discard all changes in the selected file (staged and unstaged),
+    /// restoring it to HEAD; untracked files are deleted. When the
+    /// highlight sits on a directory header, open (`▼`, `dir_cursor`) or
+    /// collapsed (the selected file is hidden inside it), every changed
+    /// file beneath it is discarded so the folder is clean again.
+    fn discard_selected(&mut self) {
+        if let Some(dir) = self.cursor_dir().map(str::to_string) {
+            self.discard_dir(&dir);
+            return;
+        }
+        let Some(file) = self.selected_file().cloned() else {
+            return;
+        };
+        if let Some(dir) = self.collapsed_dir_for(&file.path) {
+            self.discard_dir(&dir);
+        } else {
+            self.discard_file_entry(&file);
+        }
+    }
+
+    /// `d` on one visible file: discard its changes (or delete it when
+    /// untracked / staged-new).
+    fn discard_file_entry(&mut self, file: &StatusEntry) {
+        if file.state == FileState::Conflicted {
+            self.error = Some(format!(
+                "conflicted: resolve markers in {} first",
+                file.path
+            ));
+            return;
+        }
+        if file.state == FileState::Clean {
+            self.error = Some(format!("{} is unchanged — nothing to discard", file.path));
+            return;
+        }
+        if let Err(e) = self.queue.submit(AsyncJob::DiscardFile {
+            path: file.path.clone(),
+        }) {
+            self.error = Some(e.to_string());
+        }
+    }
+
+    /// `d` on a directory header: discard every changed file beneath it.
+    /// Conflicted files abort the whole directory like the single-file
+    /// case; clean files are skipped silently.
+    fn discard_dir(&mut self, dir: &str) {
+        let prefix = format!("{dir}/");
+        let under: Vec<(String, FileState)> = self
+            .file_list
+            .iter()
+            .filter(|e| e.path.starts_with(&prefix))
+            .map(|e| (e.path.clone(), e.state))
+            .collect();
+        if let Some((path, _)) = under.iter().find(|(_, s)| *s == FileState::Conflicted) {
+            self.error = Some(format!("conflicted: resolve markers in {path} first"));
+            return;
+        }
+        let dirty: Vec<String> = under
+            .iter()
+            .filter(|(_, s)| !matches!(s, FileState::Clean))
+            .map(|(p, _)| p.clone())
+            .collect();
+        if dirty.is_empty() {
+            self.error = Some(format!("nothing to discard under {dir}/"));
+            return;
+        }
+        for path in dirty {
+            if let Err(e) = self.queue.submit(AsyncJob::DiscardFile { path }) {
+                self.error = Some(e.to_string());
+                return;
+            }
+        }
+    }
+
+    /// `d` in the fullscreen diff: discard the loaded file's changes.
+    fn discard_loaded_file(&mut self) {
+        let Some((path, _)) = self.diff_for.clone() else {
+            self.error = Some("no diff loaded".into());
+            return;
+        };
+        // The file list knows the state (clean vs changed), including
+        // mode-only changes shown via the whole-file fallback.
+        if let Some(file) = self.file_list.iter().find(|f| f.path == path).cloned() {
+            self.discard_file_entry(&file);
+        } else if let Err(e) = self.queue.submit(AsyncJob::DiscardFile { path }) {
+            self.error = Some(e.to_string());
+        }
     }
 
     fn submit_commit(&mut self) {
@@ -3240,6 +3334,106 @@ mod tests {
         fx.app.on_key(KeyCode::Char(' '));
         assert!(fx.app.error().is_none());
         assert_eq!(fx.app.selected(), 0);
+    }
+
+    #[test]
+    fn d_on_unstaged_discards_the_file() {
+        let mut fx = harness(&["a.txt"]);
+        fx.app.on_key(KeyCode::Char('d'));
+        let st = wait_for(&mut fx.app, |st| st.files.iter().all(|e| e.path != "a.txt"));
+        assert!(
+            st.files.iter().all(|e| e.path != "a.txt"),
+            "got: {:?}",
+            st.files
+        );
+    }
+
+    #[test]
+    fn d_on_staged_discards_index_and_workdir_changes() {
+        let mut fx = harness(&["a.txt"]);
+        fx.app.on_key(KeyCode::Char(' '));
+        wait_for(&mut fx.app, |st| {
+            st.files
+                .iter()
+                .any(|e| e.path == "a.txt" && e.state == FileState::Staged)
+        });
+        fx.app.on_key(KeyCode::Char('d'));
+        let st = wait_for(&mut fx.app, |st| st.files.iter().all(|e| e.path != "a.txt"));
+        assert!(
+            st.files.iter().all(|e| e.path != "a.txt"),
+            "got: {:?}",
+            st.files
+        );
+    }
+
+    #[test]
+    fn d_on_untracked_deletes_the_file() {
+        let (dir, repo) = init_repo();
+        commit_file(&repo, "a.txt", "base\n", "init");
+        std::fs::write(repo.workdir().unwrap().join("new.txt"), "new\n").unwrap();
+        let path = repo.workdir().unwrap().to_path_buf();
+        drop(repo);
+        let mut fx = Fixture {
+            _dir: dir,
+            app: App::new(JobQueue::spawn(path).unwrap()),
+        };
+        wait_for(&mut fx.app, |st| {
+            st.files
+                .iter()
+                .any(|e| e.path == "new.txt" && e.state == FileState::Untracked)
+        });
+        // Changed files sort before clean ones, so the untracked file is
+        // already selected.
+        assert_eq!(fx.app.selected_file().unwrap().path, "new.txt");
+        fx.app.on_key(KeyCode::Char('d'));
+        wait_for(&mut fx.app, |st| {
+            st.files.iter().all(|e| e.path != "new.txt")
+        });
+        assert!(!fx._dir.path().join("new.txt").exists());
+    }
+
+    #[test]
+    fn d_on_clean_file_reports_error() {
+        let mut fx = harness(&[]);
+        fx.app.status = Some(RepoStatus {
+            branch: "main".into(),
+            head_summary: "x".into(),
+            files: vec![],
+            tracked_files: vec!["a.txt".into()],
+        });
+        fx.app.rebuild_file_list();
+        assert_eq!(fx.app.selected_file().unwrap().path, "a.txt");
+        fx.app.on_key(KeyCode::Char('d'));
+        let err = fx.app.error().expect("expected nothing-to-discard error");
+        assert!(err.contains("nothing to discard"), "got: {err}");
+    }
+
+    #[test]
+    fn d_on_collapsed_dir_discards_everything_under_it() {
+        let mut fx = harness(&["src/a.rs", "src/nested/b.rs", "z.txt"]);
+        // Collapse src/; the cursor stays on hidden src/a.rs, so the
+        // header takes the highlight and `d` acts on the whole dir.
+        fx.app.on_key(KeyCode::Left);
+        assert_eq!(fx.app.selected_file().unwrap().path, "src/a.rs");
+        fx.app.on_key(KeyCode::Char('d'));
+        let st = wait_for(&mut fx.app, |st| {
+            st.files.iter().all(|e| !e.path.starts_with("src/"))
+        });
+        let outside = st.files.iter().find(|e| e.path == "z.txt").unwrap();
+        assert_eq!(
+            outside.state,
+            FileState::Unstaged,
+            "files outside the dir must be left alone"
+        );
+    }
+
+    #[test]
+    fn d_in_fullscreen_discards_the_loaded_file() {
+        let mut fx = harness(&["a.txt"]);
+        fx.app.on_key(KeyCode::Enter);
+        assert_eq!(fx.app.mode(), Mode::FullDiff);
+        fx.app.on_key(KeyCode::Char('d'));
+        wait_for(&mut fx.app, |st| st.files.iter().all(|e| e.path != "a.txt"));
     }
 
     #[test]
